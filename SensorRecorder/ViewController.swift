@@ -1888,7 +1888,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let displayLayer = displayLayer else { return }
         displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
-        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2))
+        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
     }
 
     private func setStatus(_ status: String) {
@@ -2118,7 +2118,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         NSLayoutConstraint.activate([
             sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 78),
             sensorBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -142),
-            sensorBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30),
+            sensorBar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
             sensorBar.heightAnchor.constraint(equalToConstant: 44),
 
             monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 16),
@@ -2141,7 +2141,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         view.addSubview(rightRail)
         rightControlRail = rightRail
         NSLayoutConstraint.activate([
-            rightRail.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
+            rightRail.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
             rightRail.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
             rightRail.widthAnchor.constraint(equalToConstant: 92),
             rightRail.heightAnchor.constraint(equalToConstant: 288)
