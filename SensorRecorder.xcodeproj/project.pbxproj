@@ -294,7 +294,6 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = ZLZLM8XFB9;
 				INFOPLIST_FILE = SensorRecorder/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Sensor Recorder";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -315,7 +314,6 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = ZLZLM8XFB9;
 				INFOPLIST_FILE = SensorRecorder/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Sensor Recorder";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

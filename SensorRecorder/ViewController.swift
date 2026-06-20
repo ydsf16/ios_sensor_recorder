@@ -977,6 +977,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        view.backgroundColor = .black
         updateDiskCapacity()
         initializeUI()
         startStopButton.setTitle("Start", for: .normal)
@@ -1007,6 +1008,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func requestCameraAccess(_ completion: @escaping (Bool) -> Void) {
+        setStatus("Camera permission")
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             completion(true)
@@ -1024,6 +1026,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func requestAudioAccess(_ completion: @escaping (Bool) -> Void) {
+        setStatus("Audio permission")
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             completion(true)
@@ -1936,10 +1939,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func initializeUI() {
-        timeLabel.text = "Ready"
+        timeLabel.text = "Initializing"
         trackingStatusLabel.text = "wide"
         mappingStatusLabel.text = "ultrawide"
-        frameCounterLabel.text = previewDebugMode.rawValue
+        frameCounterLabel.text = "Waiting for camera"
         fileSizeLabel.text = String(format: "? / %@", diskCapacity)
         fpsLabel.text = "30.0 FPS"
         fpsStepper.value = 30
