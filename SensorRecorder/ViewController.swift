@@ -992,6 +992,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var cameraStatusRows: [String: UILabel] = [:]
     private var sensorStatusRows: [String: UILabel] = [:]
     private var captureStatusRows: [String: UILabel] = [:]
+    private var cameraStatusBadges: [String: UIView] = [:]
+    private var captureStatusBadges: [String: UIView] = [:]
     private var rightControlRail: UIVisualEffectView?
     private var sensorMonitorBar: UIVisualEffectView?
     private var hudContentRect: CGRect = .zero
@@ -1861,18 +1863,18 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
-        cameraStatusRows["wide"]?.superview?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
-        cameraStatusRows["ultra"]?.superview?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
+        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
+        cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
         let summaryWidth = min(max(hudContentRect.width * 0.78, 620), max(hudContentRect.width - 68, 320))
-        captureStatusRows["summary"]?.superview?.frame = CGRect(
+        captureStatusBadges["summary"]?.frame = CGRect(
             x: hudContentRect.midX - summaryWidth / 2,
             y: hudContentRect.minY + 54,
             width: summaryWidth,
             height: 36
         )
-        cameraStatusRows["wide"]?.superview.map { sceneView.bringSubviewToFront($0) }
-        cameraStatusRows["ultra"]?.superview.map { sceneView.bringSubviewToFront($0) }
-        captureStatusRows["summary"]?.superview.map { sceneView.bringSubviewToFront($0) }
+        cameraStatusBadges["wide"].map { sceneView.bringSubviewToFront($0) }
+        cameraStatusBadges["ultra"].map { sceneView.bringSubviewToFront($0) }
+        captureStatusBadges["summary"].map { view.bringSubviewToFront($0) }
         if let sensorMonitorBar {
             view.bringSubviewToFront(sensorMonitorBar)
         }
@@ -1888,7 +1890,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let displayLayer = displayLayer else { return }
         displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
-        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
+        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2))
     }
 
     private func setStatus(_ status: String) {
@@ -2089,7 +2091,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let summaryBadge = makeHUDLabelBadge()
         sceneView.addSubview(wideBadge)
         sceneView.addSubview(ultraBadge)
-        sceneView.addSubview(summaryBadge)
+        view.addSubview(summaryBadge)
+        cameraStatusBadges["wide"] = wideBadge
+        cameraStatusBadges["ultra"] = ultraBadge
+        captureStatusBadges["summary"] = summaryBadge
         cameraStatusRows["wide"] = wideBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
