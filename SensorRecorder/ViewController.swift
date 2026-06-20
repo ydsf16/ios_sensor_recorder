@@ -994,7 +994,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var captureStatusRows: [String: UILabel] = [:]
     private var cameraStatusBadges: [String: UIView] = [:]
     private var captureStatusBadges: [String: UIView] = [:]
-    private var rightControlRail: UIVisualEffectView?
+    private var rightControlRail: UIView?
     private var sensorMonitorBar: UIVisualEffectView?
     private var hudContentRect: CGRect = .zero
     private let overlayFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
@@ -1055,12 +1055,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        view.backgroundColor = .black
+        view.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
         updateDiskCapacity()
         installLandscapeOverlay()
         initializeUI()
         startStopButton.isEnabled = false
-        sceneView.backgroundColor = .black
+        sceneView.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
         sceneView.layer.borderWidth = 0
         configureLocationManager()
     }
@@ -1836,26 +1836,16 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func dualCameraContentRect(in bounds: CGRect) -> CGRect {
-        let leftSafeBlack: CGFloat = 58
-        let rightControls: CGFloat = 0
-        let topBlack: CGFloat = 28
-        let bottomMonitor: CGFloat = 44
-        let available = CGRect(
-            x: leftSafeBlack,
-            y: topBlack,
-            width: max(bounds.width - leftSafeBlack - rightControls, 1),
-            height: max(bounds.height - topBlack - bottomMonitor, 1)
-        )
         let targetAspect: CGFloat = 8.0 / 3.0
-        var width = available.width
+        var width = bounds.width
         var height = width / targetAspect
-        if height > available.height {
-            height = available.height
+        if height > bounds.height {
+            height = bounds.height
             width = height * targetAspect
         }
         return CGRect(
-            x: available.midX - width / 2,
-            y: available.midY - height / 2,
+            x: bounds.midX - width / 2,
+            y: bounds.midY - height / 2,
             width: width,
             height: height
         ).integral
@@ -1865,7 +1855,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
         cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
         cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
-        let summaryWidth = min(max(hudContentRect.width * 0.78, 620), max(hudContentRect.width - 68, 320))
+        let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         captureStatusBadges["summary"]?.frame = CGRect(
             x: hudContentRect.midX - summaryWidth / 2,
             y: hudContentRect.minY + 54,
@@ -1902,7 +1892,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             } else {
                 running = self.session.isRunning ? "running" : "stopped"
             }
-            self.timeLabel.text = status
+            if !self.isRecording {
+                self.timeLabel.text = status
+            }
             self.frameCounterLabel.text = "\(self.previewDebugMode.rawValue), \(running), W \(self.wideFrameCount), U \(self.ultraWideFrameCount), S \(self.singleFrameCount), \(Int(frame.width))x\(Int(frame.height))"
             self.refreshOverlayStatus()
         }
@@ -2057,6 +2049,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func toggleRecording(val: Bool) {
         isRecording = val
         updateRecordButtonAppearance(isRecording: val)
+        captureStatusBadges["summary"]?.isHidden = !val
+        refreshOverlayStatus()
         if val {
             fpsStepper.isEnabled = false
             UIApplication.shared.isIdleTimerDisabled = true
@@ -2084,7 +2078,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         legacyControlPanel = startStopButton.superview
         legacyControlPanel?.isHidden = true
 
-        sceneView.backgroundColor = UIColor(white: 0.02, alpha: 1.0)
+        sceneView.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
 
         let wideBadge = makeHUDLabelBadge()
         let ultraBadge = makeHUDLabelBadge()
@@ -2095,6 +2089,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         cameraStatusBadges["wide"] = wideBadge
         cameraStatusBadges["ultra"] = ultraBadge
         captureStatusBadges["summary"] = summaryBadge
+        summaryBadge.isHidden = true
         cameraStatusRows["wide"] = wideBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
@@ -2141,8 +2136,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         addSensorPill(to: sensorStack, key: "baro", title: "Baro")
         addSensorPill(to: sensorStack, key: "audio", title: "Audio")
 
-        let rightRail = makeOverlayPanel()
-        rightRail.alpha = 0.58
+        let rightRail = UIView()
+        rightRail.translatesAutoresizingMaskIntoConstraints = false
+        rightRail.backgroundColor = .clear
         view.addSubview(rightRail)
         rightControlRail = rightRail
         NSLayoutConstraint.activate([
@@ -2157,12 +2153,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         railStack.axis = .vertical
         railStack.alignment = .center
         railStack.distribution = .equalSpacing
-        rightRail.contentView.addSubview(railStack)
+        rightRail.addSubview(railStack)
         NSLayoutConstraint.activate([
-            railStack.leadingAnchor.constraint(equalTo: rightRail.contentView.leadingAnchor, constant: 10),
-            railStack.trailingAnchor.constraint(equalTo: rightRail.contentView.trailingAnchor, constant: -10),
-            railStack.topAnchor.constraint(equalTo: rightRail.contentView.topAnchor, constant: 18),
-            railStack.bottomAnchor.constraint(equalTo: rightRail.contentView.bottomAnchor, constant: -18)
+            railStack.leadingAnchor.constraint(equalTo: rightRail.leadingAnchor, constant: 10),
+            railStack.trailingAnchor.constraint(equalTo: rightRail.trailingAnchor, constant: -10),
+            railStack.topAnchor.constraint(equalTo: rightRail.topAnchor, constant: 18),
+            railStack.bottomAnchor.constraint(equalTo: rightRail.bottomAnchor, constant: -18)
         ])
 
         let settingsButton = makeRailButton(icon: "gearshape.fill", tint: .white)
@@ -2571,14 +2567,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func captureSummaryText() -> String {
-        let recColor = isRecording ? "●" : "○"
-        let time = isRecording ? (timeLabel.text ?? "00:00:00") : "00:00:00"
+        guard isRecording else { return "" }
+        let time = elapsedRecordingTimeText()
         let captureBytes = currentCaptureBytes()
-        let captureSize = ByteCountFormatter.string(fromByteCount: captureBytes, countStyle: .file)
+        let captureSize = megabyteText(captureBytes)
         let freeBytes = availableDiskBytes()
         let freeSize = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? diskCapacity
         let remaining = estimatedRemainingRecordTime(captureBytes: captureBytes, freeBytes: freeBytes)
-        return "REC \(time) \(recColor) | FILE \(captureSize) / FREE \(freeSize) | REM \(remaining)"
+        return "REC \(time) / \(captureSize) | FREE \(freeSize) | REM \(remaining)"
+    }
+
+    private func elapsedRecordingTimeText() -> String {
+        guard let startTime else { return "00:00:00" }
+        return durationText(seconds: max(Date().timeIntervalSince(startTime), 0))
+    }
+
+    private func megabyteText(_ bytes: Int64) -> String {
+        String(format: "%.1fMB", Double(bytes) / 1_000_000.0)
     }
 
     private func currentCaptureBytes() -> Int64 {
@@ -2601,21 +2606,21 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard isRecording,
               let freeBytes = freeBytes,
               captureBytes > 0 else {
-            return "--"
+            return "00:00:00"
         }
         let elapsed = Date().timeIntervalSince(startTime)
-        guard elapsed > 3 else { return "--" }
+        guard elapsed > 3 else { return "00:00:00" }
         let bytesPerSecond = Double(captureBytes) / elapsed
-        guard bytesPerSecond > 1 else { return "--" }
-        return compactDuration(seconds: TimeInterval(Double(freeBytes) / bytesPerSecond))
+        guard bytesPerSecond > 1 else { return "00:00:00" }
+        return durationText(seconds: TimeInterval(Double(freeBytes) / bytesPerSecond))
     }
 
-    private func compactDuration(seconds: TimeInterval) -> String {
-        let totalMinutes = max(Int(seconds / 60), 0)
-        if totalMinutes >= 60 {
-            return "\(totalMinutes / 60)h\(totalMinutes % 60)m"
-        }
-        return "\(totalMinutes)m"
+    private func durationText(seconds: TimeInterval) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
     }
 
     private func recordingDataStatusText() -> String {
