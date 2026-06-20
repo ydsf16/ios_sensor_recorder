@@ -983,6 +983,51 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         case dual = "dual preview"
     }
 
+    private struct CameraCaptureSettings: Codable {
+        var resolution: String
+        var frameRate: String
+        var autoFocus: Bool
+    }
+
+    private struct RecorderSettings: Codable {
+        var wide: CameraCaptureSettings
+        var ultraWide: CameraCaptureSettings
+        var imuEnabled: Bool
+        var magnetometerEnabled: Bool
+        var barometerEnabled: Bool
+        var geoLocationEnabled: Bool
+        var deviceMotionEnabled: Bool
+        var audioEnabled: Bool
+        var storageFormat: String
+
+        static let defaults = RecorderSettings(
+            wide: CameraCaptureSettings(resolution: "1920x1440", frameRate: "30", autoFocus: true),
+            ultraWide: CameraCaptureSettings(resolution: "1920x1440", frameRate: "30", autoFocus: true),
+            imuEnabled: true,
+            magnetometerEnabled: true,
+            barometerEnabled: true,
+            geoLocationEnabled: true,
+            deviceMotionEnabled: true,
+            audioEnabled: true,
+            storageFormat: "CSV"
+        )
+
+        private static let storageKey = "sensor_recorder.settings.v1"
+
+        static func load() -> RecorderSettings {
+            guard let data = UserDefaults.standard.data(forKey: storageKey),
+                  let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) else {
+                return defaults
+            }
+            return settings
+        }
+
+        func save() {
+            guard let data = try? JSONEncoder().encode(self) else { return }
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+    }
+
     // cellphone screen UI outlet objects
     @IBOutlet weak var startStopButton: UIButton!
     @IBOutlet weak var timeLabel: UILabel!
@@ -998,6 +1043,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private var legacyControlPanel: UIView?
     private var settingsOverlayView: UIView?
+    private var recorderSettings = RecorderSettings.load()
+    private var settingsSegmentControls: [String: UISegmentedControl] = [:]
+    private var settingsSwitches: [String: UISwitch] = [:]
+    private var settingsSegmentItems: [String: [String]] = [:]
     private var cameraStatusRows: [String: UILabel] = [:]
     private var sensorStatusRows: [String: UILabel] = [:]
     private var captureStatusRows: [String: UILabel] = [:]
@@ -1808,6 +1857,33 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return Int(dimensions.width) * Int(dimensions.height)
     }
 
+    private func cameraResolutionOptions(for device: AVCaptureDevice?) -> [String] {
+        guard let device = device else {
+            return ["1920x1440", "1280x960", "640x480"]
+        }
+
+        let options = device.formats.compactMap { format -> (label: String, area: Int)? in
+            guard format.isMultiCamSupported else { return nil }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let width = Int(dimensions.width)
+            let height = Int(dimensions.height)
+            guard width > 0, height > 0 else { return nil }
+            let aspect = Double(width) / Double(height)
+            guard abs(aspect - (4.0 / 3.0)) < 0.03 else { return nil }
+            return ("\(width)x\(height)", width * height)
+        }
+
+        let unique = Dictionary(options.map { ($0.label, $0.area) }, uniquingKeysWith: max)
+        let sorted = unique.sorted { lhs, rhs in
+            if lhs.value != rhs.value {
+                return lhs.value > rhs.value
+            }
+            return lhs.key > rhs.key
+        }
+        let labels = sorted.map(\.key)
+        return labels.isEmpty ? ["1920x1440", "1280x960", "640x480"] : Array(labels.prefix(5))
+    }
+
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
         if connection.isVideoOrientationSupported {
             connection.videoOrientation = .landscapeRight
@@ -2312,7 +2388,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         stack.addArrangedSubview(label)
     }
 
-    private func addSettingsSegmentedRow(to stack: UIStackView, title: String, items: [String], selectedIndex: Int) {
+    private func addSettingsSegmentedRow(
+        to stack: UIStackView,
+        key: String,
+        title: String,
+        items: [String],
+        selectedValue: String
+    ) {
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
@@ -2325,14 +2407,59 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         titleLabel.widthAnchor.constraint(equalToConstant: 170).isActive = true
 
         let segmentedControl = UISegmentedControl(items: items)
-        segmentedControl.selectedSegmentIndex = selectedIndex
+        segmentedControl.selectedSegmentIndex = selectedIndex(for: selectedValue, in: items)
         segmentedControl.selectedSegmentTintColor = .systemTeal
         segmentedControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .normal)
         segmentedControl.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
+        settingsSegmentControls[key] = segmentedControl
+        settingsSegmentItems[key] = items
 
         row.addArrangedSubview(titleLabel)
         row.addArrangedSubview(segmentedControl)
         stack.addArrangedSubview(row)
+    }
+
+    private func addCameraSettingsSection(
+        to stack: UIStackView,
+        title: String,
+        keyPrefix: String,
+        settings: CameraCaptureSettings,
+        resolutionItems: [String]
+    ) {
+        addSettingsSubsectionTitle(to: stack, title: title)
+        addSettingsSegmentedRow(
+            to: stack,
+            key: "\(keyPrefix).resolution",
+            title: "Resolution",
+            items: resolutionItems,
+            selectedValue: settings.resolution
+        )
+        addSettingsSegmentedRow(
+            to: stack,
+            key: "\(keyPrefix).frameRate",
+            title: "Hz",
+            items: ["1", "5", "10", "20", "30", "60"],
+            selectedValue: settings.frameRate
+        )
+        addSettingsRow(
+            to: stack,
+            key: "\(keyPrefix).autoFocus",
+            title: "Auto Focus",
+            detail: "Disable only for fixed-focus calibration tests",
+            isOn: settings.autoFocus
+        )
+    }
+
+    private func addSettingsSubsectionTitle(to stack: UIStackView, title: String) {
+        let label = UILabel()
+        label.text = title
+        label.font = UIFont.systemFont(ofSize: 18, weight: .bold)
+        label.textColor = .white
+        stack.addArrangedSubview(label)
+    }
+
+    private func selectedIndex(for selectedValue: String, in items: [String]) -> Int {
+        items.firstIndex(of: selectedValue) ?? min(1, max(items.count - 1, 0))
     }
 
     private func makeOverlayPanel() -> UIVisualEffectView {
@@ -2404,6 +2531,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     @objc private func showSettingsOverlay() {
         guard settingsOverlayView == nil else { return }
+        settingsSegmentControls.removeAll()
+        settingsSwitches.removeAll()
+        settingsSegmentItems.removeAll()
 
         let dimView = UIView()
         dimView.translatesAutoresizingMaskIntoConstraints = false
@@ -2487,25 +2617,41 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         ])
 
         addSettingsSectionTitle(to: stack, title: "Camera")
-        addSettingsSegmentedRow(to: stack, title: "Resolution", items: ["4:3 Native", "1080p"], selectedIndex: 1)
-        addSettingsSegmentedRow(to: stack, title: "Frame Rate", items: ["24", "30", "60"], selectedIndex: 1)
-        addSettingsRow(to: stack, title: "Auto Focus", detail: "Keep enabled unless running fixed-focus SLAM tests", isOn: true)
-        addSettingsRow(to: stack, title: "Wide Camera", detail: "Main capture stream", isOn: true)
-        addSettingsRow(to: stack, title: "Ultra-wide Camera", detail: "Secondary capture stream", isOn: true)
+        addCameraSettingsSection(
+            to: stack,
+            title: "Wide Camera",
+            keyPrefix: "wide",
+            settings: recorderSettings.wide,
+            resolutionItems: cameraResolutionOptions(for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back))
+        )
+        addCameraSettingsSection(
+            to: stack,
+            title: "Ultra-wide Camera",
+            keyPrefix: "ultra",
+            settings: recorderSettings.ultraWide,
+            resolutionItems: cameraResolutionOptions(for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back))
+        )
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
-        addSettingsRow(to: stack, title: "IMU", detail: "Raw accel + gyro, target 400Hz", isOn: true)
-        addSettingsRow(to: stack, title: "Device Motion", detail: "Fused attitude, target 100Hz", isOn: true)
-        addSettingsRow(to: stack, title: "Magnetometer", detail: "Raw magnetic field, target 50Hz", isOn: true)
-        addSettingsRow(to: stack, title: "Barometer", detail: "Pressure + relative altitude", isOn: true)
-        addSettingsRow(to: stack, title: "GeoLoc", detail: "CoreLocation fused geographic fixes", isOn: true)
-        addSettingsRow(to: stack, title: "Audio", detail: "M4A AAC, device input channels", isOn: true)
+        addSettingsRow(to: stack, key: "imu", title: "IMU", detail: "Raw accel + gyro", isOn: recorderSettings.imuEnabled)
+        addSettingsRow(to: stack, key: "mag", title: "Magnetometer", detail: "Raw magnetic field", isOn: recorderSettings.magnetometerEnabled)
+        addSettingsRow(to: stack, key: "baro", title: "Barometer", detail: "Pressure + relative altitude", isOn: recorderSettings.barometerEnabled)
+        addSettingsRow(to: stack, key: "geo", title: "GeoLoc", detail: "CoreLocation fused geographic fixes", isOn: recorderSettings.geoLocationEnabled)
+        addSettingsRow(to: stack, key: "motion", title: "Device Motion", detail: "Fused attitude + gravity", isOn: recorderSettings.deviceMotionEnabled)
+        addSettingsRow(to: stack, key: "audio", title: "Audio", detail: "M4A AAC, device input channels", isOn: recorderSettings.audioEnabled)
 
         addSettingsSectionTitle(to: stack, title: "Storage")
-        addSettingsSegmentedRow(to: stack, title: "Format", items: ["CSV", "Binary"], selectedIndex: 0)
+        addSettingsSegmentedRow(
+            to: stack,
+            key: "storageFormat",
+            title: "Format",
+            items: ["CSV", "Binary"],
+            selectedValue: recorderSettings.storageFormat
+        )
+        addSettingsSaveButton(to: stack)
     }
 
-    private func addSettingsRow(to stack: UIStackView, title: String, detail: String, isOn: Bool) {
+    private func addSettingsRow(to stack: UIStackView, key: String, title: String, detail: String, isOn: Bool) {
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
@@ -2532,10 +2678,59 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let sensorSwitch = UISwitch()
         sensorSwitch.isOn = isOn
         sensorSwitch.onTintColor = .systemTeal
+        settingsSwitches[key] = sensorSwitch
 
         row.addArrangedSubview(textStack)
         row.addArrangedSubview(sensorSwitch)
         stack.addArrangedSubview(row)
+    }
+
+    private func addSettingsSaveButton(to stack: UIStackView) {
+        let saveButton = UIButton(type: .system)
+        var config = UIButton.Configuration.filled()
+        config.title = "Save Settings"
+        config.baseBackgroundColor = .systemTeal
+        config.baseForegroundColor = .black
+        config.cornerStyle = .large
+        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
+        saveButton.configuration = config
+        saveButton.addTarget(self, action: #selector(saveSettingsOverlay), for: .touchUpInside)
+        stack.addArrangedSubview(saveButton)
+    }
+
+    @objc private func saveSettingsOverlay() {
+        recorderSettings = RecorderSettings(
+            wide: CameraCaptureSettings(
+                resolution: selectedSettingsValue(for: "wide.resolution", fallback: recorderSettings.wide.resolution),
+                frameRate: selectedSettingsValue(for: "wide.frameRate", fallback: recorderSettings.wide.frameRate),
+                autoFocus: settingsSwitches["wide.autoFocus"]?.isOn ?? recorderSettings.wide.autoFocus
+            ),
+            ultraWide: CameraCaptureSettings(
+                resolution: selectedSettingsValue(for: "ultra.resolution", fallback: recorderSettings.ultraWide.resolution),
+                frameRate: selectedSettingsValue(for: "ultra.frameRate", fallback: recorderSettings.ultraWide.frameRate),
+                autoFocus: settingsSwitches["ultra.autoFocus"]?.isOn ?? recorderSettings.ultraWide.autoFocus
+            ),
+            imuEnabled: settingsSwitches["imu"]?.isOn ?? recorderSettings.imuEnabled,
+            magnetometerEnabled: settingsSwitches["mag"]?.isOn ?? recorderSettings.magnetometerEnabled,
+            barometerEnabled: settingsSwitches["baro"]?.isOn ?? recorderSettings.barometerEnabled,
+            geoLocationEnabled: settingsSwitches["geo"]?.isOn ?? recorderSettings.geoLocationEnabled,
+            deviceMotionEnabled: settingsSwitches["motion"]?.isOn ?? recorderSettings.deviceMotionEnabled,
+            audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled,
+            storageFormat: selectedSettingsValue(for: "storageFormat", fallback: recorderSettings.storageFormat)
+        )
+        recorderSettings.save()
+        setStatus("Settings saved")
+        hideSettingsOverlay()
+    }
+
+    private func selectedSettingsValue(for key: String, fallback: String) -> String {
+        guard let control = settingsSegmentControls[key],
+              let items = settingsSegmentItems[key],
+              control.selectedSegmentIndex >= 0,
+              control.selectedSegmentIndex < items.count else {
+            return fallback
+        }
+        return items[control.selectedSegmentIndex]
     }
 
     @objc private func hideSettingsOverlay() {
