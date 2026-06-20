@@ -39,6 +39,7 @@ private final class CameraStreamRecorder {
     private let infoURL: URL
     private let cameraName: String
     private let includeAudioTrack: Bool
+    private let expectedFrameRate: Double
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
@@ -48,11 +49,12 @@ private final class CameraStreamRecorder {
     private var frameIndex = 0
     private var isFinishing = false
 
-    init(cameraName: String, videoURL: URL, infoURL: URL, includeAudioTrack: Bool) {
+    init(cameraName: String, videoURL: URL, infoURL: URL, includeAudioTrack: Bool, expectedFrameRate: Double) {
         self.cameraName = cameraName
         self.videoURL = videoURL
         self.infoURL = infoURL
         self.includeAudioTrack = includeAudioTrack
+        self.expectedFrameRate = expectedFrameRate
         self.utcMinusSensorOffsetSec = Date().timeIntervalSince1970 - CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         try? FileManager.default.removeItem(at: videoURL)
         try? FileManager.default.removeItem(at: infoURL)
@@ -126,7 +128,7 @@ private final class CameraStreamRecorder {
     func writeDeviceFormat(_ device: AVCaptureDevice?) {
         guard let device = device else { return }
         let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-        writeInfoLine("# active_format,\(dimensions.width)x\(dimensions.height),fps,30")
+        writeInfoLine("# active_format,\(dimensions.width)x\(dimensions.height),fps,\(String(format: "%.3f", expectedFrameRate))")
     }
 
     private func configureWriter(_ sampleBuffer: CMSampleBuffer) {
@@ -142,7 +144,7 @@ private final class CameraStreamRecorder {
                 AVVideoHeightKey: height,
                 AVVideoCompressionPropertiesKey: [
                     AVVideoAverageBitRateKey: max(width * height * 4, 2_000_000),
-                    AVVideoExpectedSourceFrameRateKey: 30,
+                    AVVideoExpectedSourceFrameRateKey: Int(max(expectedFrameRate.rounded(), 1)),
                     AVVideoAllowFrameReorderingKey: false,
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
                 ]
@@ -446,6 +448,13 @@ private final class SensorCSVWriter {
 }
 
 private final class SensorStreamRecorder {
+    struct Options {
+        var imuEnabled: Bool
+        var deviceMotionEnabled: Bool
+        var magnetometerEnabled: Bool
+        var barometerEnabled: Bool
+    }
+
     private struct AccelerometerSample {
         let sensorSec: TimeInterval
         let utcSec: TimeInterval
@@ -496,60 +505,70 @@ private final class SensorStreamRecorder {
         utcMinusSensorOffsetSec = Date().timeIntervalSince1970 - CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
     }
 
-    func start(in directory: URL) {
-        accelerometerWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("accelerometer.csv"),
-            header: "sensor_sec,utc_sec,ax,ay,az"
-        )
-        gyroscopeWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("gyroscope.csv"),
-            header: "sensor_sec,utc_sec,gx,gy,gz"
-        )
-        imuWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("imu.csv"),
-            header: "sensor_sec,utc_sec,ax,ay,az,gx,gy,gz,accel_sensor_sec,gyro_sensor_sec"
-        )
-        deviceMotionWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("device_motion.csv"),
-            header: [
-                "sensor_sec",
-                "utc_sec",
-                "qw",
-                "qx",
-                "qy",
-                "qz",
-                "roll",
-                "pitch",
-                "yaw",
-                "gravity_x",
-                "gravity_y",
-                "gravity_z",
-                "user_accel_x",
-                "user_accel_y",
-                "user_accel_z",
-                "rotation_rate_x",
-                "rotation_rate_y",
-                "rotation_rate_z",
-                "magnetic_field_x",
-                "magnetic_field_y",
-                "magnetic_field_z",
-                "magnetic_accuracy",
-                "heading_deg"
-            ].joined(separator: ",")
-        )
-        magnetometerWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("magnetometer.csv"),
-            header: "sensor_sec,utc_sec,mx,my,mz"
-        )
-        barometerWriter = SensorCSVWriter(
-            url: directory.appendingPathComponent("barometer.csv"),
-            header: "sensor_sec,utc_sec,pressure_kpa,relative_altitude_m"
-        )
+    func start(in directory: URL, options: Options) {
+        if options.imuEnabled {
+            accelerometerWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("accelerometer.csv"),
+                header: "sensor_sec,utc_sec,ax,ay,az"
+            )
+            gyroscopeWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("gyroscope.csv"),
+                header: "sensor_sec,utc_sec,gx,gy,gz"
+            )
+            imuWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("imu.csv"),
+                header: "sensor_sec,utc_sec,ax,ay,az,gx,gy,gz,accel_sensor_sec,gyro_sensor_sec"
+            )
+            startIMUUpdates()
+        }
 
-        startIMUUpdates()
-        startDeviceMotionUpdates()
-        startMagnetometerUpdates()
-        startBarometerUpdates()
+        if options.deviceMotionEnabled {
+            deviceMotionWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("device_motion.csv"),
+                header: [
+                    "sensor_sec",
+                    "utc_sec",
+                    "qw",
+                    "qx",
+                    "qy",
+                    "qz",
+                    "roll",
+                    "pitch",
+                    "yaw",
+                    "gravity_x",
+                    "gravity_y",
+                    "gravity_z",
+                    "user_accel_x",
+                    "user_accel_y",
+                    "user_accel_z",
+                    "rotation_rate_x",
+                    "rotation_rate_y",
+                    "rotation_rate_z",
+                    "magnetic_field_x",
+                    "magnetic_field_y",
+                    "magnetic_field_z",
+                    "magnetic_accuracy",
+                    "heading_deg"
+                ].joined(separator: ",")
+            )
+            startDeviceMotionUpdates()
+        }
+
+        if options.magnetometerEnabled {
+            magnetometerWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("magnetometer.csv"),
+                header: "sensor_sec,utc_sec,mx,my,mz"
+            )
+            startMagnetometerUpdates()
+        }
+
+        if options.barometerEnabled {
+            barometerWriter = SensorCSVWriter(
+                url: directory.appendingPathComponent("barometer.csv"),
+                header: "sensor_sec,utc_sec,pressure_kpa,relative_altitude_m"
+            )
+            startBarometerUpdates()
+        }
     }
 
     func statusText() -> String {
@@ -1136,6 +1155,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        recorderSettings = RecorderSettings.load()
         view.backgroundColor = .black
         updateDiskCapacity()
         installLandscapeOverlay()
@@ -1543,7 +1563,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             guard configurePreviewCamera(
                 deviceType: .builtInWideAngleCamera,
                 cameraName: "wide",
-                previewIndex: 0
+                previewIndex: 0,
+                settings: recorderSettings.wide
             ) else {
                 os_log("Failed to configure wide camera.", type: .error)
                 showError(msg: "Failed to configure wide camera.")
@@ -1555,7 +1576,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             guard configurePreviewCamera(
                 deviceType: .builtInUltraWideCamera,
                 cameraName: "ultrawide",
-                previewIndex: 1
+                previewIndex: 1,
+                settings: recorderSettings.ultraWide
             ) else {
                 os_log("Failed to configure ultra-wide camera.", type: .error)
                 showError(msg: "Failed to configure ultra-wide camera.")
@@ -1587,7 +1609,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func configurePreviewCamera(
         deviceType: AVCaptureDevice.DeviceType,
         cameraName: String,
-        previewIndex: Int
+        previewIndex: Int,
+        settings: CameraCaptureSettings
     ) -> Bool {
         guard let device = AVCaptureDevice.default(deviceType, for: .video, position: .back) else {
             os_log("Camera unavailable: %@", type: .error, deviceType.rawValue)
@@ -1595,7 +1618,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         do {
-            try configureDeviceForPreview(device)
+            try configureDeviceForPreview(device, settings: settings)
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else { return false }
             session.addInputWithNoConnections(input)
@@ -1768,39 +1791,66 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return movieOutput
     }
 
-    private func configureDeviceForPreview(_ device: AVCaptureDevice) throws {
+    private func configureDeviceForPreview(_ device: AVCaptureDevice, settings: CameraCaptureSettings) throws {
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        if let format = preferred1080pFormats(for: device).first {
+        if let format = preferredFormats(for: device, settings: settings).first {
             device.activeFormat = format
         }
 
-        let duration = CMTime(value: 1, timescale: 30)
+        let fps = supportedFrameRate(for: device.activeFormat, requested: clampedFrameRate(from: settings.frameRate))
+        let duration = frameDuration(for: fps)
         device.activeVideoMinFrameDuration = duration
         device.activeVideoMaxFrameDuration = duration
+
+        if settings.autoFocus {
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
+            }
+        } else if device.isFocusModeSupported(.locked) {
+            if device.isLockingFocusWithCustomLensPositionSupported {
+                device.setFocusModeLocked(
+                    lensPosition: lensPosition(forFocusDistanceMeters: 1.5),
+                    completionHandler: nil
+                )
+            } else {
+                device.focusMode = .locked
+            }
+        }
     }
 
-    private func preferred1080pFormats(for device: AVCaptureDevice) -> [AVCaptureDevice.Format] {
-        let targetWidth = 1920
-        let targetHeight = 1080
-        let targetArea = targetWidth * targetHeight
+    private func lensPosition(forFocusDistanceMeters meters: Double) -> Float {
+        let safeMeters = max(meters, 0.1)
+        return Float(min(max(1.0 / safeMeters, 0.0), 1.0))
+    }
 
+    private func preferredFormats(for device: AVCaptureDevice, settings: CameraCaptureSettings) -> [AVCaptureDevice.Format] {
+        let target = resolutionSize(from: settings.resolution) ?? CGSize(width: 1920, height: 1440)
+        let targetWidth = Int(target.width)
+        let targetHeight = Int(target.height)
+        let targetArea = targetWidth * targetHeight
         return device.formats.filter { format in
-            guard format.isMultiCamSupported else { return false }
-            return format.videoSupportedFrameRateRanges.contains { range in
-                range.minFrameRate <= 30 && 30 <= range.maxFrameRate
-            }
+            format.isMultiCamSupported
         }.sorted { lhs, rhs in
             let lhsDims = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
             let rhsDims = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
             let lhsArea = Int(lhsDims.width) * Int(lhsDims.height)
             let rhsArea = Int(rhsDims.width) * Int(rhsDims.height)
 
-            let lhsExact1080p = Int(lhsDims.width) == targetWidth && Int(lhsDims.height) == targetHeight
-            let rhsExact1080p = Int(rhsDims.width) == targetWidth && Int(rhsDims.height) == targetHeight
-            if lhsExact1080p != rhsExact1080p {
-                return lhsExact1080p
+            let lhsExact = Int(lhsDims.width) == targetWidth && Int(lhsDims.height) == targetHeight
+            let rhsExact = Int(rhsDims.width) == targetWidth && Int(rhsDims.height) == targetHeight
+            if lhsExact != rhsExact {
+                return lhsExact
+            }
+
+            let targetFPS = clampedFrameRate(from: settings.frameRate)
+            let lhsFPSDistance = frameRateDistance(for: lhs, requested: targetFPS)
+            let rhsFPSDistance = frameRateDistance(for: rhs, requested: targetFPS)
+            if lhsFPSDistance != rhsFPSDistance {
+                return lhsFPSDistance < rhsFPSDistance
             }
 
             let lhsUnderTarget = lhsArea <= targetArea
@@ -1820,6 +1870,53 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             }
             return lhsDims.width > rhsDims.width
         }
+    }
+
+    private func resolutionSize(from value: String) -> CGSize? {
+        let parts = value.lowercased().split(separator: "x")
+        guard parts.count == 2,
+              let width = Double(parts[0]),
+              let height = Double(parts[1]),
+              width > 0,
+              height > 0 else {
+            return nil
+        }
+        return CGSize(width: width, height: height)
+    }
+
+    private func clampedFrameRate(from value: String) -> Double {
+        guard let fps = Double(value), fps.isFinite else {
+            return 30
+        }
+        return min(max(fps, 0.1), 60)
+    }
+
+    private func supportedFrameRate(for format: AVCaptureDevice.Format, requested: Double) -> Double {
+        guard let range = format.videoSupportedFrameRateRanges.min(by: { lhs, rhs in
+            let lhsClamped = min(max(requested, lhs.minFrameRate), lhs.maxFrameRate)
+            let rhsClamped = min(max(requested, rhs.minFrameRate), rhs.maxFrameRate)
+            return abs(lhsClamped - requested) < abs(rhsClamped - requested)
+        }) else {
+            return requested
+        }
+        return min(max(requested, range.minFrameRate), range.maxFrameRate)
+    }
+
+    private func frameRateDistance(for format: AVCaptureDevice.Format, requested: Double) -> Double {
+        abs(supportedFrameRate(for: format, requested: requested) - requested)
+    }
+
+    private func activeFrameRate(for device: AVCaptureDevice?, settings: CameraCaptureSettings) -> Double {
+        guard let device = device else {
+            return clampedFrameRate(from: settings.frameRate)
+        }
+        return supportedFrameRate(for: device.activeFormat, requested: clampedFrameRate(from: settings.frameRate))
+    }
+
+    private func frameDuration(for fps: Double) -> CMTime {
+        let scale: Int32 = 600
+        let value = max(Int64(round(Double(scale) / max(fps, 0.1))), 1)
+        return CMTime(value: value, timescale: scale)
     }
 
     private func reduceFormatsForMulticamBudgetIfNeeded() {
@@ -1852,7 +1949,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func downgradeFormat(for device: AVCaptureDevice) -> Bool {
-        let formats = preferred1080pFormats(for: device)
+        let settings = device === wideDevice ? recorderSettings.wide : recorderSettings.ultraWide
+        let formats = preferredFormats(for: device, settings: settings)
         guard let currentIndex = formats.firstIndex(where: { $0 === device.activeFormat }),
               currentIndex + 1 < formats.count else {
             return false
@@ -1862,7 +1960,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         do {
             try device.lockForConfiguration()
             device.activeFormat = nextFormat
-            let duration = CMTime(value: 1, timescale: 30)
+            let fps = supportedFrameRate(for: nextFormat, requested: clampedFrameRate(from: settings.frameRate))
+            let duration = frameDuration(for: fps)
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
             device.unlockForConfiguration()
@@ -1884,10 +1983,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         let options = device.formats.compactMap { format -> (label: String, area: Int)? in
+            guard format.isMultiCamSupported else { return nil }
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             let width = Int(dimensions.width)
             let height = Int(dimensions.height)
             guard width > 0, height > 0 else { return nil }
+            guard width >= 640 && height >= 480 else { return nil }
             let aspect = Double(width) / Double(height)
             guard abs(aspect - (4.0 / 3.0)) < 0.03 else { return nil }
             return ("\(width)x\(height)", width * height)
@@ -1913,6 +2014,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
         if connection.isVideoMirroringSupported {
             connection.isVideoMirrored = false
+        }
+    }
+
+    private func applyRecordingCameraSettings() {
+        if let wideDevice {
+            do {
+                try configureDeviceForPreview(wideDevice, settings: recorderSettings.wide)
+            } catch {
+                os_log("Failed to apply wide recording settings: %@", type: .error, error.localizedDescription)
+            }
+        }
+        if let ultraWideDevice {
+            do {
+                try configureDeviceForPreview(ultraWideDevice, settings: recorderSettings.ultraWide)
+            } catch {
+                os_log("Failed to apply ultra-wide recording settings: %@", type: .error, error.localizedDescription)
+            }
         }
     }
 
@@ -2015,6 +2133,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         startStopButton.isEnabled = false
         timeLabel.text = "Preparing"
         appendStartDebug("start_tapped")
+        recorderSettings = RecorderSettings.load()
 
         guard isConfigured && session.isRunning else {
             startStopButton.isEnabled = true
@@ -2031,44 +2150,77 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         sessionQueue.async {
             self.appendStartDebug("session_queue_enter")
+            self.applyRecordingCameraSettings()
             self.resetRecordingStartAlignment()
-            self.appendStartDebug("create_wide_recorder_begin")
-            self.wideRecorder = CameraStreamRecorder(
-                cameraName: "wide",
-                videoURL: self.outDirURL.appendingPathComponent("wide.mp4"),
-                infoURL: self.outDirURL.appendingPathComponent("wide_info.csv"),
-                includeAudioTrack: self.embedAudioInCameraMP4
+
+            if self.recorderSettings.wide.enabled {
+                self.appendStartDebug("create_wide_recorder_begin")
+                self.wideRecorder = CameraStreamRecorder(
+                    cameraName: "wide",
+                    videoURL: self.outDirURL.appendingPathComponent("wide.mp4"),
+                    infoURL: self.outDirURL.appendingPathComponent("wide_info.csv"),
+                    includeAudioTrack: self.embedAudioInCameraMP4 && self.recorderSettings.audioEnabled,
+                    expectedFrameRate: self.activeFrameRate(for: self.wideDevice, settings: self.recorderSettings.wide)
+                )
+                self.wideRecorder?.writeDeviceFormat(self.wideDevice)
+                self.appendStartDebug("create_wide_recorder_done")
+            } else {
+                self.appendStartDebug("wide_recorder_disabled")
+            }
+
+            if self.recorderSettings.ultraWide.enabled {
+                self.appendStartDebug("create_ultrawide_recorder_begin")
+                self.ultraWideRecorder = CameraStreamRecorder(
+                    cameraName: "ultrawide",
+                    videoURL: self.outDirURL.appendingPathComponent("ultrawide.mp4"),
+                    infoURL: self.outDirURL.appendingPathComponent("ultra_info.csv"),
+                    includeAudioTrack: self.embedAudioInCameraMP4 && self.recorderSettings.audioEnabled,
+                    expectedFrameRate: self.activeFrameRate(for: self.ultraWideDevice, settings: self.recorderSettings.ultraWide)
+                )
+                self.ultraWideRecorder?.writeDeviceFormat(self.ultraWideDevice)
+                self.appendStartDebug("create_ultrawide_recorder_done")
+            } else {
+                self.appendStartDebug("ultrawide_recorder_disabled")
+            }
+
+            if self.recorderSettings.audioEnabled {
+                self.appendStartDebug("create_audio_recorder_begin")
+                self.audioRecorder = AudioStreamRecorder(
+                    audioURL: self.outDirURL.appendingPathComponent("audio.m4a"),
+                    infoURL: self.outDirURL.appendingPathComponent("audio_info.csv")
+                )
+                self.appendStartDebug("create_audio_recorder_done")
+            } else {
+                self.appendStartDebug("audio_recorder_disabled")
+            }
+
+            let sensorOptions = SensorStreamRecorder.Options(
+                imuEnabled: self.recorderSettings.imuEnabled,
+                deviceMotionEnabled: self.recorderSettings.deviceMotionEnabled,
+                magnetometerEnabled: self.recorderSettings.magnetometerEnabled,
+                barometerEnabled: self.recorderSettings.barometerEnabled
             )
-            self.wideRecorder?.writeDeviceFormat(self.wideDevice)
-            self.appendStartDebug("create_wide_recorder_done")
-            self.appendStartDebug("create_ultrawide_recorder_begin")
-            self.ultraWideRecorder = CameraStreamRecorder(
-                cameraName: "ultrawide",
-                videoURL: self.outDirURL.appendingPathComponent("ultrawide.mp4"),
-                infoURL: self.outDirURL.appendingPathComponent("ultra_info.csv"),
-                includeAudioTrack: self.embedAudioInCameraMP4
-            )
-            self.ultraWideRecorder?.writeDeviceFormat(self.ultraWideDevice)
-            self.appendStartDebug("create_ultrawide_recorder_done")
-            self.appendStartDebug("create_audio_recorder_begin")
-            self.audioRecorder = AudioStreamRecorder(
-                audioURL: self.outDirURL.appendingPathComponent("audio.m4a"),
-                infoURL: self.outDirURL.appendingPathComponent("audio_info.csv")
-            )
-            self.appendStartDebug("create_audio_recorder_done")
-            self.appendStartDebug("start_sensor_recorder_begin")
-            let sensorRecorder = SensorStreamRecorder()
-            sensorRecorder.start(in: self.outDirURL)
-            self.sensorRecorder = sensorRecorder
-            self.appendStartDebug("start_sensor_recorder_done")
+            if sensorOptions.imuEnabled || sensorOptions.deviceMotionEnabled || sensorOptions.magnetometerEnabled || sensorOptions.barometerEnabled {
+                self.appendStartDebug("start_sensor_recorder_begin")
+                let sensorRecorder = SensorStreamRecorder()
+                sensorRecorder.start(in: self.outDirURL, options: sensorOptions)
+                self.sensorRecorder = sensorRecorder
+                self.appendStartDebug("start_sensor_recorder_done")
+            } else {
+                self.appendStartDebug("sensor_recorder_disabled")
+            }
 
             DispatchQueue.main.async {
                 self.appendStartDebug("main_recording_begin")
                 self.startTime = Date()
                 self.toggleRecording(val: true)
-                self.appendStartDebug("start_location_begin")
-                self.startLocationRecording()
-                self.appendStartDebug("start_location_done")
+                if self.recorderSettings.geoLocationEnabled {
+                    self.appendStartDebug("start_location_begin")
+                    self.startLocationRecording()
+                    self.appendStartDebug("start_location_done")
+                } else {
+                    self.appendStartDebug("location_recorder_disabled")
+                }
                 self.updateTime()
                 self.recordingTimer = Timer.scheduledTimer(
                     timeInterval: 1.0,
@@ -2177,7 +2329,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         config?.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)
         config?.baseBackgroundColor = isRecording ? UIColor.systemRed.withAlphaComponent(0.95) : UIColor.systemRed.withAlphaComponent(0.86)
         config?.baseForegroundColor = .white
+        config?.cornerStyle = .capsule
+        config?.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12)
         startStopButton.configuration = config
+        startStopButton.layer.cornerRadius = 34
+        startStopButton.layer.cornerCurve = .continuous
+        startStopButton.clipsToBounds = false
     }
 
     private func updateAuxiliaryRailButtons(isRecording: Bool) {
@@ -2304,13 +2461,15 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         railStack.addArrangedSubview(settingsButton)
         settingsRailButton = settingsButton
 
-        let recordButton = makeRailButton(icon: "stop.fill", tint: .white)
+        let recordButton = makeRailButton(icon: "circle.fill", tint: .white)
         var recordConfig = recordButton.configuration
         recordConfig?.baseBackgroundColor = UIColor.systemRed.withAlphaComponent(0.86)
+        recordConfig?.cornerStyle = .capsule
         recordButton.configuration = recordConfig
         recordButton.addTarget(self, action: #selector(startStopButtonPressed(_:)), for: .touchUpInside)
         railStack.addArrangedSubview(recordButton)
         startStopButton = recordButton
+        updateRecordButtonAppearance(isRecording: false)
 
         let filesButton = makeRailButton(icon: "folder.fill", tint: .white)
         filesButton.addTarget(self, action: #selector(openLastCaptureDirectory), for: .touchUpInside)
@@ -2379,12 +2538,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)
         config.baseForegroundColor = tint
         config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.18)
-        config.cornerStyle = .large
+        config.cornerStyle = .capsule
         config.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12)
 
         let button = UIButton(configuration: config)
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.layer.cornerRadius = 18
+        button.layer.cornerRadius = 34
+        button.layer.cornerCurve = .continuous
         button.layer.shadowColor = UIColor.black.cgColor
         button.layer.shadowOpacity = 0.35
         button.layer.shadowRadius = 8
@@ -2839,6 +2999,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         recorderSettings.save()
         setStatus("Settings saved")
         hideSettingsOverlay()
+        sessionQueue.async {
+            self.applyRecordingCameraSettings()
+            DispatchQueue.main.async {
+                self.refreshOverlayStatus()
+            }
+        }
     }
 
     private func selectedSettingsValue(for key: String, fallback: String) -> String {
@@ -2863,6 +3029,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         fpsStepper.value = 30
         fpsStepper.isEnabled = false
         timeWriteLabel.text = "mp4,csv"
+        updateRecordButtonAppearance(isRecording: false)
         refreshOverlayStatus()
     }
 
@@ -2884,13 +3051,17 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         cameraStatusRows["wide"]?.text = cameraStatusText(
             frameCount: wideFrameCount,
             device: wideDevice,
-            fallbackName: "wide.mp4"
+            fallbackName: "wide.mp4",
+            settings: recorderSettings.wide
         )
+        updateCameraStatusColor(key: "wide", enabled: recorderSettings.wide.enabled, activeRecorder: wideRecorder != nil)
         cameraStatusRows["ultra"]?.text = cameraStatusText(
             frameCount: ultraWideFrameCount,
             device: ultraWideDevice,
-            fallbackName: "ultrawide.mp4"
+            fallbackName: "ultrawide.mp4",
+            settings: recorderSettings.ultraWide
         )
+        updateCameraStatusColor(key: "ultra", enabled: recorderSettings.ultraWide.enabled, activeRecorder: ultraWideRecorder != nil)
 
         let sensorRows = sensorRecorder?.statusRows() ?? [:]
         updateSensorPill(key: "imu", title: "IMU", value: sensorRows["imu"] ?? "0Hz")
@@ -2907,18 +3078,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         updateCaptureSummaryLabel()
     }
 
-    private func cameraStatusText(frameCount: Int, device: AVCaptureDevice?, fallbackName: String) -> String {
+    private func cameraStatusText(frameCount: Int, device: AVCaptureDevice?, fallbackName: String, settings: CameraCaptureSettings) -> String {
         let resolution: String
         if let device = device {
             let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
             resolution = "\(dimensions.width)x\(dimensions.height)"
         } else {
-            resolution = "1920x1080"
+            resolution = settings.resolution
         }
 
         let cameraName = fallbackName.hasPrefix("wide") ? "WIDE" : "ULTRAWIDE"
-        let hz = frameCount == 0 ? "0 Hz" : "30 Hz"
+        let hz = frameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", activeFrameRate(for: device, settings: settings))
         return "\(cameraName) 4:3 | \(resolution) | \(hz)"
+    }
+
+    private func updateCameraStatusColor(key: String, enabled: Bool, activeRecorder: Bool) {
+        guard let label = cameraStatusRows[key] else { return }
+        label.textColor = isRecording && enabled && activeRecorder ? .systemGreen : UIColor.white.withAlphaComponent(0.42)
     }
 
     private func updateSensorPill(key: String, title: String, value: String) {
@@ -3034,9 +3210,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func createFiles() -> Bool {
         let recDirURL = getRecDir()
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd_HH.mm.ss"
+        dateFormatter.dateFormat = "yyyy_MM_dd_HH_mm_ss"
         let date = dateFormatter.string(from: Date())
-        outDirURL = recDirURL.appendingPathComponent(date)
+        outDirURL = recDirURL.appendingPathComponent("SensorRec_\(date)")
         startDebugURL = outDirURL.appendingPathComponent("start_debug.txt")
         do {
             try FileManager.default.createDirectory(at: outDirURL, withIntermediateDirectories: true, attributes: nil)
@@ -3066,6 +3242,29 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
     }
 
+    private func currentRecordingSettingsJSON() -> [String: Any] {
+        return [
+            "wide": cameraSettingsJSON(recorderSettings.wide),
+            "ultrawide": cameraSettingsJSON(recorderSettings.ultraWide),
+            "imu_enabled": recorderSettings.imuEnabled,
+            "magnetometer_enabled": recorderSettings.magnetometerEnabled,
+            "barometer_enabled": recorderSettings.barometerEnabled,
+            "geo_location_enabled": recorderSettings.geoLocationEnabled,
+            "device_motion_enabled": recorderSettings.deviceMotionEnabled,
+            "audio_enabled": recorderSettings.audioEnabled,
+            "storage_format": recorderSettings.storageFormat
+        ]
+    }
+
+    private func cameraSettingsJSON(_ settings: CameraCaptureSettings) -> [String: Any] {
+        return [
+            "enabled": settings.enabled,
+            "resolution": settings.resolution,
+            "frame_rate": clampedFrameRate(from: settings.frameRate),
+            "auto_focus": settings.autoFocus
+        ]
+    }
+
     private func writeCaptureMetaJSON(state: String) {
         let hostSec = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         let utcSec = Date().timeIntervalSince1970
@@ -3083,6 +3282,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             ],
             "created_utc_sec": utcSec,
             "updated_utc_sec": utcSec,
+            "recording_settings": currentRecordingSettingsJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
                 "utc_sec": "Unix UTC seconds",
@@ -3091,24 +3291,31 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             ],
             "streams": [
                 "wide_camera": [
+                    "enabled": recorderSettings.wide.enabled,
                     "media_file": "wide.mp4",
                     "index_file": "wide_info.csv",
                     "codec": "h264",
-                    "nominal_fps": 30,
+                    "nominal_fps": activeFrameRate(for: wideDevice, settings: recorderSettings.wide),
+                    "requested_resolution": recorderSettings.wide.resolution,
+                    "auto_focus": recorderSettings.wide.autoFocus,
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width", "height", "fx", "fy", "cx", "cy"]
                 ],
                 "ultrawide_camera": [
+                    "enabled": recorderSettings.ultraWide.enabled,
                     "media_file": "ultrawide.mp4",
                     "index_file": "ultra_info.csv",
                     "codec": "h264",
-                    "nominal_fps": 30,
+                    "nominal_fps": activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide),
+                    "requested_resolution": recorderSettings.ultraWide.resolution,
+                    "auto_focus": recorderSettings.ultraWide.autoFocus,
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width", "height", "fx", "fy", "cx", "cy"]
                 ],
                 "audio": [
+                    "enabled": recorderSettings.audioEnabled,
                     "media_file": "audio.m4a",
                     "index_file": "audio_info.csv",
                     "embedded_in": embedAudioInCameraMP4 ? ["wide.mp4", "ultrawide.mp4"] : [],
@@ -3121,21 +3328,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "schema": ["frame_index", "sensor_sec", "utc_sec", "duration_sec", "sample_count", "sample_rate", "channels"]
                 ],
                 "accelerometer": [
+                    "enabled": recorderSettings.imuEnabled,
                     "file": "accelerometer.csv",
                     "schema": ["sensor_sec", "utc_sec", "ax", "ay", "az"],
                     "units": ["s", "s", "g", "g", "g"]
                 ],
                 "gyroscope": [
+                    "enabled": recorderSettings.imuEnabled,
                     "file": "gyroscope.csv",
                     "schema": ["sensor_sec", "utc_sec", "gx", "gy", "gz"],
                     "units": ["s", "s", "rad/s", "rad/s", "rad/s"]
                 ],
                 "imu": [
+                    "enabled": recorderSettings.imuEnabled,
                     "file": "imu.csv",
                     "schema": ["sensor_sec", "utc_sec", "ax", "ay", "az", "gx", "gy", "gz", "accel_sensor_sec", "gyro_sensor_sec"],
                     "note": "Rows are keyed by gyro samples with the latest raw accelerometer sample attached."
                 ],
                 "device_motion": [
+                    "enabled": recorderSettings.deviceMotionEnabled,
                     "file": "device_motion.csv",
                     "source": "CoreMotion fused device motion, not raw IMU",
                     "reference_frame": "xArbitraryCorrectedZVertical",
@@ -3167,15 +3378,18 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     ]
                 ],
                 "magnetometer": [
+                    "enabled": recorderSettings.magnetometerEnabled,
                     "file": "magnetometer.csv",
                     "schema": ["sensor_sec", "utc_sec", "mx", "my", "mz"],
                     "units": ["s", "s", "microtesla", "microtesla", "microtesla"]
                 ],
                 "barometer": [
+                    "enabled": recorderSettings.barometerEnabled,
                     "file": "barometer.csv",
                     "schema": ["sensor_sec", "utc_sec", "pressure_kpa", "relative_altitude_m"]
                 ],
                 "geo_location": [
+                    "enabled": recorderSettings.geoLocationEnabled,
                     "file": "geo_location.csv",
                     "source": "CoreLocation fused geographic location, not raw GNSS measurements",
                     "schema": [
