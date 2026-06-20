@@ -2161,10 +2161,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         ])
 
         addSensorPill(to: sensorStack, key: "imu", title: "IMU")
-        addSensorPill(to: sensorStack, key: "motion", title: "Motion")
-        addSensorPill(to: sensorStack, key: "geo", title: "GeoLoc")
         addSensorPill(to: sensorStack, key: "mag", title: "Mag")
         addSensorPill(to: sensorStack, key: "baro", title: "Baro")
+        addSensorPill(to: sensorStack, key: "geo", title: "GeoLoc")
+        addSensorPill(to: sensorStack, key: "motion", title: "Motion")
         addSensorPill(to: sensorStack, key: "audio", title: "Audio")
 
         let rightRail = UIView()
@@ -2584,10 +2584,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let sensorRows = sensorRecorder?.statusRows() ?? [:]
         updateSensorPill(key: "imu", title: "IMU", value: sensorRows["imu"] ?? "0Hz")
-        updateSensorPill(key: "motion", title: "Motion", value: sensorRows["motion"] ?? "0Hz")
-        updateSensorPill(key: "geo", title: "GeoLoc", value: locationRecorder?.statusValue() ?? "0Hz")
         updateSensorPill(key: "mag", title: "Mag", value: sensorRows["mag"] ?? "0Hz")
         updateSensorPill(key: "baro", title: "Baro", value: sensorRows["baro"] ?? "0Hz")
+        updateSensorPill(key: "geo", title: "GeoLoc", value: locationRecorder?.statusValue() ?? "0Hz")
+        updateSensorPill(key: "motion", title: "Motion", value: sensorRows["motion"] ?? "0Hz")
         updateSensorPill(key: "audio", title: "Audio", value: audioRecorder?.statusValue() ?? "0Hz")
 
         captureStatusRows["duration"]?.text = isRecording ? (timeLabel.text ?? "00:00:00") : "00:00:00"
