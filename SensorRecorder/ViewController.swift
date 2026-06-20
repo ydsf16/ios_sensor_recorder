@@ -2631,8 +2631,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             dimView.topAnchor.constraint(equalTo: view.topAnchor),
             dimView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            configPanel.leadingAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.leadingAnchor, constant: 22),
-            configPanel.trailingAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.trailingAnchor, constant: -22),
+            configPanel.centerXAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.centerXAnchor),
+            configPanel.widthAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.widthAnchor, multiplier: 0.67),
+            configPanel.widthAnchor.constraint(lessThanOrEqualToConstant: 820),
             configPanel.topAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.topAnchor, constant: 18),
             configPanel.bottomAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.bottomAnchor, constant: -18)
         ])
@@ -2702,8 +2703,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         addSettingsMenuRow(
             to: stack,
             key: "storageFormat",
-            title: "Format",
-            items: ["CSV", "Binary"],
+            title: "Save Format",
+            items: ["CSV", "MCAP"],
             selectedValue: recorderSettings.storageFormat
         )
         addSettingsActionButtons(to: actionBar)
