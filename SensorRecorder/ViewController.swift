@@ -1864,7 +1864,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
         cameraStatusRows["wide"]?.superview?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
         cameraStatusRows["ultra"]?.superview?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
-        captureStatusRows["summary"]?.superview?.frame = CGRect(x: hudContentRect.midX - 260, y: hudContentRect.minY + 58, width: 520, height: 34)
+        let summaryWidth = min(max(hudContentRect.width * 0.78, 620), max(hudContentRect.width - 68, 320))
+        captureStatusRows["summary"]?.superview?.frame = CGRect(
+            x: hudContentRect.midX - summaryWidth / 2,
+            y: hudContentRect.minY + 54,
+            width: summaryWidth,
+            height: 36
+        )
         cameraStatusRows["wide"]?.superview.map { sceneView.bringSubviewToFront($0) }
         cameraStatusRows["ultra"]?.superview.map { sceneView.bringSubviewToFront($0) }
         captureStatusRows["summary"]?.superview.map { sceneView.bringSubviewToFront($0) }
@@ -2061,8 +2067,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func updateRecordButtonAppearance(isRecording: Bool) {
         var config = startStopButton.configuration
-        config?.title = isRecording ? "STOP" : "RECORD"
         config?.image = UIImage(systemName: isRecording ? "stop.fill" : "circle.fill")
+        config?.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)
         config?.baseBackgroundColor = isRecording ? UIColor.systemRed.withAlphaComponent(0.95) : UIColor.systemRed.withAlphaComponent(0.86)
         config?.baseForegroundColor = .white
         startStopButton.configuration = config
@@ -2154,11 +2160,11 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             railStack.bottomAnchor.constraint(equalTo: rightRail.contentView.bottomAnchor, constant: -18)
         ])
 
-        let settingsButton = makeRailButton(icon: "gearshape.fill", title: "SETTINGS", tint: .white)
+        let settingsButton = makeRailButton(icon: "gearshape.fill", tint: .white)
         settingsButton.addTarget(self, action: #selector(showSettingsOverlay), for: .touchUpInside)
         railStack.addArrangedSubview(settingsButton)
 
-        let recordButton = makeRailButton(icon: "stop.fill", title: "RECORD", tint: .white)
+        let recordButton = makeRailButton(icon: "stop.fill", tint: .white)
         var recordConfig = recordButton.configuration
         recordConfig?.baseBackgroundColor = UIColor.systemRed.withAlphaComponent(0.86)
         recordButton.configuration = recordConfig
@@ -2166,7 +2172,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         railStack.addArrangedSubview(recordButton)
         startStopButton = recordButton
 
-        let filesButton = makeRailButton(icon: "folder.fill", title: "FILES", tint: .white)
+        let filesButton = makeRailButton(icon: "folder.fill", tint: .white)
         filesButton.addTarget(self, action: #selector(openLastCaptureDirectory), for: .touchUpInside)
         railStack.addArrangedSubview(filesButton)
     }
@@ -2182,6 +2188,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
         label.textColor = .white
         label.textAlignment = .center
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.72
         badge.contentView.addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: badge.contentView.leadingAnchor, constant: 10),
@@ -2203,28 +2211,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorStatusRows[key] = label
     }
 
-    private func makeRailButton(icon: String, title: String, tint: UIColor) -> UIButton {
+    private func makeRailButton(icon: String, tint: UIColor) -> UIButton {
         var config = UIButton.Configuration.filled()
         config.image = UIImage(systemName: icon)
-        config.imagePlacement = .top
-        config.imagePadding = 8
-        config.title = title
+        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)
         config.baseForegroundColor = tint
         config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.18)
         config.cornerStyle = .large
-        config.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 6, bottom: 10, trailing: 6)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12)
 
         let button = UIButton(configuration: config)
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.titleLabel?.font = UIFont.systemFont(ofSize: 12, weight: .bold)
         button.layer.cornerRadius = 18
         button.layer.shadowColor = UIColor.black.cgColor
         button.layer.shadowOpacity = 0.35
         button.layer.shadowRadius = 8
         button.layer.shadowOffset = CGSize(width: 0, height: 4)
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 82),
-            button.heightAnchor.constraint(equalToConstant: 96)
+            button.widthAnchor.constraint(equalToConstant: 78),
+            button.heightAnchor.constraint(equalToConstant: 78)
         ])
         return button
     }
@@ -2563,8 +2568,49 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func captureSummaryText() -> String {
         let recColor = isRecording ? "●" : "○"
         let time = isRecording ? (timeLabel.text ?? "00:00:00") : "00:00:00"
-        let size = fileSizeLabel.text?.components(separatedBy: " / ").first ?? "0 MB"
-        return "REC TIME: \(time) \(recColor) | FILE: \(size) | REM: --"
+        let captureBytes = currentCaptureBytes()
+        let captureSize = ByteCountFormatter.string(fromByteCount: captureBytes, countStyle: .file)
+        let freeBytes = availableDiskBytes()
+        let freeSize = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? diskCapacity
+        let remaining = estimatedRemainingRecordTime(captureBytes: captureBytes, freeBytes: freeBytes)
+        return "REC \(time) \(recColor) | FILE \(captureSize) / FREE \(freeSize) | REM \(remaining)"
+    }
+
+    private func currentCaptureBytes() -> Int64 {
+        guard let outDirURL = outDirURL,
+              let size = try? outDirURL.directoryTotalAllocatedSize(includingSubfolders: true) else {
+            return 0
+        }
+        return Int64(size)
+    }
+
+    private func availableDiskBytes() -> Int64? {
+        guard let values = try? getRecDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let bytes = values.volumeAvailableCapacityForImportantUsage else {
+            return nil
+        }
+        return bytes
+    }
+
+    private func estimatedRemainingRecordTime(captureBytes: Int64, freeBytes: Int64?) -> String {
+        guard isRecording,
+              let freeBytes = freeBytes,
+              captureBytes > 0 else {
+            return "--"
+        }
+        let elapsed = Date().timeIntervalSince(startTime)
+        guard elapsed > 3 else { return "--" }
+        let bytesPerSecond = Double(captureBytes) / elapsed
+        guard bytesPerSecond > 1 else { return "--" }
+        return compactDuration(seconds: TimeInterval(Double(freeBytes) / bytesPerSecond))
+    }
+
+    private func compactDuration(seconds: TimeInterval) -> String {
+        let totalMinutes = max(Int(seconds / 60), 0)
+        if totalMinutes >= 60 {
+            return "\(totalMinutes / 60)h\(totalMinutes % 60)m"
+        }
+        return "\(totalMinutes)m"
     }
 
     private func recordingDataStatusText() -> String {
