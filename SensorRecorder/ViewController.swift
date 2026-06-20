@@ -1879,7 +1879,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func layoutSampleBufferDisplayLayer(_ displayLayer: AVSampleBufferDisplayLayer?, in frame: CGRect) {
         guard let displayLayer = displayLayer else { return }
-        displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
+        displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
         displayLayer.setAffineTransform(.identity)
     }
