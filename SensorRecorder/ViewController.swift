@@ -1855,8 +1855,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
-        cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
-        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
+        cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 2, width: 348, height: 30)
+        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 2, width: 300, height: 30)
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         let summaryY = max(4, hudContentRect.minY - 42)
         captureStatusBadges["summary"]?.frame = CGRect(
@@ -2200,11 +2200,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func makeHUDLabelBadge() -> UIView {
-        let badge = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-        badge.clipsToBounds = true
-        badge.layer.cornerRadius = 9
-        badge.layer.borderColor = UIColor.white.withAlphaComponent(0.16).cgColor
-        badge.layer.borderWidth = 1
+        let badge = UIView()
+        badge.backgroundColor = .clear
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
@@ -2212,12 +2209,16 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         label.textAlignment = .center
         label.adjustsFontSizeToFitWidth = true
         label.minimumScaleFactor = 0.72
-        badge.contentView.addSubview(label)
+        label.layer.shadowColor = UIColor.black.cgColor
+        label.layer.shadowOpacity = 0.85
+        label.layer.shadowRadius = 3
+        label.layer.shadowOffset = CGSize(width: 0, height: 1)
+        badge.addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: badge.contentView.leadingAnchor, constant: 10),
-            label.trailingAnchor.constraint(equalTo: badge.contentView.trailingAnchor, constant: -10),
-            label.topAnchor.constraint(equalTo: badge.contentView.topAnchor, constant: 5),
-            label.bottomAnchor.constraint(equalTo: badge.contentView.bottomAnchor, constant: -5)
+            label.leadingAnchor.constraint(equalTo: badge.leadingAnchor, constant: 4),
+            label.trailingAnchor.constraint(equalTo: badge.trailingAnchor, constant: -4),
+            label.topAnchor.constraint(equalTo: badge.topAnchor),
+            label.bottomAnchor.constraint(equalTo: badge.bottomAnchor)
         ])
         return badge
     }
