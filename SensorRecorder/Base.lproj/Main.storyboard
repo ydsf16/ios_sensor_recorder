@@ -158,9 +158,9 @@
                             <constraint firstItem="spt-I6-Am9" firstAttribute="leading" secondItem="fQZ-KI-GVf" secondAttribute="leading" id="0zO-Z6-od4"/>
                             <constraint firstItem="spt-I6-Am9" firstAttribute="trailing" secondItem="fQZ-KI-GVf" secondAttribute="trailing" id="81q-Fe-5xn"/>
                             <constraint firstItem="fQZ-KI-GVf" firstAttribute="bottom" secondItem="spt-I6-Am9" secondAttribute="bottom" constant="19" id="DkI-dv-wSm"/>
-                            <constraint firstItem="BrB-h1-WRS" firstAttribute="leading" secondItem="fQZ-KI-GVf" secondAttribute="leading" id="GsS-dJ-CKf"/>
-                            <constraint firstItem="BrB-h1-WRS" firstAttribute="bottom" secondItem="fQZ-KI-GVf" secondAttribute="bottom" id="VpT-BR-CcM"/>
-                            <constraint firstItem="BrB-h1-WRS" firstAttribute="trailing" secondItem="fQZ-KI-GVf" secondAttribute="trailing" id="XyZ-9z-H8e"/>
+                            <constraint firstItem="BrB-h1-WRS" firstAttribute="leading" secondItem="U0K-SW-4ec" secondAttribute="leading" id="GsS-dJ-CKf"/>
+                            <constraint firstItem="BrB-h1-WRS" firstAttribute="bottom" secondItem="U0K-SW-4ec" secondAttribute="bottom" id="VpT-BR-CcM"/>
+                            <constraint firstItem="BrB-h1-WRS" firstAttribute="trailing" secondItem="U0K-SW-4ec" secondAttribute="trailing" id="XyZ-9z-H8e"/>
                             <constraint firstItem="BrB-h1-WRS" firstAttribute="top" secondItem="U0K-SW-4ec" secondAttribute="top" id="rJc-2c-zQA"/>
                         </constraints>
                     </view>

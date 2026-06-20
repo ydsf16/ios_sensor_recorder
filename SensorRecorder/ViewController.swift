@@ -1057,7 +1057,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         updateDiskCapacity()
         installLandscapeOverlay()
         initializeUI()
-        startStopButton.setTitle("Start", for: .normal)
         startStopButton.isEnabled = false
         sceneView.backgroundColor = .black
         sceneView.layer.borderWidth = 0
@@ -1267,7 +1266,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
                 let diagnosticLayer = CALayer()
                 diagnosticLayer.backgroundColor = UIColor.systemPink.withAlphaComponent(0.45).cgColor
-                self.sceneView.layer.addSublayer(diagnosticLayer)
+                self.sceneView.layer.insertSublayer(diagnosticLayer, at: 0)
                 self.diagnosticLayer = diagnosticLayer
 
                 let previewView = CameraPreviewView(frame: self.sceneView.bounds)
@@ -1541,7 +1540,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
             DispatchQueue.main.async {
                 let displayLayer = self.makeDisplayLayer(for: cameraName)
-                self.sceneView.layer.addSublayer(displayLayer)
+                self.sceneView.layer.insertSublayer(displayLayer, at: 0)
                 if cameraName == "wide" {
                     self.wideDisplayLayer = displayLayer
                 } else {
@@ -1889,7 +1888,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let displayLayer = displayLayer else { return }
         displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
-        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
+        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2))
     }
 
     private func setStatus(_ status: String) {
@@ -2068,7 +2067,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func updateRecordButtonAppearance(isRecording: Bool) {
         var config = startStopButton.configuration
         config?.image = UIImage(systemName: isRecording ? "stop.fill" : "circle.fill")
-        config?.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)
+        config?.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)
         config?.baseBackgroundColor = isRecording ? UIColor.systemRed.withAlphaComponent(0.95) : UIColor.systemRed.withAlphaComponent(0.86)
         config?.baseForegroundColor = .white
         startStopButton.configuration = config
@@ -2097,6 +2096,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let sensorBar = makeOverlayPanel()
         sensorBar.translatesAutoresizingMaskIntoConstraints = false
+        sensorBar.alpha = 0.62
         view.addSubview(sensorBar)
         sensorMonitorBar = sensorBar
 
@@ -2109,25 +2109,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorBar.contentView.addSubview(sensorStack)
 
         let monitorTitle = UILabel()
-        monitorTitle.text = "SENSOR MONITOR"
+        monitorTitle.text = ""
         monitorTitle.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
         monitorTitle.textColor = UIColor.white.withAlphaComponent(0.74)
         monitorTitle.textAlignment = .center
         sensorBar.contentView.addSubview(monitorTitle)
 
         NSLayoutConstraint.activate([
-            sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 58),
-            sensorBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -120),
-            sensorBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -9),
-            sensorBar.heightAnchor.constraint(equalToConstant: 76),
+            sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 78),
+            sensorBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -142),
+            sensorBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30),
+            sensorBar.heightAnchor.constraint(equalToConstant: 44),
 
             monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 16),
             monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -16),
-            monitorTitle.topAnchor.constraint(equalTo: sensorBar.contentView.topAnchor, constant: 7),
+            monitorTitle.topAnchor.constraint(equalTo: sensorBar.contentView.topAnchor),
 
             sensorStack.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 14),
             sensorStack.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -14),
-            sensorStack.bottomAnchor.constraint(equalTo: sensorBar.contentView.bottomAnchor, constant: -10)
+            sensorStack.centerYAnchor.constraint(equalTo: sensorBar.contentView.centerYAnchor)
         ])
 
         addSensorPill(to: sensorStack, key: "imu", title: "IMU")
@@ -2137,14 +2137,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         addSensorPill(to: sensorStack, key: "audio", title: "Audio")
 
         let rightRail = makeOverlayPanel()
-        rightRail.alpha = 0.76
+        rightRail.alpha = 0.58
         view.addSubview(rightRail)
         rightControlRail = rightRail
         NSLayoutConstraint.activate([
             rightRail.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
             rightRail.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
-            rightRail.widthAnchor.constraint(equalToConstant: 104),
-            rightRail.heightAnchor.constraint(equalToConstant: 348)
+            rightRail.widthAnchor.constraint(equalToConstant: 92),
+            rightRail.heightAnchor.constraint(equalToConstant: 288)
         ])
 
         let railStack = UIStackView()
@@ -2214,7 +2214,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func makeRailButton(icon: String, tint: UIColor) -> UIButton {
         var config = UIButton.Configuration.filled()
         config.image = UIImage(systemName: icon)
-        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)
+        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)
         config.baseForegroundColor = tint
         config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.18)
         config.cornerStyle = .large
@@ -2228,8 +2228,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         button.layer.shadowRadius = 8
         button.layer.shadowOffset = CGSize(width: 0, height: 4)
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 78),
-            button.heightAnchor.constraint(equalToConstant: 78)
+            button.widthAnchor.constraint(equalToConstant: 68),
+            button.heightAnchor.constraint(equalToConstant: 68)
         ])
         return button
     }
