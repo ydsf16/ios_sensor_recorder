@@ -1881,7 +1881,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let displayLayer = displayLayer else { return }
         displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
-        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
+        displayLayer.setAffineTransform(.identity)
     }
 
     private func setStatus(_ status: String) {
@@ -2081,7 +2081,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let wideBadge = makeHUDLabelBadge()
         let ultraBadge = makeHUDLabelBadge()
-        let summaryBadge = makeHUDLabelBadge()
+        let summaryBadge = makeTransparentHUDLabel(textColor: .systemRed)
         sceneView.addSubview(wideBadge)
         sceneView.addSubview(ultraBadge)
         view.addSubview(summaryBadge)
@@ -2198,6 +2198,26 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             label.bottomAnchor.constraint(equalTo: badge.contentView.bottomAnchor, constant: -5)
         ])
         return badge
+    }
+
+    private func makeTransparentHUDLabel(textColor: UIColor) -> UIView {
+        let container = UIView()
+        container.backgroundColor = .clear
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .bold)
+        label.textColor = textColor
+        label.textAlignment = .center
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.72
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 5),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -5)
+        ])
+        return container
     }
 
     private func addSensorPill(to stack: UIStackView, key: String, title: String) {
