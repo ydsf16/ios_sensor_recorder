@@ -257,6 +257,7 @@ private final class AudioStreamRecorder {
     private var isFinishing = false
     private var firstSensorSec: TimeInterval?
     private var latestSensorSec: TimeInterval?
+    private var latestSampleRate: Double?
 
     init(audioURL: URL, infoURL: URL) {
         self.audioURL = audioURL
@@ -317,22 +318,14 @@ private final class AudioStreamRecorder {
         statusLock.lock()
         defer { statusLock.unlock() }
         guard frameIndex > 0 else { return "AUD --" }
-        guard let first = firstSensorSec, let latest = latestSensorSec, latest > first, frameIndex > 1 else {
-            return "AUD \(frameIndex)"
-        }
-        let hz = Double(frameIndex - 1) / (latest - first)
-        return String(format: "AUD %.0fHz", hz)
+        return "AUD \(audioFormatStatusValue())"
     }
 
     func statusValue() -> String {
         statusLock.lock()
         defer { statusLock.unlock() }
         guard frameIndex > 0 else { return "0Hz" }
-        guard let first = firstSensorSec, let latest = latestSensorSec, latest > first, frameIndex > 1 else {
-            return "\(frameIndex)"
-        }
-        let hz = Double(frameIndex - 1) / (latest - first)
-        return String(format: "%.0fHz", hz)
+        return audioFormatStatusValue()
     }
 
     private func configureWriter(_ sampleBuffer: CMSampleBuffer) {
@@ -366,6 +359,7 @@ private final class AudioStreamRecorder {
         let durationSec = CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer))
         let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
         let format = audioFormat(sampleBuffer)
+        recordAudioFormat(format)
         writeInfoLine(String(
             format: "%d,%.9f,%.9f,%.9f,%d,%.3f,%d",
             frameIndex,
@@ -399,6 +393,15 @@ private final class AudioStreamRecorder {
         return (sampleRate: sampleRate, channels: channels)
     }
 
+    private func audioFormatStatusValue() -> String {
+        guard let sampleRate = latestSampleRate, sampleRate > 0 else { return "0Hz" }
+        let sampleRateKHz = sampleRate / 1_000.0
+        if abs(sampleRateKHz.rounded() - sampleRateKHz) < 0.05 {
+            return String(format: "%.0fkHz", sampleRateKHz)
+        }
+        return String(format: "%.1fkHz", sampleRateKHz)
+    }
+
     private func writeInfoLine(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }
         infoHandle?.write(data)
@@ -411,6 +414,12 @@ private final class AudioStreamRecorder {
             firstSensorSec = sensorSec
         }
         latestSensorSec = sensorSec
+    }
+
+    private func recordAudioFormat(_ format: (sampleRate: Double, channels: Int)) {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        latestSampleRate = format.sampleRate
     }
 }
 
@@ -2152,7 +2161,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         ])
 
         addSensorPill(to: sensorStack, key: "imu", title: "IMU")
-        addSensorPill(to: sensorStack, key: "geo", title: "GPS")
+        addSensorPill(to: sensorStack, key: "motion", title: "Motion")
+        addSensorPill(to: sensorStack, key: "geo", title: "GeoLoc")
         addSensorPill(to: sensorStack, key: "mag", title: "Mag")
         addSensorPill(to: sensorStack, key: "baro", title: "Baro")
         addSensorPill(to: sensorStack, key: "audio", title: "Audio")
@@ -2488,7 +2498,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         addSettingsRow(to: stack, title: "Device Motion", detail: "Fused attitude, target 100Hz", isOn: true)
         addSettingsRow(to: stack, title: "Magnetometer", detail: "Raw magnetic field, target 50Hz", isOn: true)
         addSettingsRow(to: stack, title: "Barometer", detail: "Pressure + relative altitude", isOn: true)
-        addSettingsRow(to: stack, title: "GPS", detail: "CoreLocation geographic fixes", isOn: true)
+        addSettingsRow(to: stack, title: "GeoLoc", detail: "CoreLocation fused geographic fixes", isOn: true)
         addSettingsRow(to: stack, title: "Audio", detail: "M4A AAC, device input channels", isOn: true)
 
         addSettingsSectionTitle(to: stack, title: "Storage")
@@ -2574,7 +2584,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let sensorRows = sensorRecorder?.statusRows() ?? [:]
         updateSensorPill(key: "imu", title: "IMU", value: sensorRows["imu"] ?? "0Hz")
-        updateSensorPill(key: "geo", title: "GPS", value: locationRecorder?.statusValue() ?? "0Hz")
+        updateSensorPill(key: "motion", title: "Motion", value: sensorRows["motion"] ?? "0Hz")
+        updateSensorPill(key: "geo", title: "GeoLoc", value: locationRecorder?.statusValue() ?? "0Hz")
         updateSensorPill(key: "mag", title: "Mag", value: sensorRows["mag"] ?? "0Hz")
         updateSensorPill(key: "baro", title: "Baro", value: sensorRows["baro"] ?? "0Hz")
         updateSensorPill(key: "audio", title: "Audio", value: audioRecorder?.statusValue() ?? "0Hz")
