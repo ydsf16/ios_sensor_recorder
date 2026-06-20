@@ -15,6 +15,19 @@ private final class CameraPreviewView: UIView {
     }
 }
 
+private extension UILabel {
+    var letterSpacing: CGFloat {
+        get { 0 }
+        set {
+            guard let text = text else { return }
+            attributedText = NSAttributedString(
+                string: text,
+                attributes: [.kern: newValue]
+            )
+        }
+    }
+}
+
 private final class CameraStreamRecorder {
     private let videoURL: URL
     private let infoURL: URL
@@ -305,6 +318,17 @@ private final class AudioStreamRecorder {
         return String(format: "AUD %.0fHz", hz)
     }
 
+    func statusValue() -> String {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        guard frameIndex > 0 else { return "0Hz" }
+        guard let first = firstSensorSec, let latest = latestSensorSec, latest > first, frameIndex > 1 else {
+            return "\(frameIndex)"
+        }
+        let hz = Double(frameIndex - 1) / (latest - first)
+        return String(format: "%.0fHz", hz)
+    }
+
     private func configureWriter(_ sampleBuffer: CMSampleBuffer) {
         do {
             let writer = try AVAssetWriter(outputURL: audioURL, fileType: .m4a)
@@ -528,6 +552,19 @@ private final class SensorStreamRecorder {
         return parts.isEmpty ? "sensors waiting" : parts.joined(separator: " ")
     }
 
+    func statusRows() -> [String: String] {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return [
+            "accel": streamValue(count: accelerometerCount, first: firstAccelerometerSensorSec, latest: latestAccelerometerSensorSec),
+            "gyro": streamValue(count: gyroscopeCount, first: firstGyroscopeSensorSec, latest: latestGyroscopeSensorSec),
+            "imu": streamValue(count: imuCount, first: firstIMUSensorSec, latest: latestIMUSensorSec),
+            "motion": streamValue(count: deviceMotionCount, first: firstDeviceMotionSensorSec, latest: latestDeviceMotionSensorSec),
+            "mag": streamValue(count: magnetometerCount, first: firstMagnetometerSensorSec, latest: latestMagnetometerSensorSec),
+            "baro": streamValue(count: barometerCount, first: firstBarometerSensorSec, latest: latestBarometerSensorSec)
+        ]
+    }
+
     func stop() {
         motionManager.stopAccelerometerUpdates()
         motionManager.stopGyroUpdates()
@@ -560,6 +597,17 @@ private final class SensorStreamRecorder {
         }
         let hz = Double(count - 1) / (latest - first)
         return String(format: "%@ %.0fHz", label, hz)
+    }
+
+    private func streamValue(count: Int, first: TimeInterval?, latest: TimeInterval?) -> String {
+        guard count > 0 else {
+            return "0Hz"
+        }
+        guard let first = first, let latest = latest, latest > first, count > 1 else {
+            return "\(count)"
+        }
+        let hz = Double(count - 1) / (latest - first)
+        return String(format: "%.0fHz", hz)
     }
 
     private func startIMUUpdates() {
@@ -877,6 +925,17 @@ private final class GeoLocationStreamRecorder {
         return String(format: "L %.1fHz", hz)
     }
 
+    func statusValue() -> String {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        guard count > 0 else { return "0Hz" }
+        guard let first = firstSensorSec, let latest = latestSensorSec, latest > first, count > 1 else {
+            return "\(count)"
+        }
+        let hz = Double(count - 1) / (latest - first)
+        return String(format: "%.1fHz", hz)
+    }
+
     func close() {
         writer.close()
     }
@@ -921,6 +980,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     @IBOutlet weak var timeWriteLabel: UILabel!
 
     @IBOutlet var sceneView: UIView!
+
+    private var legacyControlPanel: UIView?
+    private var settingsOverlayView: UIView?
+    private var cameraStatusRows: [String: UILabel] = [:]
+    private var sensorStatusRows: [String: UILabel] = [:]
+    private var captureStatusRows: [String: UILabel] = [:]
+    private let overlayFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+    private let overlayValueFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
 
     private lazy var session = AVCaptureMultiCamSession()
     private var singlePreviewSession: AVCaptureSession?
@@ -979,6 +1046,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         view.backgroundColor = .black
         updateDiskCapacity()
+        installLandscapeOverlay()
         initializeUI()
         startStopButton.setTitle("Start", for: .normal)
         startStopButton.isEnabled = false
@@ -1744,11 +1812,11 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             return
         }
 
-        let halfHeight = bounds.height / 2
-        layoutSampleBufferDisplayLayer(wideDisplayLayer, in: CGRect(x: 0, y: 0, width: bounds.width, height: halfHeight))
-        layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: CGRect(x: 0, y: halfHeight, width: bounds.width, height: halfHeight))
-        wideCameraPreviewView?.frame = CGRect(x: 0, y: 0, width: bounds.width, height: halfHeight)
-        ultraWideCameraPreviewView?.frame = CGRect(x: 0, y: halfHeight, width: bounds.width, height: halfHeight)
+        let halfWidth = bounds.width / 2
+        layoutSampleBufferDisplayLayer(wideDisplayLayer, in: CGRect(x: 0, y: 0, width: halfWidth, height: bounds.height))
+        layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: CGRect(x: halfWidth, y: 0, width: halfWidth, height: bounds.height))
+        wideCameraPreviewView?.frame = CGRect(x: 0, y: 0, width: halfWidth, height: bounds.height)
+        ultraWideCameraPreviewView?.frame = CGRect(x: halfWidth, y: 0, width: halfWidth, height: bounds.height)
         widePreviewLayer?.frame = wideCameraPreviewView?.bounds ?? .zero
         ultraWidePreviewLayer?.frame = ultraWideCameraPreviewView?.bounds ?? .zero
     }
@@ -1771,6 +1839,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             }
             self.timeLabel.text = status
             self.frameCounterLabel.text = "\(self.previewDebugMode.rawValue), \(running), W \(self.wideFrameCount), U \(self.ultraWideFrameCount), S \(self.singleFrameCount), \(Int(frame.width))x\(Int(frame.height))"
+            self.refreshOverlayStatus()
         }
     }
 
@@ -1938,6 +2007,274 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         fpsLabel.text = "30.0 FPS"
     }
 
+    private func installLandscapeOverlay() {
+        legacyControlPanel = startStopButton.superview
+        legacyControlPanel?.isHidden = true
+
+        let leftPanel = makeOverlayPanel()
+        let rightPanel = makeOverlayPanel()
+        view.addSubview(leftPanel)
+        view.addSubview(rightPanel)
+
+        NSLayoutConstraint.activate([
+            leftPanel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            leftPanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 14),
+            leftPanel.widthAnchor.constraint(equalToConstant: 270),
+            leftPanel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14),
+
+            rightPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14),
+            rightPanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 14),
+            rightPanel.widthAnchor.constraint(equalToConstant: 270),
+            rightPanel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14)
+        ])
+
+        let sensorStack = makePanelStack(title: "SENSOR STREAMS")
+        leftPanel.contentView.addSubview(sensorStack)
+        NSLayoutConstraint.activate([
+            sensorStack.leadingAnchor.constraint(equalTo: leftPanel.contentView.leadingAnchor, constant: 14),
+            sensorStack.trailingAnchor.constraint(equalTo: leftPanel.contentView.trailingAnchor, constant: -14),
+            sensorStack.topAnchor.constraint(equalTo: leftPanel.contentView.topAnchor, constant: 14),
+            sensorStack.bottomAnchor.constraint(equalTo: leftPanel.contentView.bottomAnchor, constant: -14)
+        ])
+
+        addStatusRow(to: sensorStack, store: &cameraStatusRows, key: "wide", title: "Wide")
+        addStatusRow(to: sensorStack, store: &cameraStatusRows, key: "ultra", title: "Ultra")
+        addDivider(to: sensorStack)
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "imu", title: "IMU")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "accel", title: "Accel")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "gyro", title: "Gyro")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "mag", title: "Mag")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "baro", title: "Baro")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "motion", title: "Motion")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "geo", title: "Geo")
+        addStatusRow(to: sensorStack, store: &sensorStatusRows, key: "audio", title: "Audio")
+
+        let controlStack = makePanelStack(title: "CAPTURE")
+        rightPanel.contentView.addSubview(controlStack)
+        NSLayoutConstraint.activate([
+            controlStack.leadingAnchor.constraint(equalTo: rightPanel.contentView.leadingAnchor, constant: 14),
+            controlStack.trailingAnchor.constraint(equalTo: rightPanel.contentView.trailingAnchor, constant: -14),
+            controlStack.topAnchor.constraint(equalTo: rightPanel.contentView.topAnchor, constant: 14),
+            controlStack.bottomAnchor.constraint(equalTo: rightPanel.contentView.bottomAnchor, constant: -14)
+        ])
+
+        let recordButton = UIButton(type: .system)
+        recordButton.translatesAutoresizingMaskIntoConstraints = false
+        recordButton.setTitle("Start", for: .normal)
+        recordButton.titleLabel?.font = UIFont.systemFont(ofSize: 28, weight: .bold)
+        recordButton.tintColor = .black
+        recordButton.backgroundColor = UIColor.systemGreen
+        recordButton.layer.cornerRadius = 18
+        recordButton.contentEdgeInsets = UIEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        recordButton.addTarget(self, action: #selector(startStopButtonPressed(_:)), for: .touchUpInside)
+        controlStack.addArrangedSubview(recordButton)
+        startStopButton = recordButton
+
+        let settingsButton = UIButton(type: .system)
+        settingsButton.setTitle("Settings", for: .normal)
+        settingsButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+        settingsButton.tintColor = .white
+        settingsButton.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        settingsButton.layer.cornerRadius = 14
+        settingsButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        settingsButton.addTarget(self, action: #selector(showSettingsOverlay), for: .touchUpInside)
+        controlStack.addArrangedSubview(settingsButton)
+
+        addDivider(to: controlStack)
+        let durationLabel = addStatusRow(to: controlStack, store: &captureStatusRows, key: "duration", title: "Duration")
+        let sizeLabel = addStatusRow(to: controlStack, store: &captureStatusRows, key: "size", title: "Size")
+        let modeLabel = addStatusRow(to: controlStack, store: &captureStatusRows, key: "mode", title: "Mode")
+        let writeLabel = addStatusRow(to: controlStack, store: &captureStatusRows, key: "write", title: "Write")
+
+        timeLabel = durationLabel
+        fileSizeLabel = sizeLabel
+        frameCounterLabel = modeLabel
+        timeWriteLabel = writeLabel
+    }
+
+    private func makeOverlayPanel() -> UIVisualEffectView {
+        let effect = UIBlurEffect(style: .systemUltraThinMaterialDark)
+        let panel = UIVisualEffectView(effect: effect)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.layer.cornerRadius = 22
+        panel.layer.cornerCurve = .continuous
+        panel.clipsToBounds = true
+        panel.contentView.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+        return panel
+    }
+
+    private func makePanelStack(title: String) -> UIStackView {
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        titleLabel.textColor = UIColor.white.withAlphaComponent(0.72)
+        titleLabel.letterSpacing = 1.4
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.spacing = 9
+        return stack
+    }
+
+    @discardableResult
+    private func addStatusRow(
+        to stack: UIStackView,
+        store: inout [String: UILabel],
+        key: String,
+        title: String
+    ) -> UILabel {
+        let row = UIStackView()
+        row.axis = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 10
+
+        let nameLabel = UILabel()
+        nameLabel.text = title
+        nameLabel.font = overlayFont
+        nameLabel.textColor = UIColor.white.withAlphaComponent(0.62)
+        nameLabel.setContentHuggingPriority(.required, for: .horizontal)
+        nameLabel.widthAnchor.constraint(equalToConstant: 72).isActive = true
+
+        let valueLabel = UILabel()
+        valueLabel.text = "--"
+        valueLabel.font = overlayValueFont
+        valueLabel.textColor = .white
+        valueLabel.numberOfLines = 1
+        valueLabel.adjustsFontSizeToFitWidth = true
+        valueLabel.minimumScaleFactor = 0.72
+
+        row.addArrangedSubview(nameLabel)
+        row.addArrangedSubview(valueLabel)
+        stack.addArrangedSubview(row)
+        store[key] = valueLabel
+        return valueLabel
+    }
+
+    private func addDivider(to stack: UIStackView) {
+        let divider = UIView()
+        divider.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        stack.addArrangedSubview(divider)
+    }
+
+    @objc private func showSettingsOverlay() {
+        guard settingsOverlayView == nil else { return }
+
+        let dimView = UIView()
+        dimView.translatesAutoresizingMaskIntoConstraints = false
+        dimView.backgroundColor = UIColor.black.withAlphaComponent(0.68)
+        view.addSubview(dimView)
+        settingsOverlayView = dimView
+
+        let panel = makeOverlayPanel()
+        dimView.addSubview(panel)
+        NSLayoutConstraint.activate([
+            dimView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            dimView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            dimView.topAnchor.constraint(equalTo: view.topAnchor),
+            dimView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            panel.centerXAnchor.constraint(equalTo: dimView.centerXAnchor),
+            panel.centerYAnchor.constraint(equalTo: dimView.centerYAnchor),
+            panel.widthAnchor.constraint(equalTo: dimView.widthAnchor, multiplier: 0.74),
+            panel.heightAnchor.constraint(equalTo: dimView.heightAnchor, multiplier: 0.82)
+        ])
+
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsVerticalScrollIndicator = true
+        panel.contentView.addSubview(scrollView)
+
+        let contentView = UIView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(contentView)
+
+        let stack = makePanelStack(title: "SETTINGS")
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: panel.contentView.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor),
+
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -22),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20)
+        ])
+
+        addSettingsRow(to: stack, title: "Wide camera", detail: "1920x1080 / 30Hz", isOn: true)
+        addSettingsRow(to: stack, title: "Ultra-wide camera", detail: "1920x1080 / 30Hz", isOn: true)
+        addSettingsRow(to: stack, title: "Raw IMU", detail: "Accel + gyro, target 400Hz", isOn: true)
+        addSettingsRow(to: stack, title: "Device motion", detail: "Fused attitude, target 100Hz", isOn: true)
+        addSettingsRow(to: stack, title: "Magnetometer", detail: "Raw magnetic field, target 50Hz", isOn: true)
+        addSettingsRow(to: stack, title: "Barometer", detail: "Pressure + relative altitude", isOn: true)
+        addSettingsRow(to: stack, title: "Geo location", detail: "CoreLocation geographic fixes", isOn: true)
+        addSettingsRow(to: stack, title: "Audio", detail: "M4A AAC, device input channels", isOn: true)
+
+        let hintLabel = UILabel()
+        hintLabel.text = "This page is the UI shell. Sensor toggles will be wired into the capture pipeline next."
+        hintLabel.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+        hintLabel.textColor = UIColor.white.withAlphaComponent(0.54)
+        hintLabel.numberOfLines = 0
+        stack.addArrangedSubview(hintLabel)
+
+        let closeButton = UIButton(type: .system)
+        closeButton.setTitle("Close", for: .normal)
+        closeButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .bold)
+        closeButton.tintColor = .black
+        closeButton.backgroundColor = UIColor.systemTeal
+        closeButton.layer.cornerRadius = 14
+        closeButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        closeButton.addTarget(self, action: #selector(hideSettingsOverlay), for: .touchUpInside)
+        stack.addArrangedSubview(closeButton)
+    }
+
+    private func addSettingsRow(to stack: UIStackView, title: String, detail: String, isOn: Bool) {
+        let row = UIStackView()
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 16
+
+        let textStack = UIStackView()
+        textStack.axis = .vertical
+        textStack.spacing = 2
+
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = .white
+
+        let detailLabel = UILabel()
+        detailLabel.text = detail
+        detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        detailLabel.textColor = UIColor.white.withAlphaComponent(0.56)
+
+        textStack.addArrangedSubview(titleLabel)
+        textStack.addArrangedSubview(detailLabel)
+
+        let sensorSwitch = UISwitch()
+        sensorSwitch.isOn = isOn
+        sensorSwitch.onTintColor = .systemTeal
+
+        row.addArrangedSubview(textStack)
+        row.addArrangedSubview(sensorSwitch)
+        stack.addArrangedSubview(row)
+    }
+
+    @objc private func hideSettingsOverlay() {
+        settingsOverlayView?.removeFromSuperview()
+        settingsOverlayView = nil
+    }
+
     private func initializeUI() {
         timeLabel.text = "Initializing"
         trackingStatusLabel.text = "wide"
@@ -1948,6 +2285,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         fpsStepper.value = 30
         fpsStepper.isEnabled = false
         timeWriteLabel.text = "mp4,csv"
+        refreshOverlayStatus()
     }
 
     @objc private func updateTime() {
@@ -1961,6 +2299,50 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             timeWriteLabel.text = recordingDataStatusText()
         }
         updateSize()
+        refreshOverlayStatus()
+    }
+
+    private func refreshOverlayStatus() {
+        cameraStatusRows["wide"]?.text = cameraStatusText(
+            frameCount: wideFrameCount,
+            device: wideDevice,
+            fallbackName: "wide.mp4"
+        )
+        cameraStatusRows["ultra"]?.text = cameraStatusText(
+            frameCount: ultraWideFrameCount,
+            device: ultraWideDevice,
+            fallbackName: "ultrawide.mp4"
+        )
+
+        let sensorRows = sensorRecorder?.statusRows() ?? [:]
+        sensorStatusRows["imu"]?.text = sensorRows["imu"] ?? "0Hz"
+        sensorStatusRows["accel"]?.text = sensorRows["accel"] ?? "0Hz"
+        sensorStatusRows["gyro"]?.text = sensorRows["gyro"] ?? "0Hz"
+        sensorStatusRows["mag"]?.text = sensorRows["mag"] ?? "0Hz"
+        sensorStatusRows["baro"]?.text = sensorRows["baro"] ?? "0Hz"
+        sensorStatusRows["motion"]?.text = sensorRows["motion"] ?? "0Hz"
+        sensorStatusRows["geo"]?.text = locationRecorder?.statusValue() ?? "0Hz"
+        sensorStatusRows["audio"]?.text = audioRecorder?.statusValue() ?? "0Hz"
+
+        captureStatusRows["duration"]?.text = isRecording ? (timeLabel.text ?? "00:00:00") : "00:00:00"
+        captureStatusRows["size"]?.text = fileSizeLabel.text ?? "? / ?"
+        captureStatusRows["mode"]?.text = isRecording ? "Recording" : "Preview"
+        captureStatusRows["write"]?.text = isRecording ? recordingDataStatusText() : "mp4 + csv + m4a"
+    }
+
+    private func cameraStatusText(frameCount: Int, device: AVCaptureDevice?, fallbackName: String) -> String {
+        let resolution: String
+        if let device = device {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            resolution = "\(dimensions.width)x\(dimensions.height)"
+        } else {
+            resolution = "1920x1080"
+        }
+
+        if frameCount == 0 {
+            return "0Hz • \(resolution)"
+        }
+        return "30Hz • \(resolution) • \(frameCount)f"
     }
 
     private func recordingDataStatusText() -> String {
