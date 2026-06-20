@@ -1856,9 +1856,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
         cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
+        let summaryY = max(4, hudContentRect.minY - 42)
         captureStatusBadges["summary"]?.frame = CGRect(
             x: hudContentRect.midX - summaryWidth / 2,
-            y: hudContentRect.minY + 54,
+            y: summaryY,
             width: summaryWidth,
             height: 36
         )
@@ -2003,7 +2004,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 self.audioRecorder = nil
                 DispatchQueue.main.async {
                     self.updateSize()
-                    self.openCaptureDirectory()
                 }
             }
         }
@@ -2037,11 +2037,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         pendingMovieFinishes -= 1
         guard pendingMovieFinishes <= 0 else { return }
         updateSize()
-        openCaptureDirectory()
     }
 
     private func openCaptureDirectory() {
-        var sharedURL = URLComponents(url: outDirURL, resolvingAgainstBaseURL: false)!
+        var sharedURL = URLComponents(url: getRecDir(), resolvingAgainstBaseURL: false)!
         sharedURL.scheme = "shareddocuments"
         UIApplication.shared.open(sharedURL.url!)
     }
@@ -2118,8 +2117,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         NSLayoutConstraint.activate([
             sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 78),
             sensorBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -142),
-            sensorBar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4),
-            sensorBar.heightAnchor.constraint(equalToConstant: 44),
+            sensorBar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -3),
+            sensorBar.heightAnchor.constraint(equalToConstant: 36),
 
             monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 16),
             monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -16),
@@ -2236,7 +2235,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     @objc private func openLastCaptureDirectory() {
-        guard outDirURL != nil else { return }
         openCaptureDirectory()
     }
 
