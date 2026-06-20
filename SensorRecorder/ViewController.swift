@@ -995,7 +995,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var cameraStatusBadges: [String: UIView] = [:]
     private var captureStatusBadges: [String: UIView] = [:]
     private var rightControlRail: UIView?
-    private var sensorMonitorBar: UIVisualEffectView?
+    private var sensorMonitorBar: UIView?
     private var hudContentRect: CGRect = .zero
     private let overlayFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
     private let overlayValueFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
@@ -1055,12 +1055,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        view.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
+        view.backgroundColor = .black
         updateDiskCapacity()
         installLandscapeOverlay()
         initializeUI()
         startStopButton.isEnabled = false
-        sceneView.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
+        sceneView.backgroundColor = .black
         sceneView.layer.borderWidth = 0
         configureLocationManager()
     }
@@ -1824,8 +1824,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         hudContentRect = dualCameraContentRect(in: bounds)
         let halfWidth = hudContentRect.width / 2
-        let wideFrame = CGRect(x: hudContentRect.minX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
-        let ultraFrame = CGRect(x: hudContentRect.midX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
+        let ultraFrame = CGRect(x: hudContentRect.minX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
+        let wideFrame = CGRect(x: hudContentRect.midX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
         layoutSampleBufferDisplayLayer(wideDisplayLayer, in: wideFrame)
         layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: ultraFrame)
         wideCameraPreviewView?.frame = wideFrame
@@ -1853,8 +1853,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
-        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
         cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 12, width: 348, height: 34)
+        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 12, width: 300, height: 34)
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         let summaryY = max(4, hudContentRect.minY - 42)
         captureStatusBadges["summary"]?.frame = CGRect(
@@ -1881,7 +1881,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let displayLayer = displayLayer else { return }
         displayLayer.bounds = CGRect(x: 0, y: 0, width: frame.height, height: frame.width)
         displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
-        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2))
+        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
     }
 
     private func setStatus(_ status: String) {
@@ -2077,7 +2077,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         legacyControlPanel = startStopButton.superview
         legacyControlPanel?.isHidden = true
 
-        sceneView.backgroundColor = UIColor(white: 0.93, alpha: 1.0)
+        sceneView.backgroundColor = .black
 
         let wideBadge = makeHUDLabelBadge()
         let ultraBadge = makeHUDLabelBadge()
@@ -2093,9 +2093,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
 
-        let sensorBar = makeOverlayPanel()
+        let sensorBar = UIView()
         sensorBar.translatesAutoresizingMaskIntoConstraints = false
-        sensorBar.alpha = 0.62
+        sensorBar.backgroundColor = .clear
         view.addSubview(sensorBar)
         sensorMonitorBar = sensorBar
 
@@ -2105,14 +2105,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorStack.alignment = .center
         sensorStack.distribution = .equalSpacing
         sensorStack.spacing = 8
-        sensorBar.contentView.addSubview(sensorStack)
+        sensorBar.addSubview(sensorStack)
 
         let monitorTitle = UILabel()
         monitorTitle.text = ""
         monitorTitle.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
         monitorTitle.textColor = UIColor.white.withAlphaComponent(0.74)
         monitorTitle.textAlignment = .center
-        sensorBar.contentView.addSubview(monitorTitle)
+        sensorBar.addSubview(monitorTitle)
 
         NSLayoutConstraint.activate([
             sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 78),
@@ -2120,13 +2120,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             sensorBar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -3),
             sensorBar.heightAnchor.constraint(equalToConstant: 36),
 
-            monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 16),
-            monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -16),
-            monitorTitle.topAnchor.constraint(equalTo: sensorBar.contentView.topAnchor),
+            monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.leadingAnchor, constant: 16),
+            monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.trailingAnchor, constant: -16),
+            monitorTitle.topAnchor.constraint(equalTo: sensorBar.topAnchor),
 
-            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 14),
-            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -14),
-            sensorStack.centerYAnchor.constraint(equalTo: sensorBar.contentView.centerYAnchor)
+            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.leadingAnchor, constant: 14),
+            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.trailingAnchor, constant: -14),
+            sensorStack.centerYAnchor.constraint(equalTo: sensorBar.centerYAnchor)
         ])
 
         addSensorPill(to: sensorStack, key: "imu", title: "IMU")
