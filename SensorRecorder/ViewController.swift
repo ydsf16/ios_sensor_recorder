@@ -1065,6 +1065,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var recorderSettings = RecorderSettings.load()
     private var settingsMenuButtons: [String: UIButton] = [:]
     private var settingsSwitches: [String: UISwitch] = [:]
+    private var cameraSettingsGroups: [String: UIView] = [:]
+    private weak var settingsRailButton: UIButton?
+    private weak var filesRailButton: UIButton?
     private var cameraStatusRows: [String: UILabel] = [:]
     private var sensorStatusRows: [String: UILabel] = [:]
     private var captureStatusRows: [String: UILabel] = [:]
@@ -2155,6 +2158,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func toggleRecording(val: Bool) {
         isRecording = val
         updateRecordButtonAppearance(isRecording: val)
+        updateAuxiliaryRailButtons(isRecording: val)
         captureStatusBadges["summary"]?.isHidden = !val
         val ? startRECBlinking() : stopRECBlinking()
         refreshOverlayStatus()
@@ -2174,6 +2178,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         config?.baseBackgroundColor = isRecording ? UIColor.systemRed.withAlphaComponent(0.95) : UIColor.systemRed.withAlphaComponent(0.86)
         config?.baseForegroundColor = .white
         startStopButton.configuration = config
+    }
+
+    private func updateAuxiliaryRailButtons(isRecording: Bool) {
+        [settingsRailButton, filesRailButton].forEach { button in
+            button?.isEnabled = !isRecording
+            button?.alpha = isRecording ? 0.28 : 1.0
+        }
     }
 
     private func startRECBlinking() {
@@ -2291,6 +2302,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let settingsButton = makeRailButton(icon: "gearshape.fill", tint: .white)
         settingsButton.addTarget(self, action: #selector(showSettingsOverlay), for: .touchUpInside)
         railStack.addArrangedSubview(settingsButton)
+        settingsRailButton = settingsButton
 
         let recordButton = makeRailButton(icon: "stop.fill", tint: .white)
         var recordConfig = recordButton.configuration
@@ -2303,6 +2315,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let filesButton = makeRailButton(icon: "folder.fill", tint: .white)
         filesButton.addTarget(self, action: #selector(openLastCaptureDirectory), for: .touchUpInside)
         railStack.addArrangedSubview(filesButton)
+        filesRailButton = filesButton
     }
 
     private func makeHUDLabelBadge() -> UIView {
@@ -2415,7 +2428,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         titleLabel.textColor = .white
 
         let detailLabel = UILabel()
-        detailLabel.text = "Camera formats are read from the current iPhone. Saved config is written to sensor_recorder_settings.json."
+        detailLabel.text = "Camera formats are read from the current iPhone."
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(0.58)
         detailLabel.numberOfLines = 2
@@ -2468,21 +2481,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         settings: CameraCaptureSettings,
         resolutionItems: [String]
     ) {
-        addSettingsSubsectionTitle(to: stack, title: title)
+        addSettingsSubsectionTitle(to: stack, title: title, switchKey: "\(keyPrefix).enabled", isOn: settings.enabled)
         let compactStack = UIStackView()
         compactStack.axis = .vertical
         compactStack.spacing = 6
         compactStack.layoutMargins = UIEdgeInsets(top: 0, left: 18, bottom: 2, right: 0)
         compactStack.isLayoutMarginsRelativeArrangement = true
         stack.addArrangedSubview(compactStack)
-        addSettingsRow(
-            to: compactStack,
-            key: "\(keyPrefix).enabled",
-            title: "\(title) Enabled",
-            detail: "Record this camera stream",
-            isOn: settings.enabled,
-            compact: true
-        )
+        cameraSettingsGroups[keyPrefix] = compactStack
         addSettingsMenuRow(
             to: compactStack,
             key: "\(keyPrefix).resolution",
@@ -2503,18 +2509,50 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             to: compactStack,
             key: "\(keyPrefix).autoFocus",
             title: "Auto Focus",
-            detail: "Disable only for fixed-focus calibration tests",
+            detail: "",
             isOn: settings.autoFocus,
             compact: true
         )
+        updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: settings.enabled)
     }
 
-    private func addSettingsSubsectionTitle(to stack: UIStackView, title: String) {
+    private func addSettingsSubsectionTitle(to stack: UIStackView, title: String, switchKey: String? = nil, isOn: Bool = true) {
+        let row = UIStackView()
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 12
+
         let label = UILabel()
         label.text = title
         label.font = UIFont.systemFont(ofSize: 18, weight: .bold)
         label.textColor = .white
-        stack.addArrangedSubview(label)
+        row.addArrangedSubview(label)
+
+        if let switchKey {
+            let cameraSwitch = UISwitch()
+            cameraSwitch.isOn = isOn
+            cameraSwitch.onTintColor = .systemTeal
+            cameraSwitch.accessibilityIdentifier = switchKey
+            cameraSwitch.addTarget(self, action: #selector(cameraEnabledSwitchChanged(_:)), for: .valueChanged)
+            settingsSwitches[switchKey] = cameraSwitch
+            row.addArrangedSubview(cameraSwitch)
+        }
+
+        stack.addArrangedSubview(row)
+    }
+
+    @objc private func cameraEnabledSwitchChanged(_ sender: UISwitch) {
+        guard let switchKey = sender.accessibilityIdentifier,
+              let keyPrefix = switchKey.split(separator: ".").first.map(String.init) else {
+            return
+        }
+        updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: sender.isOn)
+    }
+
+    private func updateCameraSettingsGroup(keyPrefix: String, enabled: Bool) {
+        guard let group = cameraSettingsGroups[keyPrefix] else { return }
+        group.isUserInteractionEnabled = enabled
+        group.alpha = enabled ? 1.0 : 0.34
     }
 
     private func resolvedSelectedValue(in items: [String], preferred: String) -> String {
@@ -2616,6 +2654,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard settingsOverlayView == nil else { return }
         settingsMenuButtons.removeAll()
         settingsSwitches.removeAll()
+        cameraSettingsGroups.removeAll()
 
         let dimView = UIView()
         dimView.translatesAutoresizingMaskIntoConstraints = false
@@ -2632,8 +2671,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             dimView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             configPanel.centerXAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.centerXAnchor),
-            configPanel.widthAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.widthAnchor, multiplier: 0.67),
-            configPanel.widthAnchor.constraint(lessThanOrEqualToConstant: 820),
+            configPanel.widthAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.widthAnchor, multiplier: 0.74),
+            configPanel.widthAnchor.constraint(lessThanOrEqualToConstant: 900),
             configPanel.topAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.topAnchor, constant: 18),
             configPanel.bottomAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.bottomAnchor, constant: -18)
         ])
@@ -2737,6 +2776,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         detailLabel.text = detail
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 10 : 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(0.56)
+        detailLabel.isHidden = detail.isEmpty
 
         textStack.addArrangedSubview(titleLabel)
         textStack.addArrangedSubview(detailLabel)
