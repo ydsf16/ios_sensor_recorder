@@ -8,10 +8,12 @@
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Sensor Recorder</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>Sensor Recorder</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -22,8 +24,6 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Record nearby Bluetooth signals during capture sessions.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Record synchronized wide and ultra-wide camera videos.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
@@ -46,8 +46,6 @@
 		<string>magnetometer</string>
 		<string>gyroscope</string>
 		<string>accelerometer</string>
-		<string>armv7</string>
-		<string>arkit</string>
 	</array>
 	<key>UIStatusBarHidden</key>
 	<true/>

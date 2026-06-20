@@ -1,10 +1,3 @@
-//
-//  AppDelegate.swift
-//  ScanCapture
-//
-//  Created by Paul-Edouard Sarlin on 26.04.21.
-//
-
 import UIKit
 
 @main
@@ -37,4 +30,3 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 
 }
-

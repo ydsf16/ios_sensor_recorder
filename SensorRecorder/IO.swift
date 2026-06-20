@@ -1,17 +1,12 @@
-//
-//  IO.swift
-//  ScanCapture
-//
-//  Created by Paul-Edouard Sarlin on 30.05.21.
-//
-
 import Foundation
 import AVFoundation
+import CoreImage
+import ImageIO
 import os.log
-import ARKit
-import MobileCoreServices  // for ImageI/O
+import Metal
+import UIKit
+import UniformTypeIdentifiers
 import CoreMotion
-import CoreBluetooth
 
 
 func timestampToInt(_ timestamp: TimeInterval) -> Int64 {
@@ -177,90 +172,11 @@ class ImageWriter {
         
         let imagePath = outDir.appendingPathComponent(String(format: "%lld.jpg", timestampToInt(timestamp)))
         let options: NSDictionary = [kCGImageDestinationLossyCompressionQuality: 0.5]
-        let myImageDest = CGImageDestinationCreateWithURL(imagePath as CFURL, kUTTypeJPEG, 1, nil)!
+        let myImageDest = CGImageDestinationCreateWithURL(imagePath as CFURL, UTType.jpeg.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(myImageDest, cgImage!, options)
         CGImageDestinationFinalize(myImageDest)
     }
     
-    @available(iOS 14.0, *)
-    func writeDepth(sceneDepth: ARDepthData, timestamp: TimeInterval) {
-        let depthMap = sceneDepth.depthMap;
-        CVPixelBufferLockBaseAddress(depthMap, CVPixelBufferLockFlags(rawValue: 0))
-        let addr = CVPixelBufferGetBaseAddress(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        let bpr = CVPixelBufferGetBytesPerRow(depthMap)
-        let data = Data(bytes: addr!, count: (bpr*height))
-        let fileName = String(format: "%lld.bin", timestampToInt(timestamp))
-        let filePath = self.outDir.appendingPathComponent(fileName)
-        do {
-           try data.write(to: filePath)
-        } catch {
-            os_log("Cannot write depth map: %@", type:.error, error.localizedDescription)
-        }
-        CVPixelBufferUnlockBaseAddress(depthMap, CVPixelBufferLockFlags(rawValue: 0))
-        
-        if (sceneDepth.confidenceMap != nil) {
-            let confidence = self.imageBufferToUIImage(buffer: sceneDepth.confidenceMap!)
-            if let data = confidence.pngData() {
-                let fileName = String(format: "%lld.confidence.png", timestampToInt(timestamp))
-                let imagePath = self.outDir.appendingPathComponent(fileName)
-                do {
-                    try data.write(to: imagePath)
-                } catch {
-                    os_log("Cannot write confidence: %@", type:.error, error.localizedDescription)
-                }
-            }
-        }
-    }
-}
-
-class PoseWriter {
-    var file: FileHandle!
-    let filename = "poses.txt"
-    let header = "# timestamp, status, tx, ty, tz, qx, qy, qz, qw, w, h, fx, fy, cx, cy, exposure\n"
-    let template = "%lld, %@, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %u, %u, %.6f, %.6f, %.6f, %.6f, %lld\n"
-    
-    init?(outDir: URL) {
-        let device = UIDevice.current  // add some info about the device used to record
-        let device_str = String(format: "# %@ %@ %@ %@", device.name, device.systemName, device.systemVersion, device.model)
-        let header_ = device_str + "\n" + header
-        
-        let fileURL = outDir.appendingPathComponent(filename)
-        if (!FileManager.default.createFile(atPath: fileURL.path, contents: header_.data(using: String.Encoding.utf8), attributes: nil)) {
-            os_log("Cannot create the pose file at %@", type:.error, fileURL.path)
-            return nil
-        }
-        do {
-            try file = FileHandle(forWritingTo: fileURL)
-        } catch {
-            os_log("Cannot create the pose file: %@", type:.error, error.localizedDescription)
-            return nil
-        }
-        file.seekToEndOfFile()
-    }
-    
-    func write(camera: ARCamera, timestamp: TimeInterval, state: String) {
-        let tvec = camera.transform.columns.3
-        let qvec = simd_quatf(camera.transform).vector
-        let width = UInt32(camera.imageResolution.width)
-        let height = UInt32(camera.imageResolution.height)
-        let K = camera.intrinsics
-        let poseData = String(
-            format: template,
-            timestampToInt(timestamp), state, tvec.x, tvec.y, tvec.z, qvec.x, qvec.y, qvec.z, qvec.w,
-            width, height, K[0][0], K[1][1], K[2][0], K[2][1],
-            timestampToInt(camera.exposureDuration))
-        if let poseDataOut = poseData.data(using: .utf8) {
-            file!.write(poseDataOut)
-        } else {
-            os_log("Failed to format to the pose string: %@", type: .fault, poseData)
-        }
-    }
-    
-    func finish() {
-        file.closeFile()
-        file = nil
-    }
 }
 
 class AccelWriter {
@@ -508,48 +424,6 @@ class MotionWriter {
         gyroWriter.finish()
         magnetoWriter.finish()
         fusedWriter.finish()
-    }
-}
-
-class BluetoothWriter {
-    var file: FileHandle!
-    let filename = "bluetooth.txt"
-    let header = "# timestamp, name, uuid, rssi\n"
-    let template = "%lld, %@, %@, %@\n"
-    
-    init?(outDir: URL) {
-        let fileURL = outDir.appendingPathComponent(filename)
-        if (!FileManager.default.createFile(atPath: fileURL.path, contents: header.data(using: String.Encoding.utf8), attributes: nil)) {
-            os_log("Cannot create the bluetooth file at %@", type:.error, fileURL.path)
-            return nil
-        }
-        do {
-            try file = FileHandle(forWritingTo: fileURL)
-        } catch {
-            os_log("Cannot create the bluetooth file: %@", type:.error, error.localizedDescription)
-            return nil
-        }
-        file.seekToEndOfFile()
-    }
-    
-    func write(peripheral: CBPeripheral, rssi: NSNumber) {
-        let name = peripheral.name ?? "unkown"
-        let strData = String(
-            format: template,
-            timestampToInt(ProcessInfo.processInfo.systemUptime),
-            name.replacingOccurrences(of: ",", with: ""),
-            peripheral.identifier.uuidString,
-            rssi)
-        if let outData = strData.data(using: .utf8) {
-            file!.write(outData)
-        } else {
-            os_log("Failed to format to the bluetooth string: %@", type: .fault, strData)
-        }
-    }
-    
-    func finish() {
-        file.closeFile()
-        file = nil
     }
 }
 

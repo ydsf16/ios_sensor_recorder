@@ -1,10 +1,3 @@
-//
-//  ViewController.swift
-//  ScanCapture
-//
-//  Created by Paul-Edouard Sarlin on 26.04.21.
-//
-
 import UIKit
 import AVFoundation
 import CoreLocation
@@ -2036,7 +2029,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             "format_version": 1,
             "state": state,
             "app": [
-                "name": Bundle.main.bundleIdentifier ?? "ScanCapture",
+                "name": Bundle.main.bundleIdentifier ?? "SensorRecorder",
                 "version": appVersion,
                 "build": buildVersion
             ],

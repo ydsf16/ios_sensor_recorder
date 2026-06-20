@@ -1,53 +1,5 @@
-//
-//  Utils.swift
-//  ScanCapture
-//
-//  Created by Paul-Edouard Sarlin on 27.04.21.
-//
-
-import ARKit
+import Foundation
 import os.log
-
-extension ARCamera.TrackingState {
-    func toString() -> String {
-        switch self {
-        case .notAvailable:
-            return "no tracking"
-        case .normal:
-            return "normal"
-        case .limited(let reason):
-            switch reason {
-            case .excessiveMotion:
-                return "excessive motion"
-            case .insufficientFeatures:
-                return "insufficient features"
-            case .initializing:
-                return "initializing"
-            case .relocalizing:
-                return "relocalizing"
-            @unknown default:
-                return "unknown"
-            }
-        }
-    }
-}
-
-extension ARFrame.WorldMappingStatus {
-    func toString() -> String {
-        switch self {
-        case .notAvailable:
-            return "no map"
-        case .limited:
-            return "limited"
-        case .extending:
-            return "extending"
-        case .mapped:
-            return "mapped"
-        @unknown default:
-            return "unknown"
-        }
-    }
-}
 
 extension URL {
     /// check if the URL is a directory and if it is reachable
@@ -82,13 +34,4 @@ extension URL {
         return byteCount
     }
     private static let byteCountFormatter = ByteCountFormatter()
-}
-
-extension SCNVector3 {
-    func length() -> Float {
-        return sqrtf(x * x + y * y + z * z)
-    }
-}
-func - (l: SCNVector3, r: SCNVector3) -> SCNVector3 {
-    return SCNVector3Make(l.x - r.x, l.y - r.y, l.z - r.z)
 }

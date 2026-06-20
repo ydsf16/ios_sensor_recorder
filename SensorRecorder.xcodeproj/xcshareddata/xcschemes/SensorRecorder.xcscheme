@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "26DED2532636F1DC00FAE501"
-               BuildableName = "ScanCapture.app"
-               BlueprintName = "ScanCapture"
-               ReferencedContainer = "container:ScanCapture.xcodeproj">
+               BuildableName = "SensorRecorder.app"
+               BlueprintName = "SensorRecorder"
+               ReferencedContainer = "container:SensorRecorder.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -45,9 +45,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "26DED2532636F1DC00FAE501"
-            BuildableName = "ScanCapture.app"
-            BlueprintName = "ScanCapture"
-            ReferencedContainer = "container:ScanCapture.xcodeproj">
+            BuildableName = "SensorRecorder.app"
+            BlueprintName = "SensorRecorder"
+            ReferencedContainer = "container:SensorRecorder.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -62,9 +62,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "26DED2532636F1DC00FAE501"
-            BuildableName = "ScanCapture.app"
-            BlueprintName = "ScanCapture"
-            ReferencedContainer = "container:ScanCapture.xcodeproj">
+            BuildableName = "SensorRecorder.app"
+            BlueprintName = "SensorRecorder"
+            ReferencedContainer = "container:SensorRecorder.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

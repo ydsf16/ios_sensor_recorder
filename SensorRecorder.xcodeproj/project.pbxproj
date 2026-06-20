@@ -19,7 +19,7 @@
 /* Begin PBXFileReference section */
 		26663A4F26385F820000D4C6 /* Utils.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Utils.swift; sourceTree = "<group>"; };
 		26C41DFC2663F9ED000CB9B0 /* IO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IO.swift; sourceTree = "<group>"; };
-		26DED2542636F1DC00FAE501 /* ScanCapture.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ScanCapture.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		26DED2542636F1DC00FAE501 /* SensorRecorder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SensorRecorder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		26DED2572636F1DC00FAE501 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		26DED25B2636F1DC00FAE501 /* ViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewController.swift; sourceTree = "<group>"; };
 		26DED25E2636F1DC00FAE501 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
@@ -42,7 +42,7 @@
 		26DED24B2636F1DC00FAE501 = {
 			isa = PBXGroup;
 			children = (
-				26DED2562636F1DC00FAE501 /* ScanCapture */,
+				26DED2562636F1DC00FAE501 /* SensorRecorder */,
 				26DED2552636F1DC00FAE501 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -50,12 +50,12 @@
 		26DED2552636F1DC00FAE501 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				26DED2542636F1DC00FAE501 /* ScanCapture.app */,
+				26DED2542636F1DC00FAE501 /* SensorRecorder.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		26DED2562636F1DC00FAE501 /* ScanCapture */ = {
+		26DED2562636F1DC00FAE501 /* SensorRecorder */ = {
 			isa = PBXGroup;
 			children = (
 				26DED2572636F1DC00FAE501 /* AppDelegate.swift */,
@@ -67,15 +67,15 @@
 				26DED2622636F1DF00FAE501 /* LaunchScreen.storyboard */,
 				26DED2652636F1DF00FAE501 /* Info.plist */,
 			);
-			path = ScanCapture;
+			path = SensorRecorder;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		26DED2532636F1DC00FAE501 /* ScanCapture */ = {
+		26DED2532636F1DC00FAE501 /* SensorRecorder */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 26DED2682636F1DF00FAE501 /* Build configuration list for PBXNativeTarget "ScanCapture" */;
+			buildConfigurationList = 26DED2682636F1DF00FAE501 /* Build configuration list for PBXNativeTarget "SensorRecorder" */;
 			buildPhases = (
 				26DED2502636F1DC00FAE501 /* Sources */,
 				26DED2512636F1DC00FAE501 /* Frameworks */,
@@ -85,9 +85,9 @@
 			);
 			dependencies = (
 			);
-			name = ScanCapture;
-			productName = ScanCapture;
-			productReference = 26DED2542636F1DC00FAE501 /* ScanCapture.app */;
+			name = SensorRecorder;
+			productName = SensorRecorder;
+			productReference = 26DED2542636F1DC00FAE501 /* SensorRecorder.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -104,7 +104,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 26DED24F2636F1DC00FAE501 /* Build configuration list for PBXProject "ScanCapture" */;
+			buildConfigurationList = 26DED24F2636F1DC00FAE501 /* Build configuration list for PBXProject "SensorRecorder" */;
 			compatibilityVersion = "Xcode 9.3";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -117,7 +117,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				26DED2532636F1DC00FAE501 /* ScanCapture */,
+				26DED2532636F1DC00FAE501 /* SensorRecorder */,
 			);
 		};
 /* End PBXProject section */
@@ -293,14 +293,15 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = ZLZLM8XFB9;
-				INFOPLIST_FILE = ScanCapture/Info.plist;
+				INFOPLIST_FILE = SensorRecorder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Sensor Recorder";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16.iosSensorRecorder;
+				PRODUCT_NAME = SensorRecorder;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -313,14 +314,15 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = ZLZLM8XFB9;
-				INFOPLIST_FILE = ScanCapture/Info.plist;
+				INFOPLIST_FILE = SensorRecorder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Sensor Recorder";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16.iosSensorRecorder;
+				PRODUCT_NAME = SensorRecorder;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -329,7 +331,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		26DED24F2636F1DC00FAE501 /* Build configuration list for PBXProject "ScanCapture" */ = {
+		26DED24F2636F1DC00FAE501 /* Build configuration list for PBXProject "SensorRecorder" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				26DED2662636F1DF00FAE501 /* Debug */,
@@ -338,7 +340,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		26DED2682636F1DF00FAE501 /* Build configuration list for PBXNativeTarget "ScanCapture" */ = {
+		26DED2682636F1DF00FAE501 /* Build configuration list for PBXNativeTarget "SensorRecorder" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				26DED2692636F1DF00FAE501 /* Debug */,

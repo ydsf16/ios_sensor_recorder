@@ -31,7 +31,7 @@ Use `sensor_sec` for camera, IMU, audio, and location alignment. Use `utc_sec` w
 
 ## Build And Run
 
-1. Open `ScanCapture.xcodeproj` in Xcode.
+1. Open `SensorRecorder.xcodeproj` in Xcode.
 2. Set your signing team in `Project -> Signing & Capabilities`.
 3. Connect an iPhone that supports MultiCam capture.
 4. Build and run on device.
