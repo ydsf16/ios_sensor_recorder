@@ -984,6 +984,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private struct CameraCaptureSettings: Codable {
+        var enabled: Bool
         var resolution: String
         var frameRate: String
         var autoFocus: Bool
@@ -1001,8 +1002,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         var storageFormat: String
 
         static let defaults = RecorderSettings(
-            wide: CameraCaptureSettings(resolution: "1920x1440", frameRate: "30", autoFocus: true),
-            ultraWide: CameraCaptureSettings(resolution: "1920x1440", frameRate: "30", autoFocus: true),
+            wide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: true),
+            ultraWide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: true),
             imuEnabled: true,
             magnetometerEnabled: true,
             barometerEnabled: true,
@@ -1013,8 +1014,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         )
 
         private static let storageKey = "sensor_recorder.settings.v1"
+        private static let configFileName = "sensor_recorder_settings.json"
 
         static func load() -> RecorderSettings {
+            if let data = try? Data(contentsOf: configFileURL),
+               let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) {
+                return settings
+            }
             guard let data = UserDefaults.standard.data(forKey: storageKey),
                   let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) else {
                 return defaults
@@ -1025,6 +1031,16 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         func save() {
             guard let data = try? JSONEncoder().encode(self) else { return }
             UserDefaults.standard.set(data, forKey: Self.storageKey)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let prettyData = try? encoder.encode(self) {
+                try? prettyData.write(to: Self.configFileURL, options: .atomic)
+            }
+        }
+
+        private static var configFileURL: URL {
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(configFileName)
         }
     }
 
@@ -1044,9 +1060,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var legacyControlPanel: UIView?
     private var settingsOverlayView: UIView?
     private var recorderSettings = RecorderSettings.load()
-    private var settingsSegmentControls: [String: UISegmentedControl] = [:]
+    private var settingsMenuButtons: [String: UIButton] = [:]
     private var settingsSwitches: [String: UISwitch] = [:]
-    private var settingsSegmentItems: [String: [String]] = [:]
     private var cameraStatusRows: [String: UILabel] = [:]
     private var sensorStatusRows: [String: UILabel] = [:]
     private var captureStatusRows: [String: UILabel] = [:]
@@ -1863,7 +1878,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         let options = device.formats.compactMap { format -> (label: String, area: Int)? in
-            guard format.isMultiCamSupported else { return nil }
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             let width = Int(dimensions.width)
             let height = Int(dimensions.height)
@@ -2388,7 +2402,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         stack.addArrangedSubview(label)
     }
 
-    private func addSettingsSegmentedRow(
+    private func addSettingsHeader(to stack: UIStackView) {
+        let titleLabel = UILabel()
+        titleLabel.text = "SETTINGS"
+        titleLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
+        titleLabel.textColor = .white
+
+        let detailLabel = UILabel()
+        detailLabel.text = "Camera formats are read from the current iPhone. Saved config is written to sensor_recorder_settings.json."
+        detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        detailLabel.textColor = UIColor.white.withAlphaComponent(0.58)
+        detailLabel.numberOfLines = 2
+
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(detailLabel)
+    }
+
+    private func addSettingsMenuRow(
         to stack: UIStackView,
         key: String,
         title: String,
@@ -2402,20 +2432,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let titleLabel = UILabel()
         titleLabel.text = title
-        titleLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
         titleLabel.textColor = .white
-        titleLabel.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        titleLabel.widthAnchor.constraint(equalToConstant: 126).isActive = true
 
-        let segmentedControl = UISegmentedControl(items: items)
-        segmentedControl.selectedSegmentIndex = selectedIndex(for: selectedValue, in: items)
-        segmentedControl.selectedSegmentTintColor = .systemTeal
-        segmentedControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .normal)
-        segmentedControl.setTitleTextAttributes([.foregroundColor: UIColor.black], for: .selected)
-        settingsSegmentControls[key] = segmentedControl
-        settingsSegmentItems[key] = items
+        let button = UIButton(type: .system)
+        button.contentHorizontalAlignment = .leading
+        button.accessibilityValue = resolvedSelectedValue(in: items, preferred: selectedValue)
+        button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue)
+        button.menu = UIMenu(children: items.map { item in
+            UIAction(title: item, state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
+                button?.accessibilityValue = item
+                button?.configuration = self?.settingsMenuConfiguration(title: item)
+            }
+        })
+        button.showsMenuAsPrimaryAction = true
+        settingsMenuButtons[key] = button
 
         row.addArrangedSubview(titleLabel)
-        row.addArrangedSubview(segmentedControl)
+        row.addArrangedSubview(button)
         stack.addArrangedSubview(row)
     }
 
@@ -2427,14 +2462,22 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         resolutionItems: [String]
     ) {
         addSettingsSubsectionTitle(to: stack, title: title)
-        addSettingsSegmentedRow(
+        addSettingsRow(
+            to: stack,
+            key: "\(keyPrefix).enabled",
+            title: "\(title) Enabled",
+            detail: "Record this camera stream",
+            isOn: settings.enabled,
+            compact: true
+        )
+        addSettingsMenuRow(
             to: stack,
             key: "\(keyPrefix).resolution",
             title: "Resolution",
             items: resolutionItems,
             selectedValue: settings.resolution
         )
-        addSettingsSegmentedRow(
+        addSettingsMenuRow(
             to: stack,
             key: "\(keyPrefix).frameRate",
             title: "Hz",
@@ -2446,7 +2489,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             key: "\(keyPrefix).autoFocus",
             title: "Auto Focus",
             detail: "Disable only for fixed-focus calibration tests",
-            isOn: settings.autoFocus
+            isOn: settings.autoFocus,
+            compact: true
         )
     }
 
@@ -2458,8 +2502,21 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         stack.addArrangedSubview(label)
     }
 
-    private func selectedIndex(for selectedValue: String, in items: [String]) -> Int {
-        items.firstIndex(of: selectedValue) ?? min(1, max(items.count - 1, 0))
+    private func resolvedSelectedValue(in items: [String], preferred: String) -> String {
+        items.contains(preferred) ? preferred : (items.first ?? preferred)
+    }
+
+    private func settingsMenuConfiguration(title: String) -> UIButton.Configuration {
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.image = UIImage(systemName: "chevron.down")
+        config.imagePlacement = .trailing
+        config.imagePadding = 8
+        config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.12)
+        config.baseForegroundColor = .white
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
+        return config
     }
 
     private func makeOverlayPanel() -> UIVisualEffectView {
@@ -2531,9 +2588,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     @objc private func showSettingsOverlay() {
         guard settingsOverlayView == nil else { return }
-        settingsSegmentControls.removeAll()
+        settingsMenuButtons.removeAll()
         settingsSwitches.removeAll()
-        settingsSegmentItems.removeAll()
 
         let dimView = UIView()
         dimView.translatesAutoresizingMaskIntoConstraints = false
@@ -2541,9 +2597,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         view.addSubview(dimView)
         settingsOverlayView = dimView
 
-        let tabPanel = makeOverlayPanel()
         let configPanel = makeOverlayPanel()
-        dimView.addSubview(tabPanel)
         dimView.addSubview(configPanel)
         NSLayoutConstraint.activate([
             dimView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -2551,71 +2605,49 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             dimView.topAnchor.constraint(equalTo: view.topAnchor),
             dimView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            tabPanel.leadingAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.leadingAnchor, constant: 22),
-            tabPanel.topAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.topAnchor, constant: 18),
-            tabPanel.bottomAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.bottomAnchor, constant: -18),
-            tabPanel.widthAnchor.constraint(equalToConstant: 214),
-
-            configPanel.leadingAnchor.constraint(equalTo: tabPanel.trailingAnchor, constant: 16),
+            configPanel.leadingAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.leadingAnchor, constant: 22),
             configPanel.trailingAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.trailingAnchor, constant: -22),
-            configPanel.topAnchor.constraint(equalTo: tabPanel.topAnchor),
-            configPanel.bottomAnchor.constraint(equalTo: tabPanel.bottomAnchor)
+            configPanel.topAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.topAnchor, constant: 18),
+            configPanel.bottomAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.bottomAnchor, constant: -18)
         ])
-
-        let tabStack = UIStackView()
-        tabStack.translatesAutoresizingMaskIntoConstraints = false
-        tabStack.axis = .vertical
-        tabStack.spacing = 12
-        tabPanel.contentView.addSubview(tabStack)
-
-        let titleLabel = UILabel()
-        titleLabel.text = "SETTINGS"
-        titleLabel.font = UIFont.systemFont(ofSize: 22, weight: .bold)
-        titleLabel.textColor = .white
-        tabStack.addArrangedSubview(titleLabel)
-        tabStack.addArrangedSubview(makeSettingsTabButton(title: "Camera", selected: true))
-        tabStack.addArrangedSubview(makeSettingsTabButton(title: "Sensors", selected: false))
-        tabStack.addArrangedSubview(makeSettingsTabButton(title: "Storage", selected: false))
-
-        let closeButton = UIButton(type: .system)
-        var closeConfig = UIButton.Configuration.filled()
-        closeConfig.title = "Close"
-        closeConfig.baseBackgroundColor = UIColor.white.withAlphaComponent(0.14)
-        closeConfig.baseForegroundColor = .white
-        closeConfig.cornerStyle = .large
-        closeButton.configuration = closeConfig
-        closeButton.addTarget(self, action: #selector(hideSettingsOverlay), for: .touchUpInside)
-        tabStack.addArrangedSubview(UIView())
-        tabStack.addArrangedSubview(closeButton)
 
         let scrollView = UIScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.showsVerticalScrollIndicator = true
         configPanel.contentView.addSubview(scrollView)
 
+        let actionBar = UIStackView()
+        actionBar.translatesAutoresizingMaskIntoConstraints = false
+        actionBar.axis = .horizontal
+        actionBar.alignment = .center
+        actionBar.distribution = .fillEqually
+        actionBar.spacing = 14
+        configPanel.contentView.addSubview(actionBar)
+
         let stack = UIStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
-        stack.spacing = 14
+        stack.spacing = 10
         scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
-            tabStack.leadingAnchor.constraint(equalTo: tabPanel.contentView.leadingAnchor, constant: 16),
-            tabStack.trailingAnchor.constraint(equalTo: tabPanel.contentView.trailingAnchor, constant: -16),
-            tabStack.topAnchor.constraint(equalTo: tabPanel.contentView.topAnchor, constant: 18),
-            tabStack.bottomAnchor.constraint(equalTo: tabPanel.contentView.bottomAnchor, constant: -18),
+            scrollView.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 18),
+            scrollView.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -18),
+            scrollView.topAnchor.constraint(equalTo: configPanel.contentView.topAnchor, constant: 18),
+            scrollView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -14),
 
-            scrollView.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: configPanel.contentView.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: configPanel.contentView.bottomAnchor),
+            actionBar.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 24),
+            actionBar.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
+            actionBar.bottomAnchor.constraint(equalTo: configPanel.contentView.bottomAnchor, constant: -18),
+            actionBar.heightAnchor.constraint(equalToConstant: 48),
 
-            stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 22),
-            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -22),
-            stack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -48)
+            stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 6),
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -6),
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 4),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -4),
+            stack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -12)
         ])
 
+        addSettingsHeader(to: stack)
         addSettingsSectionTitle(to: stack, title: "Camera")
         addCameraSettingsSection(
             to: stack,
@@ -2641,35 +2673,42 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         addSettingsRow(to: stack, key: "audio", title: "Audio", detail: "M4A AAC, device input channels", isOn: recorderSettings.audioEnabled)
 
         addSettingsSectionTitle(to: stack, title: "Storage")
-        addSettingsSegmentedRow(
+        addSettingsMenuRow(
             to: stack,
             key: "storageFormat",
             title: "Format",
             items: ["CSV", "Binary"],
             selectedValue: recorderSettings.storageFormat
         )
-        addSettingsSaveButton(to: stack)
+        addSettingsActionButtons(to: actionBar)
     }
 
-    private func addSettingsRow(to stack: UIStackView, key: String, title: String, detail: String, isOn: Bool) {
+    private func addSettingsRow(
+        to stack: UIStackView,
+        key: String,
+        title: String,
+        detail: String,
+        isOn: Bool,
+        compact: Bool = false
+    ) {
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
-        row.spacing = 16
+        row.spacing = compact ? 10 : 16
 
         let textStack = UIStackView()
         textStack.axis = .vertical
-        textStack.spacing = 2
+        textStack.spacing = compact ? 0 : 2
         textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let titleLabel = UILabel()
         titleLabel.text = title
-        titleLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.font = UIFont.systemFont(ofSize: compact ? 14 : 17, weight: .semibold)
         titleLabel.textColor = .white
 
         let detailLabel = UILabel()
         detailLabel.text = detail
-        detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        detailLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 10 : 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(0.56)
 
         textStack.addArrangedSubview(titleLabel)
@@ -2685,7 +2724,16 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         stack.addArrangedSubview(row)
     }
 
-    private func addSettingsSaveButton(to stack: UIStackView) {
+    private func addSettingsActionButtons(to stack: UIStackView) {
+        let closeButton = UIButton(type: .system)
+        var closeConfig = UIButton.Configuration.filled()
+        closeConfig.title = "Close"
+        closeConfig.baseBackgroundColor = UIColor.white.withAlphaComponent(0.14)
+        closeConfig.baseForegroundColor = .white
+        closeConfig.cornerStyle = .large
+        closeButton.configuration = closeConfig
+        closeButton.addTarget(self, action: #selector(hideSettingsOverlay), for: .touchUpInside)
+
         let saveButton = UIButton(type: .system)
         var config = UIButton.Configuration.filled()
         config.title = "Save Settings"
@@ -2695,17 +2743,20 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
         saveButton.configuration = config
         saveButton.addTarget(self, action: #selector(saveSettingsOverlay), for: .touchUpInside)
+        stack.addArrangedSubview(closeButton)
         stack.addArrangedSubview(saveButton)
     }
 
     @objc private func saveSettingsOverlay() {
         recorderSettings = RecorderSettings(
             wide: CameraCaptureSettings(
+                enabled: settingsSwitches["wide.enabled"]?.isOn ?? recorderSettings.wide.enabled,
                 resolution: selectedSettingsValue(for: "wide.resolution", fallback: recorderSettings.wide.resolution),
                 frameRate: selectedSettingsValue(for: "wide.frameRate", fallback: recorderSettings.wide.frameRate),
                 autoFocus: settingsSwitches["wide.autoFocus"]?.isOn ?? recorderSettings.wide.autoFocus
             ),
             ultraWide: CameraCaptureSettings(
+                enabled: settingsSwitches["ultra.enabled"]?.isOn ?? recorderSettings.ultraWide.enabled,
                 resolution: selectedSettingsValue(for: "ultra.resolution", fallback: recorderSettings.ultraWide.resolution),
                 frameRate: selectedSettingsValue(for: "ultra.frameRate", fallback: recorderSettings.ultraWide.frameRate),
                 autoFocus: settingsSwitches["ultra.autoFocus"]?.isOn ?? recorderSettings.ultraWide.autoFocus
@@ -2724,13 +2775,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func selectedSettingsValue(for key: String, fallback: String) -> String {
-        guard let control = settingsSegmentControls[key],
-              let items = settingsSegmentItems[key],
-              control.selectedSegmentIndex >= 0,
-              control.selectedSegmentIndex < items.count else {
+        guard let value = settingsMenuButtons[key]?.accessibilityValue else {
             return fallback
         }
-        return items[control.selectedSegmentIndex]
+        return value
     }
 
     @objc private func hideSettingsOverlay() {
