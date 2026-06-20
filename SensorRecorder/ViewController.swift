@@ -1039,7 +1039,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         private static var configFileURL: URL {
-            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("SensorRecorder", isDirectory: true)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
                 .appendingPathComponent(configFileName)
         }
     }
@@ -1894,8 +1897,11 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             }
             return lhs.key > rhs.key
         }
-        let labels = sorted.map(\.key)
-        return labels.isEmpty ? ["1920x1440", "1280x960", "640x480"] : Array(labels.prefix(5))
+        var labels = sorted.map(\.key)
+        if !labels.contains("640x480") {
+            labels.append("640x480")
+        }
+        return labels.isEmpty ? ["1920x1440", "1280x960", "640x480"] : labels
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
@@ -2423,27 +2429,28 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         key: String,
         title: String,
         items: [String],
-        selectedValue: String
+        selectedValue: String,
+        compact: Bool = false
     ) {
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
-        row.spacing = 16
+        row.spacing = compact ? 10 : 16
 
         let titleLabel = UILabel()
         titleLabel.text = title
-        titleLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.font = UIFont.systemFont(ofSize: compact ? 15 : 17, weight: .semibold)
         titleLabel.textColor = .white
-        titleLabel.widthAnchor.constraint(equalToConstant: 126).isActive = true
+        titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true
 
         let button = UIButton(type: .system)
         button.contentHorizontalAlignment = .leading
         button.accessibilityValue = resolvedSelectedValue(in: items, preferred: selectedValue)
-        button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue)
+        button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue, compact: compact)
         button.menu = UIMenu(children: items.map { item in
             UIAction(title: item, state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
                 button?.accessibilityValue = item
-                button?.configuration = self?.settingsMenuConfiguration(title: item)
+                button?.configuration = self?.settingsMenuConfiguration(title: item, compact: compact)
             }
         })
         button.showsMenuAsPrimaryAction = true
@@ -2462,8 +2469,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         resolutionItems: [String]
     ) {
         addSettingsSubsectionTitle(to: stack, title: title)
+        let compactStack = UIStackView()
+        compactStack.axis = .vertical
+        compactStack.spacing = 6
+        compactStack.layoutMargins = UIEdgeInsets(top: 0, left: 18, bottom: 2, right: 0)
+        compactStack.isLayoutMarginsRelativeArrangement = true
+        stack.addArrangedSubview(compactStack)
         addSettingsRow(
-            to: stack,
+            to: compactStack,
             key: "\(keyPrefix).enabled",
             title: "\(title) Enabled",
             detail: "Record this camera stream",
@@ -2471,21 +2484,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             compact: true
         )
         addSettingsMenuRow(
-            to: stack,
+            to: compactStack,
             key: "\(keyPrefix).resolution",
             title: "Resolution",
             items: resolutionItems,
-            selectedValue: settings.resolution
+            selectedValue: settings.resolution,
+            compact: true
         )
         addSettingsMenuRow(
-            to: stack,
+            to: compactStack,
             key: "\(keyPrefix).frameRate",
             title: "Hz",
             items: ["1", "5", "10", "20", "30", "60"],
-            selectedValue: settings.frameRate
+            selectedValue: settings.frameRate,
+            compact: true
         )
         addSettingsRow(
-            to: stack,
+            to: compactStack,
             key: "\(keyPrefix).autoFocus",
             title: "Auto Focus",
             detail: "Disable only for fixed-focus calibration tests",
@@ -2506,16 +2521,27 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         items.contains(preferred) ? preferred : (items.first ?? preferred)
     }
 
-    private func settingsMenuConfiguration(title: String) -> UIButton.Configuration {
+    private func settingsMenuConfiguration(title: String, compact: Bool = false) -> UIButton.Configuration {
         var config = UIButton.Configuration.filled()
         config.title = title
+        config.attributedTitle = AttributedString(
+            title,
+            attributes: AttributeContainer([
+                .font: UIFont.systemFont(ofSize: compact ? 13 : 14, weight: .semibold)
+            ])
+        )
         config.image = UIImage(systemName: "chevron.down")
         config.imagePlacement = .trailing
         config.imagePadding = 8
         config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.12)
         config.baseForegroundColor = .white
         config.cornerStyle = .medium
-        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
+        config.contentInsets = NSDirectionalEdgeInsets(
+            top: compact ? 6 : 8,
+            leading: 12,
+            bottom: compact ? 6 : 8,
+            trailing: 12
+        )
         return config
     }
 
