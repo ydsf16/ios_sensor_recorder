@@ -1051,6 +1051,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var diskCapacity: String = "?"
     private var startTime: Date!
     private var recordingTimer: Timer?
+    private var recBlinkTimer: Timer?
+    private var recBlinkVisible = true
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -2049,6 +2051,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         isRecording = val
         updateRecordButtonAppearance(isRecording: val)
         captureStatusBadges["summary"]?.isHidden = !val
+        val ? startRECBlinking() : stopRECBlinking()
         refreshOverlayStatus()
         if val {
             fpsStepper.isEnabled = false
@@ -2066,6 +2069,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         config?.baseBackgroundColor = isRecording ? UIColor.systemRed.withAlphaComponent(0.95) : UIColor.systemRed.withAlphaComponent(0.86)
         config?.baseForegroundColor = .white
         startStopButton.configuration = config
+    }
+
+    private func startRECBlinking() {
+        recBlinkTimer?.invalidate()
+        recBlinkVisible = true
+        let timer = Timer(timeInterval: 0.55, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.recBlinkVisible.toggle()
+            self.updateCaptureSummaryLabel()
+        }
+        recBlinkTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopRECBlinking() {
+        recBlinkTimer?.invalidate()
+        recBlinkTimer = nil
+        recBlinkVisible = true
+        updateCaptureSummaryLabel()
     }
 
     @IBAction func fpsStepperChanged(_ sender: UIStepper) {
@@ -2560,7 +2582,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         captureStatusRows["size"]?.text = fileSizeLabel.text ?? "? / ?"
         captureStatusRows["mode"]?.text = isRecording ? "Recording" : "Preview"
         captureStatusRows["write"]?.text = isRecording ? recordingDataStatusText() : "mp4 + csv + m4a"
-        captureStatusRows["summary"]?.text = captureSummaryText()
+        updateCaptureSummaryLabel()
     }
 
     private func cameraStatusText(frameCount: Int, device: AVCaptureDevice?, fallbackName: String) -> String {
@@ -2593,6 +2615,29 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let freeSize = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? diskCapacity
         let remaining = estimatedRemainingRecordTime(captureBytes: captureBytes, freeBytes: freeBytes)
         return "REC \(time) / \(captureSize) | FREE \(freeSize) | REM \(remaining)"
+    }
+
+    private func updateCaptureSummaryLabel() {
+        guard let label = captureStatusRows["summary"] else { return }
+        guard isRecording else {
+            label.attributedText = nil
+            label.text = ""
+            return
+        }
+
+        let text = captureSummaryText()
+        let attributed = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: UIColor.systemRed.withAlphaComponent(0.92)
+            ]
+        )
+        attributed.addAttribute(
+            .foregroundColor,
+            value: UIColor.systemRed.withAlphaComponent(recBlinkVisible ? 1.0 : 0.18),
+            range: NSRange(location: 0, length: min(3, text.count))
+        )
+        label.attributedText = attributed
     }
 
     private func elapsedRecordingTimeText() -> String {
