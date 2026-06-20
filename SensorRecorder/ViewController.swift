@@ -1836,9 +1836,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func dualCameraContentRect(in bounds: CGRect) -> CGRect {
         let leftSafeBlack: CGFloat = 58
-        let rightControls: CGFloat = 10
-        let topBlack: CGFloat = 54
-        let bottomMonitor: CGFloat = 92
+        let rightControls: CGFloat = 0
+        let topBlack: CGFloat = 28
+        let bottomMonitor: CGFloat = 44
         let available = CGRect(
             x: leftSafeBlack,
             y: topBlack,
@@ -2099,7 +2099,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorStack.axis = .horizontal
         sensorStack.alignment = .center
         sensorStack.distribution = .equalSpacing
-        sensorStack.spacing = 12
+        sensorStack.spacing = 8
         sensorBar.contentView.addSubview(sensorStack)
 
         let monitorTitle = UILabel()
@@ -2119,8 +2119,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -16),
             monitorTitle.topAnchor.constraint(equalTo: sensorBar.contentView.topAnchor, constant: 7),
 
-            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 18),
-            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -18),
+            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.contentView.leadingAnchor, constant: 14),
+            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.contentView.trailingAnchor, constant: -14),
             sensorStack.bottomAnchor.constraint(equalTo: sensorBar.contentView.bottomAnchor, constant: -10)
         ])
 
@@ -2194,9 +2194,11 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func addSensorPill(to stack: UIStackView, key: String, title: String) {
         let label = UILabel()
-        label.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
+        label.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
         label.textColor = UIColor.white.withAlphaComponent(0.44)
-        label.text = "\(title): 0Hz ●"
+        label.text = "\(title) 0Hz"
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.82
         stack.addArrangedSubview(label)
         sensorStatusRows[key] = label
     }
@@ -2554,7 +2556,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func updateSensorPill(key: String, title: String, value: String) {
         guard let label = sensorStatusRows[key] else { return }
         let active = isRecording && !value.hasPrefix("0Hz") && value != "--"
-        label.text = "\(title): \(value) ●"
+        label.text = "\(title) \(value)"
         label.textColor = active ? UIColor.systemGreen : UIColor.white.withAlphaComponent(0.42)
     }
 
