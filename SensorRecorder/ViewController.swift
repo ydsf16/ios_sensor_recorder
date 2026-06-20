@@ -46,6 +46,7 @@ private final class CameraStreamRecorder {
     private var infoHandle: FileHandle?
     private var firstPTS: CMTime?
     private let utcMinusSensorOffsetSec: TimeInterval
+    private var videoCodec: AVVideoCodecType = .h264
     private var frameIndex = 0
     private var isFinishing = false
 
@@ -138,20 +139,13 @@ private final class CameraStreamRecorder {
 
         do {
             let writer = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
-            let settings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: width,
-                AVVideoHeightKey: height,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: max(width * height * 4, 2_000_000),
-                    AVVideoExpectedSourceFrameRateKey: Int(max(expectedFrameRate.rounded(), 1)),
-                    AVVideoAllowFrameReorderingKey: false,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-                ]
-            ]
+            let settings = Self.videoOutputSettings(width: width, height: height)
+            let codec = settings[AVVideoCodecKey] as? AVVideoCodecType ?? .h264
+            videoCodec = codec
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
-            guard writer.canAdd(input) else {
+            guard writer.canApply(outputSettings: settings, forMediaType: .video),
+                  writer.canAdd(input) else {
                 writeInfoLine("# writer_input_failed")
                 return
             }
@@ -169,10 +163,83 @@ private final class CameraStreamRecorder {
             }
             self.writer = writer
             self.input = input
-            writeInfoLine("# \(cameraName),video,\(width)x\(height)")
+            writeInfoLine("# \(cameraName),video,\(width)x\(height),codec,\(codec.rawValue)")
         } catch {
             writeInfoLine("# writer_init_failed \(error.localizedDescription)")
         }
+    }
+
+    fileprivate static func canEncodeMP4(width: Int, height: Int) -> Bool {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sensor_recorder_probe_\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        do {
+            let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mp4)
+            let settings = videoOutputSettings(width: width, height: height)
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            input.expectsMediaDataInRealTime = true
+            return writer.canApply(outputSettings: settings, forMediaType: .video) && writer.canAdd(input)
+        } catch {
+            return false
+        }
+    }
+
+    fileprivate static func isRecordableMP4Resolution(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        let longEdge = max(width, height)
+        let shortEdge = min(width, height)
+        let pixels = width * height
+
+        // AVAssetWriter may accept photo-sized dimensions during a static probe,
+        // but real-time MP4 recording is much less forgiving. Keep the settings
+        // menu on known video-safe envelopes and filter photo-ish 4:3 formats
+        // such as 2592x1944 or 4032x3024 until we add a live format probe.
+        let aspect = Double(longEdge) / Double(shortEdge)
+        let isFourByThree = abs(aspect - (4.0 / 3.0)) < 0.03
+        let isSixteenByNine = abs(aspect - (16.0 / 9.0)) < 0.03
+
+        if isFourByThree {
+            guard longEdge <= 1920, shortEdge <= 1440 else { return false }
+        } else if isSixteenByNine {
+            guard longEdge <= 3840, shortEdge <= 2160, pixels <= 3840 * 2160 else { return false }
+        } else {
+            return false
+        }
+
+        guard pixels <= 3840 * 2160 else {
+            return false
+        }
+
+        return canEncodeMP4(width: width, height: height)
+    }
+
+    fileprivate static func preferredVideoCodec(width: Int, height: Int) -> AVVideoCodecType {
+        let exceedsH264UHDEnvelope = width > 3840 || height > 2160 || width * height > 3840 * 2160
+        return exceedsH264UHDEnvelope ? .hevc : .h264
+    }
+
+    fileprivate static func videoOutputSettings(width: Int, height: Int) -> [String: Any] {
+        let codec = preferredVideoCodec(width: width, height: height)
+        var compressionProperties: [String: Any] = [
+            AVVideoAverageBitRateKey: videoBitRate(width: width, height: height, codec: codec),
+            AVVideoAllowFrameReorderingKey: false
+        ]
+        if codec == .h264 {
+            compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
+        return [
+            AVVideoCodecKey: codec,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: compressionProperties
+        ]
+    }
+
+    private static func videoBitRate(width: Int, height: Int, codec: AVVideoCodecType) -> Int {
+        let pixels = width * height
+        let bitsPerPixel = codec == .hevc ? 3 : 4
+        return max(pixels * bitsPerPixel, 2_000_000)
     }
 
     private static func audioOutputSettings() -> [String: Any] {
@@ -1021,8 +1088,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         var storageFormat: String
 
         static let defaults = RecorderSettings(
-            wide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: true),
-            ultraWide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: true),
+            wide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: false),
+            ultraWide: CameraCaptureSettings(enabled: true, resolution: "1920x1440", frameRate: "30", autoFocus: false),
             imuEnabled: true,
             magnetometerEnabled: true,
             barometerEnabled: true,
@@ -1063,6 +1130,44 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             return directory
                 .appendingPathComponent(configFileName)
+        }
+    }
+
+    private enum CapturePermission {
+        case camera
+        case microphone
+        case location
+        case motion
+
+        var statusText: String {
+            switch self {
+            case .camera: return "Camera permission"
+            case .microphone: return "Microphone permission"
+            case .location: return "Location permission"
+            case .motion: return "Motion permission"
+            }
+        }
+
+        var alertTitle: String {
+            switch self {
+            case .camera: return "Camera Access Needed"
+            case .microphone: return "Microphone Access Needed"
+            case .location: return "Location Access Needed"
+            case .motion: return "Motion Access Needed"
+            }
+        }
+
+        var deniedMessage: String {
+            switch self {
+            case .camera:
+                return "Camera permission was denied. Please enable Camera in Settings to show preview and record video."
+            case .microphone:
+                return "Microphone permission was denied. Please enable Microphone in Settings or turn Audio off in Sensor Recorder settings."
+            case .location:
+                return "Location permission was denied. Please enable Location in Settings or turn GeoLoc off in Sensor Recorder settings."
+            case .motion:
+                return "Motion & Fitness permission was denied. Please enable Motion & Fitness in Settings or turn IMU/Mag/Baro/Motion off in Sensor Recorder settings."
+            }
         }
     }
 
@@ -1137,6 +1242,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var recordingStartAligned = false
     private var pendingWideStartFrame: PendingStartFrame?
     private var pendingUltraWideStartFrame: PendingStartFrame?
+    private var pendingLocationPermissionCompletion: ((Bool) -> Void)?
     private let recordingStartToleranceSec: TimeInterval = 1.0 / 60.0
     private let embedAudioInCameraMP4 = false
     private let previewOnlyMode = false
@@ -1145,12 +1251,19 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var pendingMovieFinishes = 0
 
     private var outDirURL: URL!
-    private var startDebugURL: URL?
     private var diskCapacity: String = "?"
     private var startTime: Date!
     private var recordingTimer: Timer?
     private var recBlinkTimer: Timer?
     private var recBlinkVisible = true
+
+    private var hasEnabledCamera: Bool {
+        recorderSettings.wide.enabled || recorderSettings.ultraWide.enabled
+    }
+
+    private var needsRunningCaptureSession: Bool {
+        hasEnabledCamera || recorderSettings.audioEnabled
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -1187,37 +1300,124 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func requestCameraAccess(_ completion: @escaping (Bool) -> Void) {
-        setStatus("Camera permission")
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        ensurePermission(.camera, completion: completion)
+    }
+
+    private func requestAudioAccess(_ completion: @escaping (Bool) -> Void) {
+        ensurePermission(.microphone, completion: completion)
+    }
+
+    private func requiredPermissions(for settings: RecorderSettings) -> [CapturePermission] {
+        var permissions: [CapturePermission] = []
+        if settings.wide.enabled || settings.ultraWide.enabled {
+            permissions.append(.camera)
+        }
+        if settings.audioEnabled {
+            permissions.append(.microphone)
+        }
+        if settings.geoLocationEnabled {
+            permissions.append(.location)
+        }
+        if settings.imuEnabled || settings.magnetometerEnabled || settings.barometerEnabled || settings.deviceMotionEnabled {
+            permissions.append(.motion)
+        }
+        return permissions
+    }
+
+    private func ensurePermissions(_ permissions: [CapturePermission], completion: @escaping (Bool) -> Void) {
+        var remaining = permissions
+        guard !remaining.isEmpty else {
+            completion(true)
+            return
+        }
+
+        let permission = remaining.removeFirst()
+        ensurePermission(permission) { granted in
+            guard granted else {
+                completion(false)
+                return
+            }
+            self.ensurePermissions(remaining, completion: completion)
+        }
+    }
+
+    private func ensurePermission(_ permission: CapturePermission, completion: @escaping (Bool) -> Void) {
+        setStatus(permission.statusText)
+        switch permission {
+        case .camera:
+            ensureAVPermission(.video, permission: permission, completion: completion)
+        case .microphone:
+            ensureAVPermission(.audio, permission: permission, completion: completion)
+        case .location:
+            ensureLocationPermission(completion)
+        case .motion:
+            ensureMotionPermission(completion)
+        }
+    }
+
+    private func ensureAVPermission(
+        _ mediaType: AVMediaType,
+        permission: CapturePermission,
+        completion: @escaping (Bool) -> Void
+    ) {
+        switch AVCaptureDevice.authorizationStatus(for: mediaType) {
         case .authorized:
             completion(true)
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
+            AVCaptureDevice.requestAccess(for: mediaType) { granted in
                 if !granted {
-                    self.showError(msg: "Camera permission is required for capture.")
+                    self.showPermissionSettingsAlert(title: permission.alertTitle, message: permission.deniedMessage)
                 }
                 completion(granted)
             }
-        default:
-            showError(msg: "Camera permission is required for capture.")
+        case .denied, .restricted:
+            showPermissionSettingsAlert(title: permission.alertTitle, message: permission.deniedMessage)
+            completion(false)
+        @unknown default:
+            showPermissionSettingsAlert(title: permission.alertTitle, message: permission.deniedMessage)
             completion(false)
         }
     }
 
-    private func requestAudioAccess(_ completion: @escaping (Bool) -> Void) {
-        setStatus("Audio permission")
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
+    private func ensureLocationPermission(_ completion: @escaping (Bool) -> Void) {
+        guard CLLocationManager.locationServicesEnabled() else {
+            showPermissionSettingsAlert(
+                title: CapturePermission.location.alertTitle,
+                message: "Location Services are disabled. Please enable Location Services in Settings or turn GeoLoc off in Sensor Recorder settings."
+            )
+            completion(false)
+            return
+        }
+
+        switch locationManager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
             completion(true)
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                if !granted {
-                    os_log("Microphone permission was not granted.", type: .error)
-                }
-                completion(granted)
-            }
-        default:
-            os_log("Microphone permission is unavailable.", type: .error)
+            pendingLocationPermissionCompletion = completion
+            locationManager.requestWhenInUseAuthorization()
+        case .denied, .restricted:
+            showPermissionSettingsAlert(title: CapturePermission.location.alertTitle, message: CapturePermission.location.deniedMessage)
+            completion(false)
+        @unknown default:
+            showPermissionSettingsAlert(title: CapturePermission.location.alertTitle, message: CapturePermission.location.deniedMessage)
+            completion(false)
+        }
+    }
+
+    private func ensureMotionPermission(_ completion: @escaping (Bool) -> Void) {
+        guard CMMotionActivityManager.isActivityAvailable() else {
+            completion(true)
+            return
+        }
+
+        switch CMMotionActivityManager.authorizationStatus() {
+        case .authorized, .notDetermined:
+            completion(true)
+        case .denied, .restricted:
+            showPermissionSettingsAlert(title: CapturePermission.motion.alertTitle, message: CapturePermission.motion.deniedMessage)
+            completion(false)
+        @unknown default:
+            showPermissionSettingsAlert(title: CapturePermission.motion.alertTitle, message: CapturePermission.motion.deniedMessage)
             completion(false)
         }
     }
@@ -1231,22 +1431,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func startLocationRecording() {
-        guard CLLocationManager.locationServicesEnabled() else {
-            return
-        }
-
-        locationRecorder = GeoLocationStreamRecorder(directory: outDirURL)
         switch locationManager.authorizationStatus {
         case .authorizedAlways, .authorizedWhenInUse:
+            locationRecorder = GeoLocationStreamRecorder(directory: outDirURL)
             locationManager.startUpdatingLocation()
-        case .notDetermined:
-            locationManager.requestWhenInUseAuthorization()
-        case .denied, .restricted:
-            locationRecorder?.close()
-            locationRecorder = nil
-        @unknown default:
-            locationRecorder?.close()
-            locationRecorder = nil
+        default:
+            break
         }
     }
 
@@ -1257,6 +1447,22 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        if let completion = pendingLocationPermissionCompletion {
+            pendingLocationPermissionCompletion = nil
+            switch manager.authorizationStatus {
+            case .authorizedAlways, .authorizedWhenInUse:
+                completion(true)
+            case .denied, .restricted:
+                showPermissionSettingsAlert(title: CapturePermission.location.alertTitle, message: CapturePermission.location.deniedMessage)
+                completion(false)
+            case .notDetermined:
+                pendingLocationPermissionCompletion = completion
+            @unknown default:
+                showPermissionSettingsAlert(title: CapturePermission.location.alertTitle, message: CapturePermission.location.deniedMessage)
+                completion(false)
+            }
+        }
+
         guard isRecording, locationRecorder != nil else { return }
         switch manager.authorizationStatus {
         case .authorizedAlways, .authorizedWhenInUse:
@@ -1301,24 +1507,46 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func preparePreviewSession() {
         guard !isConfigured else { return }
         setStatus("Preview")
-        requestCameraAccess { granted in
-            guard granted else { return }
-            self.requestAudioAccess { audioGranted in
-                if self.previewDebugMode == .wideOnly {
-                    self.configureSingleCameraPreview()
-                    return
-                }
+        let cameraEnabled = recorderSettings.wide.enabled || recorderSettings.ultraWide.enabled
 
+        let configureAfterCameraPermission: () -> Void = {
+            if self.previewDebugMode == .wideOnly {
+                self.configureSingleCameraPreview()
+                return
+            }
+
+            let configurePreview: (Bool) -> Void = { includeAudio in
                 self.sessionQueue.async {
-                    self.configurePreviewSession(includeAudio: audioGranted)
+                    self.configurePreviewSession(includeAudio: includeAudio)
                     guard self.isConfigured else { return }
-                    self.session.startRunning()
+                    if self.needsRunningCaptureSession {
+                        self.session.startRunning()
+                    }
                     DispatchQueue.main.async {
                         self.startStopButton.isEnabled = true
                     }
-                    self.setStatus(self.session.isRunning ? "Ready" : "Not running")
+                    let ready = self.needsRunningCaptureSession ? self.session.isRunning : true
+                    self.setStatus(ready ? "Ready" : "Not running")
                 }
             }
+
+            if self.recorderSettings.audioEnabled {
+                self.requestAudioAccess { audioGranted in
+                    configurePreview(audioGranted)
+                }
+            } else {
+                configurePreview(false)
+            }
+        }
+
+        guard cameraEnabled else {
+            configureAfterCameraPermission()
+            return
+        }
+
+        requestCameraAccess { granted in
+            guard granted else { return }
+            configureAfterCameraPermission()
         }
     }
 
@@ -1376,7 +1604,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 previewView.backgroundColor = UIColor.systemBlue
                 previewView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                 previewView.previewLayer.session = previewSession
-                previewView.previewLayer.videoGravity = .resizeAspectFill
+                previewView.previewLayer.videoGravity = .resizeAspect
                 previewView.previewLayer.backgroundColor = UIColor.systemBlue.cgColor
                 self.sceneView.addSubview(previewView)
                 self.singlePreviewView = previewView
@@ -1459,7 +1687,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func handleRecordingSample(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera) {
-        guard previewDebugMode == .dual else {
+        guard shouldSynchronizeRecordingStart() else {
             appendRecordingSample(sampleBuffer, camera: camera)
             return
         }
@@ -1507,6 +1735,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         pendingUltraWideStartFrame = nil
         appendRecordingSample(wideFrame.sampleBuffer, camera: .wide)
         appendRecordingSample(ultraWideFrame.sampleBuffer, camera: .ultraWide)
+    }
+
+    private func shouldSynchronizeRecordingStart() -> Bool {
+        // Keep recording responsive. Offline pairing should use per-frame host timestamps
+        // from info.csv instead of blocking either stream at the first frame.
+        return false
     }
 
     private func appendRecordingSample(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera) {
@@ -1559,12 +1793,17 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
-        if previewDebugMode == .wideOnly || previewDebugMode == .dual {
+        let wideEnabled = recorderSettings.wide.enabled
+        let ultraWideEnabled = recorderSettings.ultraWide.enabled
+        let dualCameraCapture = wideEnabled && ultraWideEnabled
+
+        if (previewDebugMode == .wideOnly || previewDebugMode == .dual) && wideEnabled {
             guard configurePreviewCamera(
                 deviceType: .builtInWideAngleCamera,
                 cameraName: "wide",
                 previewIndex: 0,
-                settings: recorderSettings.wide
+                settings: recorderSettings.wide,
+                requiresMultiCamFormat: dualCameraCapture
             ) else {
                 os_log("Failed to configure wide camera.", type: .error)
                 showError(msg: "Failed to configure wide camera.")
@@ -1572,12 +1811,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             }
         }
 
-        if previewDebugMode == .ultraWideOnly || previewDebugMode == .dual {
+        if (previewDebugMode == .ultraWideOnly || previewDebugMode == .dual) && ultraWideEnabled {
             guard configurePreviewCamera(
                 deviceType: .builtInUltraWideCamera,
                 cameraName: "ultrawide",
                 previewIndex: 1,
-                settings: recorderSettings.ultraWide
+                settings: recorderSettings.ultraWide,
+                requiresMultiCamFormat: dualCameraCapture
             ) else {
                 os_log("Failed to configure ultra-wide camera.", type: .error)
                 showError(msg: "Failed to configure ultra-wide camera.")
@@ -1610,7 +1850,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         deviceType: AVCaptureDevice.DeviceType,
         cameraName: String,
         previewIndex: Int,
-        settings: CameraCaptureSettings
+        settings: CameraCaptureSettings,
+        requiresMultiCamFormat: Bool
     ) -> Bool {
         guard let device = AVCaptureDevice.default(deviceType, for: .video, position: .back) else {
             os_log("Camera unavailable: %@", type: .error, deviceType.rawValue)
@@ -1618,7 +1859,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         do {
-            try configureDeviceForPreview(device, settings: settings)
+            try configureDeviceForPreview(device, settings: settings, requiresMultiCamFormat: requiresMultiCamFormat)
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else { return false }
             session.addInputWithNoConnections(input)
@@ -1728,8 +1969,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func makeDisplayLayer(for cameraName: String) -> AVSampleBufferDisplayLayer {
         let displayLayer = AVSampleBufferDisplayLayer()
-        displayLayer.videoGravity = .resizeAspectFill
-        displayLayer.backgroundColor = (cameraName == "wide" ? UIColor.systemBlue : UIColor.systemOrange).cgColor
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.backgroundColor = UIColor.black.cgColor
         return displayLayer
     }
 
@@ -1747,9 +1988,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func createPreviewView(for cameraName: String) -> CameraPreviewView {
         let previewView = CameraPreviewView(frame: .zero)
-        previewView.backgroundColor = cameraName == "wide" ? UIColor.systemBlue : UIColor.systemOrange
+        previewView.backgroundColor = .black
         previewView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        previewView.previewLayer.videoGravity = .resizeAspectFill
+        previewView.previewLayer.videoGravity = .resizeAspect
         previewView.previewLayer.backgroundColor = previewView.backgroundColor?.cgColor
         return previewView
     }
@@ -1791,11 +2032,15 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return movieOutput
     }
 
-    private func configureDeviceForPreview(_ device: AVCaptureDevice, settings: CameraCaptureSettings) throws {
+    private func configureDeviceForPreview(
+        _ device: AVCaptureDevice,
+        settings: CameraCaptureSettings,
+        requiresMultiCamFormat: Bool
+    ) throws {
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        if let format = preferredFormats(for: device, settings: settings).first {
+        if let format = preferredFormats(for: device, settings: settings, requiresMultiCamFormat: requiresMultiCamFormat).first {
             device.activeFormat = format
         }
 
@@ -1827,13 +2072,22 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return Float(min(max(1.0 / safeMeters, 0.0), 1.0))
     }
 
-    private func preferredFormats(for device: AVCaptureDevice, settings: CameraCaptureSettings) -> [AVCaptureDevice.Format] {
+    private func preferredFormats(
+        for device: AVCaptureDevice,
+        settings: CameraCaptureSettings,
+        requiresMultiCamFormat: Bool
+    ) -> [AVCaptureDevice.Format] {
         let target = resolutionSize(from: settings.resolution) ?? CGSize(width: 1920, height: 1440)
         let targetWidth = Int(target.width)
         let targetHeight = Int(target.height)
         let targetArea = targetWidth * targetHeight
         return device.formats.filter { format in
-            format.isMultiCamSupported
+            guard !requiresMultiCamFormat || format.isMultiCamSupported else { return false }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return CameraStreamRecorder.isRecordableMP4Resolution(
+                width: Int(dimensions.width),
+                height: Int(dimensions.height)
+            )
         }.sorted { lhs, rhs in
             let lhsDims = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
             let rhsDims = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
@@ -1950,7 +2204,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func downgradeFormat(for device: AVCaptureDevice) -> Bool {
         let settings = device === wideDevice ? recorderSettings.wide : recorderSettings.ultraWide
-        let formats = preferredFormats(for: device, settings: settings)
+        let formats = preferredFormats(for: device, settings: settings, requiresMultiCamFormat: true)
         guard let currentIndex = formats.firstIndex(where: { $0 === device.activeFormat }),
               currentIndex + 1 < formats.count else {
             return false
@@ -1977,20 +2231,19 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return Int(dimensions.width) * Int(dimensions.height)
     }
 
-    private func cameraResolutionOptions(for device: AVCaptureDevice?) -> [String] {
+    private func cameraResolutionOptions(for device: AVCaptureDevice?, requiresMultiCamFormat: Bool) -> [String] {
         guard let device = device else {
-            return ["1920x1440", "1280x960", "640x480"]
+            return ["3840x2160", "1920x1440", "1920x1080", "1280x960", "1280x720", "640x480"]
         }
 
         let options = device.formats.compactMap { format -> (label: String, area: Int)? in
-            guard format.isMultiCamSupported else { return nil }
+            guard !requiresMultiCamFormat || format.isMultiCamSupported else { return nil }
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             let width = Int(dimensions.width)
             let height = Int(dimensions.height)
             guard width > 0, height > 0 else { return nil }
             guard width >= 640 && height >= 480 else { return nil }
-            let aspect = Double(width) / Double(height)
-            guard abs(aspect - (4.0 / 3.0)) < 0.03 else { return nil }
+            guard CameraStreamRecorder.isRecordableMP4Resolution(width: width, height: height) else { return nil }
             return ("\(width)x\(height)", width * height)
         }
 
@@ -2005,7 +2258,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         if !labels.contains("640x480") {
             labels.append("640x480")
         }
-        return labels.isEmpty ? ["1920x1440", "1280x960", "640x480"] : labels
+        return labels.isEmpty ? ["3840x2160", "1920x1440", "1920x1080", "1280x960", "1280x720", "640x480"] : labels
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
@@ -2018,16 +2271,25 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func applyRecordingCameraSettings() {
+        let requiresMultiCamFormat = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled
         if let wideDevice {
             do {
-                try configureDeviceForPreview(wideDevice, settings: recorderSettings.wide)
+                try configureDeviceForPreview(
+                    wideDevice,
+                    settings: recorderSettings.wide,
+                    requiresMultiCamFormat: requiresMultiCamFormat
+                )
             } catch {
                 os_log("Failed to apply wide recording settings: %@", type: .error, error.localizedDescription)
             }
         }
         if let ultraWideDevice {
             do {
-                try configureDeviceForPreview(ultraWideDevice, settings: recorderSettings.ultraWide)
+                try configureDeviceForPreview(
+                    ultraWideDevice,
+                    settings: recorderSettings.ultraWide,
+                    requiresMultiCamFormat: requiresMultiCamFormat
+                )
             } catch {
                 os_log("Failed to apply ultra-wide recording settings: %@", type: .error, error.localizedDescription)
             }
@@ -2051,9 +2313,24 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
 
         hudContentRect = dualCameraContentRect(in: bounds)
+        let wideEnabled = recorderSettings.wide.enabled
+        let ultraEnabled = recorderSettings.ultraWide.enabled
         let halfWidth = hudContentRect.width / 2
-        let ultraFrame = CGRect(x: hudContentRect.minX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
-        let wideFrame = CGRect(x: hudContentRect.midX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
+        let ultraFrame: CGRect
+        let wideFrame: CGRect
+        if wideEnabled && ultraEnabled {
+            ultraFrame = CGRect(x: hudContentRect.minX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
+            wideFrame = CGRect(x: hudContentRect.midX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
+        } else if wideEnabled {
+            wideFrame = hudContentRect
+            ultraFrame = .zero
+        } else if ultraEnabled {
+            ultraFrame = hudContentRect
+            wideFrame = .zero
+        } else {
+            wideFrame = .zero
+            ultraFrame = .zero
+        }
         layoutSampleBufferDisplayLayer(wideDisplayLayer, in: wideFrame)
         layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: ultraFrame)
         wideCameraPreviewView?.frame = wideFrame
@@ -2081,8 +2358,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
-        cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 2, width: 348, height: 30)
-        cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 2, width: 300, height: 30)
+        cameraStatusBadges["ultra"]?.isHidden = ultraFrame.isEmpty
+        cameraStatusBadges["wide"]?.isHidden = wideFrame.isEmpty
+        if !ultraFrame.isEmpty {
+            cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 2, width: 348, height: 30)
+        }
+        if !wideFrame.isEmpty {
+            cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 2, width: 300, height: 30)
+        }
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         let summaryY = max(4, hudContentRect.minY - 42)
         captureStatusBadges["summary"]?.frame = CGRect(
@@ -2130,15 +2413,29 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func startRecording() {
+        let startClock = CACurrentMediaTime()
+        logRecordingStartStep("tap", startClock: startClock)
         startStopButton.isEnabled = false
         timeLabel.text = "Preparing"
-        appendStartDebug("start_tapped")
-        recorderSettings = RecorderSettings.load()
 
-        guard isConfigured && session.isRunning else {
+        ensurePermissions(requiredPermissions(for: recorderSettings)) { granted in
+            DispatchQueue.main.async {
+                self.logRecordingStartStep("permissions", startClock: startClock)
+                guard granted else {
+                    self.startStopButton.isEnabled = true
+                    self.timeLabel.text = "Permission needed"
+                    return
+                }
+                self.startRecordingAfterPermissionChecks(startClock: startClock)
+            }
+        }
+    }
+
+    private func startRecordingAfterPermissionChecks(startClock: CFTimeInterval) {
+        let captureSessionReady = needsRunningCaptureSession ? session.isRunning : true
+        guard isConfigured && captureSessionReady else {
             startStopButton.isEnabled = true
-            appendStartDebug("start_failed_preview_not_ready")
-            showError(msg: "Camera preview is not ready yet.")
+            showError(msg: needsRunningCaptureSession ? "Capture session is not ready yet." : "Recorder is not ready yet.")
             return
         }
 
@@ -2147,14 +2444,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             showError(msg: "Failed to create the recording directory.")
             return
         }
+        logRecordingStartStep("files", startClock: startClock)
 
         sessionQueue.async {
-            self.appendStartDebug("session_queue_enter")
-            self.applyRecordingCameraSettings()
             self.resetRecordingStartAlignment()
 
             if self.recorderSettings.wide.enabled {
-                self.appendStartDebug("create_wide_recorder_begin")
                 self.wideRecorder = CameraStreamRecorder(
                     cameraName: "wide",
                     videoURL: self.outDirURL.appendingPathComponent("wide.mp4"),
@@ -2163,13 +2458,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     expectedFrameRate: self.activeFrameRate(for: self.wideDevice, settings: self.recorderSettings.wide)
                 )
                 self.wideRecorder?.writeDeviceFormat(self.wideDevice)
-                self.appendStartDebug("create_wide_recorder_done")
-            } else {
-                self.appendStartDebug("wide_recorder_disabled")
             }
 
             if self.recorderSettings.ultraWide.enabled {
-                self.appendStartDebug("create_ultrawide_recorder_begin")
                 self.ultraWideRecorder = CameraStreamRecorder(
                     cameraName: "ultrawide",
                     videoURL: self.outDirURL.appendingPathComponent("ultrawide.mp4"),
@@ -2178,21 +2469,16 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     expectedFrameRate: self.activeFrameRate(for: self.ultraWideDevice, settings: self.recorderSettings.ultraWide)
                 )
                 self.ultraWideRecorder?.writeDeviceFormat(self.ultraWideDevice)
-                self.appendStartDebug("create_ultrawide_recorder_done")
-            } else {
-                self.appendStartDebug("ultrawide_recorder_disabled")
             }
+            self.logRecordingStartStep("camera_recorders", startClock: startClock)
 
             if self.recorderSettings.audioEnabled {
-                self.appendStartDebug("create_audio_recorder_begin")
                 self.audioRecorder = AudioStreamRecorder(
                     audioURL: self.outDirURL.appendingPathComponent("audio.m4a"),
                     infoURL: self.outDirURL.appendingPathComponent("audio_info.csv")
                 )
-                self.appendStartDebug("create_audio_recorder_done")
-            } else {
-                self.appendStartDebug("audio_recorder_disabled")
             }
+            self.logRecordingStartStep("audio_recorder", startClock: startClock)
 
             let sensorOptions = SensorStreamRecorder.Options(
                 imuEnabled: self.recorderSettings.imuEnabled,
@@ -2201,25 +2487,17 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 barometerEnabled: self.recorderSettings.barometerEnabled
             )
             if sensorOptions.imuEnabled || sensorOptions.deviceMotionEnabled || sensorOptions.magnetometerEnabled || sensorOptions.barometerEnabled {
-                self.appendStartDebug("start_sensor_recorder_begin")
                 let sensorRecorder = SensorStreamRecorder()
                 sensorRecorder.start(in: self.outDirURL, options: sensorOptions)
                 self.sensorRecorder = sensorRecorder
-                self.appendStartDebug("start_sensor_recorder_done")
-            } else {
-                self.appendStartDebug("sensor_recorder_disabled")
             }
+            self.logRecordingStartStep("sensors", startClock: startClock)
 
             DispatchQueue.main.async {
-                self.appendStartDebug("main_recording_begin")
                 self.startTime = Date()
                 self.toggleRecording(val: true)
                 if self.recorderSettings.geoLocationEnabled {
-                    self.appendStartDebug("start_location_begin")
                     self.startLocationRecording()
-                    self.appendStartDebug("start_location_done")
-                } else {
-                    self.appendStartDebug("location_recorder_disabled")
                 }
                 self.updateTime()
                 self.recordingTimer = Timer.scheduledTimer(
@@ -2230,9 +2508,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     repeats: true
                 )
                 self.startStopButton.isEnabled = true
-                self.appendStartDebug("start_recording_done")
+                self.logRecordingStartStep("ui_recording", startClock: startClock)
             }
         }
+    }
+
+    private func logRecordingStartStep(_ step: String, startClock: CFTimeInterval) {
+        let elapsed = CACurrentMediaTime() - startClock
+        os_log("REC_START %{public}@ %.3fs", type: .info, step, elapsed)
     }
 
     private func stopRecording() {
@@ -2588,7 +2871,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         titleLabel.textColor = .white
 
         let detailLabel = UILabel()
-        detailLabel.text = "Camera formats are read from the current iPhone."
+        detailLabel.text = "Higher resolutions appear automatically when only one camera is enabled."
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(0.58)
         detailLabel.numberOfLines = 2
@@ -2632,6 +2915,19 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         row.addArrangedSubview(titleLabel)
         row.addArrangedSubview(button)
         stack.addArrangedSubview(row)
+    }
+
+    private func updateSettingsMenu(key: String, items: [String], compact: Bool = false) {
+        guard let button = settingsMenuButtons[key] else { return }
+        let selectedValue = resolvedSelectedValue(in: items, preferred: button.accessibilityValue ?? "")
+        button.accessibilityValue = selectedValue
+        button.configuration = settingsMenuConfiguration(title: selectedValue, compact: compact)
+        button.menu = UIMenu(children: items.map { item in
+            UIAction(title: item, state: item == selectedValue ? .on : .off) { [weak self, weak button] _ in
+                button?.accessibilityValue = item
+                button?.configuration = self?.settingsMenuConfiguration(title: item, compact: compact)
+            }
+        })
     }
 
     private func addCameraSettingsSection(
@@ -2707,6 +3003,30 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             return
         }
         updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: sender.isOn)
+        updateCameraResolutionMenus()
+    }
+
+    private func updateCameraResolutionMenus() {
+        let wideEnabled = settingsSwitches["wide.enabled"]?.isOn ?? recorderSettings.wide.enabled
+        let ultraEnabled = settingsSwitches["ultra.enabled"]?.isOn ?? recorderSettings.ultraWide.enabled
+        let requiresMultiCamFormat = wideEnabled && ultraEnabled
+
+        updateSettingsMenu(
+            key: "wide.resolution",
+            items: cameraResolutionOptions(
+                for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamFormat
+            ),
+            compact: true
+        )
+        updateSettingsMenu(
+            key: "ultra.resolution",
+            items: cameraResolutionOptions(
+                for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamFormat
+            ),
+            compact: true
+        )
     }
 
     private func updateCameraSettingsGroup(keyPrefix: String, enabled: Bool) {
@@ -2875,19 +3195,26 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         addSettingsHeader(to: stack)
         addSettingsSectionTitle(to: stack, title: "Camera")
+        let requiresMultiCamResolutionOptions = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled
         addCameraSettingsSection(
             to: stack,
             title: "Wide Camera",
             keyPrefix: "wide",
             settings: recorderSettings.wide,
-            resolutionItems: cameraResolutionOptions(for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back))
+            resolutionItems: cameraResolutionOptions(
+                for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamResolutionOptions
+            )
         )
         addCameraSettingsSection(
             to: stack,
             title: "Ultra-wide Camera",
             keyPrefix: "ultra",
             settings: recorderSettings.ultraWide,
-            resolutionItems: cameraResolutionOptions(for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back))
+            resolutionItems: cameraResolutionOptions(
+                for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamResolutionOptions
+            )
         )
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
@@ -2999,10 +3326,41 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         recorderSettings.save()
         setStatus("Settings saved")
         hideSettingsOverlay()
+        resetPreviewSessionForSettingsChange()
+    }
+
+    private func resetPreviewSessionForSettingsChange() {
+        startStopButton.isEnabled = false
         sessionQueue.async {
-            self.applyRecordingCameraSettings()
+            if self.observesSessionRuntimeErrors {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: .AVCaptureSessionRuntimeError,
+                    object: self.session
+                )
+                self.observesSessionRuntimeErrors = false
+            }
+            self.session.stopRunning()
+            self.session = AVCaptureMultiCamSession()
+            self.isConfigured = false
+            self.isRecordingConfigured = false
+            self.wideVideoPort = nil
+            self.ultraWideVideoPort = nil
+            self.wideDevice = nil
+            self.ultraWideDevice = nil
+            self.widePreviewOutput = nil
+            self.ultraWidePreviewOutput = nil
+            self.audioOutput = nil
+            self.wideFrameCount = 0
+            self.ultraWideFrameCount = 0
+
             DispatchQueue.main.async {
+                self.wideDisplayLayer?.removeFromSuperlayer()
+                self.ultraWideDisplayLayer?.removeFromSuperlayer()
+                self.wideDisplayLayer = nil
+                self.ultraWideDisplayLayer = nil
                 self.refreshOverlayStatus()
+                self.preparePreviewSession()
             }
         }
     }
@@ -3089,7 +3447,29 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         let cameraName = fallbackName.hasPrefix("wide") ? "WIDE" : "ULTRAWIDE"
         let hz = frameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", activeFrameRate(for: device, settings: settings))
-        return "\(cameraName) 4:3 | \(resolution) | \(hz)"
+        return "\(cameraName) \(aspectLabel(for: resolution)) | \(resolution) | \(hz)"
+    }
+
+    private func aspectLabel(for resolution: String) -> String {
+        guard let size = resolutionSize(from: resolution), size.height > 0 else {
+            return "--"
+        }
+        let ratio = size.width / size.height
+        if abs(ratio - (4.0 / 3.0)) < 0.03 {
+            return "4:3"
+        }
+        if abs(ratio - (16.0 / 9.0)) < 0.03 {
+            return "16:9"
+        }
+        return String(format: "%.2f:1", ratio)
+    }
+
+    private func videoCodecName(for settings: CameraCaptureSettings) -> String {
+        guard let size = resolutionSize(from: settings.resolution) else {
+            return "h264"
+        }
+        let pixels = Int(size.width * size.height)
+        return size.width > 3840 || size.height > 2160 || pixels > 3840 * 2160 ? "hevc" : "h264"
     }
 
     private func updateCameraStatusColor(key: String, enabled: Bool, activeRecorder: Bool) {
@@ -3201,9 +3581,23 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func showError(msg: String) {
         DispatchQueue.main.async {
+            guard self.presentedViewController == nil else { return }
             let fileAlert = UIAlertController(title: "Error", message: msg, preferredStyle: .alert)
             fileAlert.addAction(UIAlertAction(title: "OK", style: .cancel, handler: nil))
             self.present(fileAlert, animated: true, completion: nil)
+        }
+    }
+
+    private func showPermissionSettingsAlert(title: String, message: String) {
+        DispatchQueue.main.async {
+            guard self.presentedViewController == nil else { return }
+            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+            alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { _ in
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            })
+            self.present(alert, animated: true, completion: nil)
         }
     }
 
@@ -3213,7 +3607,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         dateFormatter.dateFormat = "yyyy_MM_dd_HH_mm_ss"
         let date = dateFormatter.string(from: Date())
         outDirURL = recDirURL.appendingPathComponent("SensorRec_\(date)")
-        startDebugURL = outDirURL.appendingPathComponent("start_debug.txt")
         do {
             try FileManager.default.createDirectory(at: outDirURL, withIntermediateDirectories: true, attributes: nil)
         } catch {
@@ -3221,25 +3614,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             return false
         }
 
-        appendStartDebug("recording_directory_created")
         writeCaptureMetaJSON(state: "created")
-        appendStartDebug("meta_created")
         updateDiskCapacity()
         return true
-    }
-
-    private func appendStartDebug(_ message: String) {
-        guard let url = startDebugURL else { return }
-        let line = String(format: "%.6f,%@\n", Date().timeIntervalSince1970, message)
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: url)
-        }
     }
 
     private func currentRecordingSettingsJSON() -> [String: Any] {
@@ -3265,6 +3642,21 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         ]
     }
 
+    private func recordingStartJSON() -> [String: Any] {
+        let wideRequestedFPS = clampedFrameRate(from: recorderSettings.wide.frameRate)
+        let ultraRequestedFPS = clampedFrameRate(from: recorderSettings.ultraWide.frameRate)
+        let wideActiveFPS = activeFrameRate(for: wideDevice, settings: recorderSettings.wide)
+        let ultraActiveFPS = activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide)
+        return [
+            "sync_first_frame": shouldSynchronizeRecordingStart(),
+            "sync_rule": "Only synchronize the first camera frames when both cameras are enabled and requested/active FPS are nearly equal.",
+            "wide_requested_fps": wideRequestedFPS,
+            "wide_active_fps": wideActiveFPS,
+            "ultrawide_requested_fps": ultraRequestedFPS,
+            "ultrawide_active_fps": ultraActiveFPS
+        ]
+    }
+
     private func writeCaptureMetaJSON(state: String) {
         let hostSec = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         let utcSec = Date().timeIntervalSince1970
@@ -3283,6 +3675,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             "created_utc_sec": utcSec,
             "updated_utc_sec": utcSec,
             "recording_settings": currentRecordingSettingsJSON(),
+            "recording_start": recordingStartJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
                 "utc_sec": "Unix UTC seconds",
@@ -3294,7 +3687,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "enabled": recorderSettings.wide.enabled,
                     "media_file": "wide.mp4",
                     "index_file": "wide_info.csv",
-                    "codec": "h264",
+                    "codec": videoCodecName(for: recorderSettings.wide),
                     "nominal_fps": activeFrameRate(for: wideDevice, settings: recorderSettings.wide),
                     "requested_resolution": recorderSettings.wide.resolution,
                     "auto_focus": recorderSettings.wide.autoFocus,
@@ -3306,7 +3699,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "enabled": recorderSettings.ultraWide.enabled,
                     "media_file": "ultrawide.mp4",
                     "index_file": "ultra_info.csv",
-                    "codec": "h264",
+                    "codec": videoCodecName(for: recorderSettings.ultraWide),
                     "nominal_fps": activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide),
                     "requested_resolution": recorderSettings.ultraWide.resolution,
                     "auto_focus": recorderSettings.ultraWide.autoFocus,
