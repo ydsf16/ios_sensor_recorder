@@ -49,6 +49,7 @@ private final class CameraStreamRecorder {
     private var videoCodec: AVVideoCodecType = .h264
     private var frameIndex = 0
     private var isFinishing = false
+    private var didWriteCSVHeader = false
 
     init(cameraName: String, videoURL: URL, infoURL: URL, includeAudioTrack: Bool, expectedFrameRate: Double) {
         self.cameraName = cameraName
@@ -61,7 +62,7 @@ private final class CameraStreamRecorder {
         try? FileManager.default.removeItem(at: infoURL)
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
-        writeInfoLine("frame_index,sensor_sec,utc_sec,exposure_sec,iso,width,height,fx,fy,cx,cy")
+        writeInfoLine("# camera,\(cameraName)")
     }
 
     func append(_ sampleBuffer: CMSampleBuffer, device: AVCaptureDevice?, sessionClock: CMClock?) {
@@ -163,7 +164,8 @@ private final class CameraStreamRecorder {
             }
             self.writer = writer
             self.input = input
-            writeInfoLine("# \(cameraName),video,\(width)x\(height),codec,\(codec.rawValue)")
+            writeInfoLine("# video,\(width)x\(height),codec,\(codec.rawValue)")
+            writeCSVHeaderIfNeeded()
         } catch {
             writeInfoLine("# writer_init_failed \(error.localizedDescription)")
         }
@@ -255,6 +257,7 @@ private final class CameraStreamRecorder {
     }
 
     private func writeInfo(_ sampleBuffer: CMSampleBuffer, device: AVCaptureDevice?, sessionClock: CMClock?) {
+        writeCSVHeaderIfNeeded()
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let sensorTime = captureSensorTime(for: presentationTime, sessionClock: sessionClock)
         let sensorSec = CMTimeGetSeconds(sensorTime)
@@ -312,6 +315,12 @@ private final class CameraStreamRecorder {
         guard let data = (line + "\n").data(using: .utf8) else { return }
         infoHandle?.write(data)
     }
+
+    private func writeCSVHeaderIfNeeded() {
+        guard !didWriteCSVHeader else { return }
+        didWriteCSVHeader = true
+        writeInfoLine("frame_index,sensor_sec,utc_sec,exposure_sec,iso,width_px,height_px,fx_px,fy_px,cx_px,cy_px")
+    }
 }
 
 private final class AudioStreamRecorder {
@@ -336,7 +345,7 @@ private final class AudioStreamRecorder {
         try? FileManager.default.removeItem(at: infoURL)
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
-        writeInfoLine("frame_index,sensor_sec,utc_sec,duration_sec,sample_count,sample_rate,channels")
+        writeInfoLine("frame_index,sensor_sec,utc_sec,duration_sec,sample_count,sample_rate_hz,channels")
     }
 
     func append(_ sampleBuffer: CMSampleBuffer, sessionClock: CMClock?) {
@@ -533,6 +542,7 @@ private final class SensorStreamRecorder {
     private static let rawIMUUpdateInterval: TimeInterval = 1.0 / 400.0
     private static let deviceMotionUpdateInterval: TimeInterval = 1.0 / 100.0
     private static let magnetometerUpdateInterval: TimeInterval = 1.0 / 50.0
+    private static let standardGravity: Double = 9.80665
 
     private let motionManager = CMMotionManager()
     private let altimeter = CMAltimeter()
@@ -567,7 +577,7 @@ private final class SensorStreamRecorder {
 
     init() {
         queue = OperationQueue()
-        queue.name = "com.scantoolscapture.sensors"
+        queue.name = "com.ydsf16.sensorrecorder.sensors"
         queue.maxConcurrentOperationCount = 1
         utcMinusSensorOffsetSec = Date().timeIntervalSince1970 - CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
     }
@@ -576,15 +586,15 @@ private final class SensorStreamRecorder {
         if options.imuEnabled {
             accelerometerWriter = SensorCSVWriter(
                 url: directory.appendingPathComponent("accelerometer.csv"),
-                header: "sensor_sec,utc_sec,ax,ay,az"
+                header: "sensor_sec,utc_sec,ax_m_s2,ay_m_s2,az_m_s2"
             )
             gyroscopeWriter = SensorCSVWriter(
                 url: directory.appendingPathComponent("gyroscope.csv"),
-                header: "sensor_sec,utc_sec,gx,gy,gz"
+                header: "sensor_sec,utc_sec,gx_rad_s,gy_rad_s,gz_rad_s"
             )
             imuWriter = SensorCSVWriter(
                 url: directory.appendingPathComponent("imu.csv"),
-                header: "sensor_sec,utc_sec,ax,ay,az,gx,gy,gz,accel_sensor_sec,gyro_sensor_sec"
+                header: "sensor_sec,utc_sec,ax_m_s2,ay_m_s2,az_m_s2,gx_rad_s,gy_rad_s,gz_rad_s,accel_sensor_sec,gyro_sensor_sec"
             )
             startIMUUpdates()
         }
@@ -602,18 +612,18 @@ private final class SensorStreamRecorder {
                     "roll",
                     "pitch",
                     "yaw",
-                    "gravity_x",
-                    "gravity_y",
-                    "gravity_z",
-                    "user_accel_x",
-                    "user_accel_y",
-                    "user_accel_z",
-                    "rotation_rate_x",
-                    "rotation_rate_y",
-                    "rotation_rate_z",
-                    "magnetic_field_x",
-                    "magnetic_field_y",
-                    "magnetic_field_z",
+                    "gravity_x_m_s2",
+                    "gravity_y_m_s2",
+                    "gravity_z_m_s2",
+                    "user_accel_x_m_s2",
+                    "user_accel_y_m_s2",
+                    "user_accel_z_m_s2",
+                    "rotation_rate_x_rad_s",
+                    "rotation_rate_y_rad_s",
+                    "rotation_rate_z_rad_s",
+                    "magnetic_field_x_uT",
+                    "magnetic_field_y_uT",
+                    "magnetic_field_z_uT",
                     "magnetic_accuracy",
                     "heading_deg"
                 ].joined(separator: ",")
@@ -624,7 +634,7 @@ private final class SensorStreamRecorder {
         if options.magnetometerEnabled {
             magnetometerWriter = SensorCSVWriter(
                 url: directory.appendingPathComponent("magnetometer.csv"),
-                header: "sensor_sec,utc_sec,mx,my,mz"
+                header: "sensor_sec,utc_sec,mx_uT,my_uT,mz_uT"
             )
             startMagnetometerUpdates()
         }
@@ -731,17 +741,20 @@ private final class SensorStreamRecorder {
             }
             let sensorSec = data.timestamp
             let utcSec = sensorSec + self.utcMinusSensorOffsetSec
+            let ax = self.metersPerSecondSquared(fromG: data.acceleration.x)
+            let ay = self.metersPerSecondSquared(fromG: data.acceleration.y)
+            let az = self.metersPerSecondSquared(fromG: data.acceleration.z)
             self.recordAccelerometerSample(sensorSec)
             self.latestAccelerometerSample = AccelerometerSample(
                 sensorSec: sensorSec,
                 utcSec: utcSec,
-                x: data.acceleration.x,
-                y: data.acceleration.y,
-                z: data.acceleration.z
+                x: ax,
+                y: ay,
+                z: az
             )
             self.accelerometerWriter?.writeLine(String(
                 format: "%.9f,%.9f,%.9f,%.9f,%.9f",
-                sensorSec, utcSec, data.acceleration.x, data.acceleration.y, data.acceleration.z
+                sensorSec, utcSec, ax, ay, az
             ))
         }
     }
@@ -805,6 +818,12 @@ private final class SensorStreamRecorder {
             let quaternion = data.attitude.quaternion
             let attitude = data.attitude
             let magneticField = data.magneticField
+            let gravityX = self.metersPerSecondSquared(fromG: data.gravity.x)
+            let gravityY = self.metersPerSecondSquared(fromG: data.gravity.y)
+            let gravityZ = self.metersPerSecondSquared(fromG: data.gravity.z)
+            let userAccelX = self.metersPerSecondSquared(fromG: data.userAcceleration.x)
+            let userAccelY = self.metersPerSecondSquared(fromG: data.userAcceleration.y)
+            let userAccelZ = self.metersPerSecondSquared(fromG: data.userAcceleration.z)
             self.recordDeviceMotionSample(sensorSec)
             self.deviceMotionWriter?.writeLine(String(
                 format: "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d,%.9f",
@@ -817,12 +836,12 @@ private final class SensorStreamRecorder {
                 attitude.roll,
                 attitude.pitch,
                 attitude.yaw,
-                data.gravity.x,
-                data.gravity.y,
-                data.gravity.z,
-                data.userAcceleration.x,
-                data.userAcceleration.y,
-                data.userAcceleration.z,
+                gravityX,
+                gravityY,
+                gravityZ,
+                userAccelX,
+                userAccelY,
+                userAccelZ,
                 data.rotationRate.x,
                 data.rotationRate.y,
                 data.rotationRate.z,
@@ -833,6 +852,10 @@ private final class SensorStreamRecorder {
                 data.heading
             ))
         }
+    }
+
+    private func metersPerSecondSquared(fromG value: Double) -> Double {
+        value * Self.standardGravity
     }
 
     private func startMagnetometerUpdates() {
@@ -959,12 +982,12 @@ private final class GeoLocationStreamRecorder {
                 "latitude",
                 "longitude",
                 "altitude",
-                "horizontal_accuracy",
-                "vertical_accuracy",
-                "speed",
-                "speed_accuracy",
-                "course",
-                "course_accuracy",
+                "horizontal_accuracy_m",
+                "vertical_accuracy_m",
+                "speed_m_s",
+                "speed_accuracy_m_s",
+                "course_deg",
+                "course_accuracy_deg",
                 "valid_position",
                 "valid_altitude",
                 "valid_speed",
@@ -1212,7 +1235,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var singleVideoOutput: AVCaptureVideoDataOutput?
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
-    private let sessionQueue = DispatchQueue(label: "com.scantoolscapture.multicam")
+    private let sessionQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.capture")
 
     private var wideOutput: AVCaptureMovieFileOutput?
     private var ultraWideOutput: AVCaptureMovieFileOutput?
@@ -2693,17 +2716,17 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorBar.addSubview(monitorTitle)
 
         NSLayoutConstraint.activate([
-            sensorBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 78),
-            sensorBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -142),
+            sensorBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 54),
+            sensorBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -112),
             sensorBar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -3),
-            sensorBar.heightAnchor.constraint(equalToConstant: 36),
+            sensorBar.heightAnchor.constraint(equalToConstant: 34),
 
             monitorTitle.leadingAnchor.constraint(equalTo: sensorBar.leadingAnchor, constant: 16),
             monitorTitle.trailingAnchor.constraint(equalTo: sensorBar.trailingAnchor, constant: -16),
             monitorTitle.topAnchor.constraint(equalTo: sensorBar.topAnchor),
 
-            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.leadingAnchor, constant: 14),
-            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.trailingAnchor, constant: -14),
+            sensorStack.leadingAnchor.constraint(equalTo: sensorBar.leadingAnchor, constant: 8),
+            sensorStack.trailingAnchor.constraint(equalTo: sensorBar.trailingAnchor, constant: -8),
             sensorStack.centerYAnchor.constraint(equalTo: sensorBar.centerYAnchor)
         ])
 
@@ -2806,11 +2829,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func addSensorPill(to stack: UIStackView, key: String, title: String) {
         let label = UILabel()
-        label.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        label.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
         label.textColor = UIColor.white.withAlphaComponent(0.44)
         label.text = "\(title) 0Hz"
         label.adjustsFontSizeToFitWidth = true
-        label.minimumScaleFactor = 0.82
+        label.minimumScaleFactor = 0.76
+        label.textAlignment = .center
         stack.addArrangedSubview(label)
         sensorStatusRows[key] = label
     }
@@ -3604,9 +3628,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func createFiles() -> Bool {
         let recDirURL = getRecDir()
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy_MM_dd_HH_mm_ss"
+        dateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let date = dateFormatter.string(from: Date())
-        outDirURL = recDirURL.appendingPathComponent("SensorRec_\(date)")
+        outDirURL = recDirURL.appendingPathComponent("SR_\(date)")
         do {
             try FileManager.default.createDirectory(at: outDirURL, withIntermediateDirectories: true, attributes: nil)
         } catch {
@@ -3657,6 +3681,30 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         ]
     }
 
+    private func deviceMetadataJSON() -> [String: Any] {
+        let device = UIDevice.current
+        return [
+            "device_id": device.identifierForVendor?.uuidString ?? "unknown",
+            "device_id_source": "UIDevice.identifierForVendor; may change after reinstall or vendor changes",
+            "name": device.name,
+            "model": device.model,
+            "localized_model": device.localizedModel,
+            "model_identifier": modelIdentifier(),
+            "system_name": device.systemName,
+            "system_version": device.systemVersion
+        ]
+    }
+
+    private func modelIdentifier() -> String {
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let mirror = Mirror(reflecting: systemInfo.machine)
+        return mirror.children.reduce(into: "") { identifier, element in
+            guard let value = element.value as? Int8, value != 0 else { return }
+            identifier.append(String(UnicodeScalar(UInt8(value))))
+        }
+    }
+
     private func writeCaptureMetaJSON(state: String) {
         let hostSec = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         let utcSec = Date().timeIntervalSince1970
@@ -3672,6 +3720,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 "version": appVersion,
                 "build": buildVersion
             ],
+            "device": deviceMetadataJSON(),
             "created_utc_sec": utcSec,
             "updated_utc_sec": utcSec,
             "recording_settings": currentRecordingSettingsJSON(),
@@ -3693,7 +3742,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "auto_focus": recorderSettings.wide.autoFocus,
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width", "height", "fx", "fy", "cx", "cy"]
+                    "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "ultrawide_camera": [
                     "enabled": recorderSettings.ultraWide.enabled,
@@ -3705,7 +3754,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "auto_focus": recorderSettings.ultraWide.autoFocus,
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width", "height", "fx", "fy", "cx", "cy"]
+                    "schema": ["frame_index", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "audio": [
                     "enabled": recorderSettings.audioEnabled,
@@ -3718,25 +3767,26 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "channel_count_source": "actual channel count is written per buffer in audio_info.csv",
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "sensor_sec", "utc_sec", "duration_sec", "sample_count", "sample_rate", "channels"]
+                    "schema": ["frame_index", "sensor_sec", "utc_sec", "duration_sec", "sample_count", "sample_rate_hz", "channels"]
                 ],
                 "accelerometer": [
                     "enabled": recorderSettings.imuEnabled,
                     "file": "accelerometer.csv",
-                    "schema": ["sensor_sec", "utc_sec", "ax", "ay", "az"],
-                    "units": ["s", "s", "g", "g", "g"]
+                    "schema": ["sensor_sec", "utc_sec", "ax_m_s2", "ay_m_s2", "az_m_s2"],
+                    "source_unit": "CoreMotion g",
+                    "acceleration_conversion": "CoreMotion g converted to m/s^2 using 9.80665"
                 ],
                 "gyroscope": [
                     "enabled": recorderSettings.imuEnabled,
                     "file": "gyroscope.csv",
-                    "schema": ["sensor_sec", "utc_sec", "gx", "gy", "gz"],
-                    "units": ["s", "s", "rad/s", "rad/s", "rad/s"]
+                    "schema": ["sensor_sec", "utc_sec", "gx_rad_s", "gy_rad_s", "gz_rad_s"]
                 ],
                 "imu": [
                     "enabled": recorderSettings.imuEnabled,
                     "file": "imu.csv",
-                    "schema": ["sensor_sec", "utc_sec", "ax", "ay", "az", "gx", "gy", "gz", "accel_sensor_sec", "gyro_sensor_sec"],
-                    "note": "Rows are keyed by gyro samples with the latest raw accelerometer sample attached."
+                    "schema": ["sensor_sec", "utc_sec", "ax_m_s2", "ay_m_s2", "az_m_s2", "gx_rad_s", "gy_rad_s", "gz_rad_s", "accel_sensor_sec", "gyro_sensor_sec"],
+                    "note": "Rows are keyed by gyro samples with the latest raw accelerometer sample attached.",
+                    "acceleration_conversion": "CoreMotion g converted to m/s^2 using 9.80665"
                 ],
                 "device_motion": [
                     "enabled": recorderSettings.deviceMotionEnabled,
@@ -3754,27 +3804,27 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                         "roll",
                         "pitch",
                         "yaw",
-                        "gravity_x",
-                        "gravity_y",
-                        "gravity_z",
-                        "user_accel_x",
-                        "user_accel_y",
-                        "user_accel_z",
-                        "rotation_rate_x",
-                        "rotation_rate_y",
-                        "rotation_rate_z",
-                        "magnetic_field_x",
-                        "magnetic_field_y",
-                        "magnetic_field_z",
+                        "gravity_x_m_s2",
+                        "gravity_y_m_s2",
+                        "gravity_z_m_s2",
+                        "user_accel_x_m_s2",
+                        "user_accel_y_m_s2",
+                        "user_accel_z_m_s2",
+                        "rotation_rate_x_rad_s",
+                        "rotation_rate_y_rad_s",
+                        "rotation_rate_z_rad_s",
+                        "magnetic_field_x_uT",
+                        "magnetic_field_y_uT",
+                        "magnetic_field_z_uT",
                         "magnetic_accuracy",
                         "heading_deg"
-                    ]
+                    ],
+                    "acceleration_conversion": "CoreMotion g converted to m/s^2 using 9.80665"
                 ],
                 "magnetometer": [
                     "enabled": recorderSettings.magnetometerEnabled,
                     "file": "magnetometer.csv",
-                    "schema": ["sensor_sec", "utc_sec", "mx", "my", "mz"],
-                    "units": ["s", "s", "microtesla", "microtesla", "microtesla"]
+                    "schema": ["sensor_sec", "utc_sec", "mx_uT", "my_uT", "mz_uT"]
                 ],
                 "barometer": [
                     "enabled": recorderSettings.barometerEnabled,
@@ -3791,12 +3841,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                         "latitude",
                         "longitude",
                         "altitude",
-                        "horizontal_accuracy",
-                        "vertical_accuracy",
-                        "speed",
-                        "speed_accuracy",
-                        "course",
-                        "course_accuracy",
+                        "horizontal_accuracy_m",
+                        "vertical_accuracy_m",
+                        "speed_m_s",
+                        "speed_accuracy_m_s",
+                        "course_deg",
+                        "course_accuracy_deg",
                         "valid_position",
                         "valid_altitude",
                         "valid_speed",
