@@ -301,14 +301,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = ZLZLM8XFB9;
+				DEVELOPMENT_TEAM = NJ4A36DHA3;
 				INFOPLIST_FILE = SensorRecorder/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16.iosSensorRecorder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dongsheng.iosSensorRecorder;
 				PRODUCT_NAME = SensorRecorder;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -321,14 +321,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = ZLZLM8XFB9;
+				DEVELOPMENT_TEAM = NJ4A36DHA3;
 				INFOPLIST_FILE = SensorRecorder/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.4;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.ydsf16.iosSensorRecorder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dongsheng.iosSensorRecorder;
 				PRODUCT_NAME = SensorRecorder;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";

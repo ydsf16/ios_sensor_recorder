@@ -1099,6 +1099,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         var autoFocus: Bool
     }
 
+    private struct CameraCapabilities {
+        let hasWide: Bool
+        let hasUltraWide: Bool
+        let hasTelephoto: Bool
+        let hasLiDAR: Bool
+        let supportsMultiCam: Bool
+    }
+
     private struct RecorderSettings: Codable {
         var wide: CameraCaptureSettings
         var ultraWide: CameraCaptureSettings
@@ -1226,7 +1234,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private let overlayFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
     private let overlayValueFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
 
-    private lazy var session = AVCaptureMultiCamSession()
+    private lazy var session: AVCaptureSession = makeCaptureSession(for: recorderSettings)
     private var singlePreviewSession: AVCaptureSession?
     private var singlePreviewLayer: AVCaptureVideoPreviewLayer?
     private var singlePreviewView: CameraPreviewView?
@@ -1288,10 +1296,58 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         hasEnabledCamera || recorderSettings.audioEnabled
     }
 
+    private func makeCaptureSession(for settings: RecorderSettings) -> AVCaptureSession {
+        let wantsDualCamera = settings.wide.enabled && settings.ultraWide.enabled
+        if wantsDualCamera && AVCaptureMultiCamSession.isMultiCamSupported {
+            return AVCaptureMultiCamSession()
+        }
+        return AVCaptureSession()
+    }
+
+    private func cameraCapabilities() -> CameraCapabilities {
+        CameraCapabilities(
+            hasWide: AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) != nil,
+            hasUltraWide: AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) != nil,
+            hasTelephoto: AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) != nil,
+            hasLiDAR: AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) != nil,
+            supportsMultiCam: AVCaptureMultiCamSession.isMultiCamSupported
+        )
+    }
+
+    private func sanitizeRecorderSettingsForCurrentDevice() {
+        let capabilities = cameraCapabilities()
+        var updated = recorderSettings
+
+        if updated.wide.enabled && !capabilities.hasWide {
+            updated.wide.enabled = false
+        }
+        if updated.ultraWide.enabled && !capabilities.hasUltraWide {
+            updated.ultraWide.enabled = false
+        }
+
+        let wantsDualCamera = updated.wide.enabled && updated.ultraWide.enabled
+        if wantsDualCamera && !capabilities.supportsMultiCam {
+            // Prefer wide for older single-camera devices. Ultra-wide can still be
+            // used as a single camera on devices that have it but cannot MultiCam.
+            updated.ultraWide.enabled = false
+        }
+
+        if !updated.wide.enabled && !updated.ultraWide.enabled && capabilities.hasWide {
+            updated.wide.enabled = true
+        }
+
+        if updated.wide.enabled != recorderSettings.wide.enabled ||
+            updated.ultraWide.enabled != recorderSettings.ultraWide.enabled {
+            recorderSettings = updated
+            recorderSettings.save()
+        }
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
         recorderSettings = RecorderSettings.load()
+        sanitizeRecorderSettingsForCurrentDevice()
         view.backgroundColor = .black
         updateDiskCapacity()
         installLandscapeOverlay()
@@ -1529,6 +1585,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func preparePreviewSession() {
         guard !isConfigured else { return }
+        sanitizeRecorderSettingsForCurrentDevice()
         setStatus("Preview")
         let cameraEnabled = recorderSettings.wide.enabled || recorderSettings.ultraWide.enabled
 
@@ -1792,7 +1849,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func captureSessionClock() -> CMClock? {
-        return session.synchronizationClock
+        (session as? AVCaptureMultiCamSession)?.synchronizationClock
     }
 
     private func sensorSeconds(for sampleBuffer: CMSampleBuffer) -> TimeInterval {
@@ -1806,19 +1863,17 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func configurePreviewSession(includeAudio: Bool) {
         guard !isConfigured else { return }
-        guard AVCaptureMultiCamSession.isMultiCamSupported else {
-            showError(msg: "This device does not support MultiCam capture.")
-            return
-        }
+        sanitizeRecorderSettingsForCurrentDevice()
 
         observeSessionRuntimeErrorsIfNeeded()
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        configureSessionPresetForActiveFormats()
 
         let wideEnabled = recorderSettings.wide.enabled
         let ultraWideEnabled = recorderSettings.ultraWide.enabled
-        let dualCameraCapture = wideEnabled && ultraWideEnabled
+        let dualCameraCapture = wideEnabled && ultraWideEnabled && session is AVCaptureMultiCamSession
 
         if (previewDebugMode == .wideOnly || previewDebugMode == .dual) && wideEnabled {
             guard configurePreviewCamera(
@@ -1855,7 +1910,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         reduceFormatsForMulticamBudgetIfNeeded()
         isConfigured = true
-        setStatus(previewDebugMode.rawValue)
+        setStatus(dualCameraCapture ? "dual preview" : "single preview")
+    }
+
+    private func configureSessionPresetForActiveFormats() {
+        guard !(session is AVCaptureMultiCamSession) else { return }
+        if session.canSetSessionPreset(.inputPriority) {
+            session.sessionPreset = .inputPriority
+        }
     }
 
     private func observeSessionRuntimeErrorsIfNeeded() {
@@ -1929,6 +1991,15 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 ultraWideDevice = device
                 ultraWidePreviewOutput = videoOutput
             }
+            let activeDimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            os_log(
+                "Configured %@ camera requested %@ active %dx%d preset %@",
+                cameraName,
+                settings.resolution,
+                activeDimensions.width,
+                activeDimensions.height,
+                session.sessionPreset.rawValue
+            )
             return true
         } catch {
             os_log("Failed to configure camera %@: %@", type: .error, deviceType.rawValue, error.localizedDescription)
@@ -2198,12 +2269,13 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func reduceFormatsForMulticamBudgetIfNeeded() {
         guard previewDebugMode == .dual,
+              let multiCamSession = session as? AVCaptureMultiCamSession,
               let wideDevice = wideDevice,
               let ultraWideDevice = ultraWideDevice else {
             return
         }
 
-        while session.hardwareCost > 1.0 || session.systemPressureCost > 1.0 {
+        while multiCamSession.hardwareCost > 1.0 || multiCamSession.systemPressureCost > 1.0 {
             let wideArea = activeFormatArea(for: wideDevice)
             let ultraWideArea = activeFormatArea(for: ultraWideDevice)
             let firstChoice = wideArea >= ultraWideArea ? wideDevice : ultraWideDevice
@@ -2218,8 +2290,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             os_log(
                 "MultiCam cost remains high. hardwareCost %.3f systemPressureCost %.3f",
                 type: .error,
-                session.hardwareCost,
-                session.systemPressureCost
+                multiCamSession.hardwareCost,
+                multiCamSession.systemPressureCost
             )
             break
         }
@@ -2294,7 +2366,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     }
 
     private func applyRecordingCameraSettings() {
-        let requiresMultiCamFormat = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled
+        let requiresMultiCamFormat = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled && session is AVCaptureMultiCamSession
         if let wideDevice {
             do {
                 try configureDeviceForPreview(
@@ -2895,13 +2967,33 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         titleLabel.textColor = .white
 
         let detailLabel = UILabel()
-        detailLabel.text = "Higher resolutions appear automatically when only one camera is enabled."
+        detailLabel.text = "Unavailable cameras are disabled automatically. Higher resolutions appear when only one camera is enabled."
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(0.58)
         detailLabel.numberOfLines = 2
 
         stack.addArrangedSubview(titleLabel)
         stack.addArrangedSubview(detailLabel)
+    }
+
+    private func addSettingsFootnote(to stack: UIStackView, text: String) {
+        let label = UILabel()
+        label.text = text
+        label.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        label.textColor = UIColor.white.withAlphaComponent(0.46)
+        label.numberOfLines = 2
+        stack.addArrangedSubview(label)
+    }
+
+    private func cameraCapabilityText(_ capabilities: CameraCapabilities) -> String {
+        let cameras = [
+            capabilities.hasWide ? "Wide" : nil,
+            capabilities.hasUltraWide ? "UltraWide" : nil,
+            capabilities.hasTelephoto ? "Tele" : nil,
+            capabilities.hasLiDAR ? "LiDAR" : nil
+        ].compactMap { $0 }.joined(separator: " / ")
+        let multiCam = capabilities.supportsMultiCam ? "MultiCam supported" : "Single-camera capture only"
+        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam). Tele/LiDAR are reserved for future versions."
     }
 
     private func addSettingsMenuRow(
@@ -2959,9 +3051,18 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         title: String,
         keyPrefix: String,
         settings: CameraCaptureSettings,
-        resolutionItems: [String]
+        resolutionItems: [String],
+        available: Bool,
+        unavailableReason: String? = nil
     ) {
-        addSettingsSubsectionTitle(to: stack, title: title, switchKey: "\(keyPrefix).enabled", isOn: settings.enabled)
+        addSettingsSubsectionTitle(
+            to: stack,
+            title: title,
+            switchKey: "\(keyPrefix).enabled",
+            isOn: settings.enabled && available,
+            enabled: available,
+            detail: unavailableReason
+        )
         let compactStack = UIStackView()
         compactStack.axis = .vertical
         compactStack.spacing = 6
@@ -2993,24 +3094,46 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             isOn: settings.autoFocus,
             compact: true
         )
-        updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: settings.enabled)
+        updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: settings.enabled && available)
     }
 
-    private func addSettingsSubsectionTitle(to stack: UIStackView, title: String, switchKey: String? = nil, isOn: Bool = true) {
+    private func addSettingsSubsectionTitle(
+        to stack: UIStackView,
+        title: String,
+        switchKey: String? = nil,
+        isOn: Bool = true,
+        enabled: Bool = true,
+        detail: String? = nil
+    ) {
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
         row.spacing = 12
 
+        let textStack = UIStackView()
+        textStack.axis = .vertical
+        textStack.spacing = 1
+
         let label = UILabel()
         label.text = title
         label.font = UIFont.systemFont(ofSize: 18, weight: .bold)
-        label.textColor = .white
-        row.addArrangedSubview(label)
+        label.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
+        textStack.addArrangedSubview(label)
+
+        if let detail, !detail.isEmpty {
+            let detailLabel = UILabel()
+            detailLabel.text = detail
+            detailLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+            detailLabel.textColor = UIColor.white.withAlphaComponent(0.46)
+            textStack.addArrangedSubview(detailLabel)
+        }
+
+        row.addArrangedSubview(textStack)
 
         if let switchKey {
             let cameraSwitch = UISwitch()
             cameraSwitch.isOn = isOn
+            cameraSwitch.isEnabled = enabled
             cameraSwitch.onTintColor = .systemTeal
             cameraSwitch.accessibilityIdentifier = switchKey
             cameraSwitch.addTarget(self, action: #selector(cameraEnabledSwitchChanged(_:)), for: .valueChanged)
@@ -3026,14 +3149,30 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
               let keyPrefix = switchKey.split(separator: ".").first.map(String.init) else {
             return
         }
+        enforceCameraSwitchCompatibility(changedKeyPrefix: keyPrefix)
         updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: sender.isOn)
         updateCameraResolutionMenus()
+    }
+
+    private func enforceCameraSwitchCompatibility(changedKeyPrefix: String) {
+        let capabilities = cameraCapabilities()
+        if !capabilities.supportsMultiCam,
+           settingsSwitches["wide.enabled"]?.isOn == true,
+           settingsSwitches["ultra.enabled"]?.isOn == true {
+            if changedKeyPrefix == "wide" {
+                settingsSwitches["ultra.enabled"]?.setOn(false, animated: true)
+                updateCameraSettingsGroup(keyPrefix: "ultra", enabled: false)
+            } else {
+                settingsSwitches["wide.enabled"]?.setOn(false, animated: true)
+                updateCameraSettingsGroup(keyPrefix: "wide", enabled: false)
+            }
+        }
     }
 
     private func updateCameraResolutionMenus() {
         let wideEnabled = settingsSwitches["wide.enabled"]?.isOn ?? recorderSettings.wide.enabled
         let ultraEnabled = settingsSwitches["ultra.enabled"]?.isOn ?? recorderSettings.ultraWide.enabled
-        let requiresMultiCamFormat = wideEnabled && ultraEnabled
+        let requiresMultiCamFormat = wideEnabled && ultraEnabled && AVCaptureMultiCamSession.isMultiCamSupported
 
         updateSettingsMenu(
             key: "wide.resolution",
@@ -3219,7 +3358,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
         addSettingsHeader(to: stack)
         addSettingsSectionTitle(to: stack, title: "Camera")
-        let requiresMultiCamResolutionOptions = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled
+        let capabilities = cameraCapabilities()
+        addSettingsFootnote(to: stack, text: cameraCapabilityText(capabilities))
+        let requiresMultiCamResolutionOptions = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled && capabilities.supportsMultiCam
         addCameraSettingsSection(
             to: stack,
             title: "Wide Camera",
@@ -3228,7 +3369,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             resolutionItems: cameraResolutionOptions(
                 for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                 requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            )
+            ),
+            available: capabilities.hasWide,
+            unavailableReason: capabilities.hasWide ? nil : "Not available on this device"
         )
         addCameraSettingsSection(
             to: stack,
@@ -3238,7 +3381,9 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             resolutionItems: cameraResolutionOptions(
                 for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
                 requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            )
+            ),
+            available: capabilities.hasUltraWide,
+            unavailableReason: capabilities.hasUltraWide ? nil : "Not available on this device"
         )
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
@@ -3347,6 +3492,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled,
             storageFormat: selectedSettingsValue(for: "storageFormat", fallback: recorderSettings.storageFormat)
         )
+        sanitizeRecorderSettingsForCurrentDevice()
         recorderSettings.save()
         setStatus("Settings saved")
         hideSettingsOverlay()
@@ -3365,7 +3511,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 self.observesSessionRuntimeErrors = false
             }
             self.session.stopRunning()
-            self.session = AVCaptureMultiCamSession()
+            self.sanitizeRecorderSettingsForCurrentDevice()
+            self.session = self.makeCaptureSession(for: self.recorderSettings)
             self.isConfigured = false
             self.isRecordingConfigured = false
             self.wideVideoPort = nil
