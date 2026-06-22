@@ -385,6 +385,7 @@ private final class AudioStreamRecorder {
         try? FileManager.default.removeItem(at: infoURL)
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
+        writeInfoLine("# audio,aac,m4a")
         writeInfoLine("frame_index,sensor_sec,utc_sec,duration_sec,sample_count,sample_rate_hz,channels")
     }
 
@@ -458,7 +459,6 @@ private final class AudioStreamRecorder {
             writer.add(input)
             self.writer = writer
             self.input = input
-            writeInfoLine("# audio,aac,m4a")
         } catch {
             writeInfoLine("# writer_init_failed,\(error.localizedDescription)")
         }
@@ -1115,15 +1115,10 @@ private final class GeoLocationStreamRecorder {
     }
 }
 
-class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
+class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
     private enum RecordingCamera {
         case wide
         case ultraWide
-    }
-
-    private struct PendingStartFrame {
-        let sampleBuffer: CMSampleBuffer
-        let sensorSec: TimeInterval
     }
 
     private enum PreviewDebugMode: String {
@@ -1137,6 +1132,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         var resolution: String
         var frameRate: String
         var autoFocus: Bool
+        var autoExposure: Bool? = true
         var maxExposureDurationMS: String? = "10"
         var fixedFocusLensPosition: Double?
     }
@@ -1158,7 +1154,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         var geoLocationEnabled: Bool
         var deviceMotionEnabled: Bool
         var audioEnabled: Bool
-        var storageFormat: String
 
         static let defaults = RecorderSettings(
             wide: CameraCaptureSettings(
@@ -1166,6 +1161,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 resolution: "1920x1440",
                 frameRate: "30",
                 autoFocus: false,
+                autoExposure: true,
                 maxExposureDurationMS: "10",
                 fixedFocusLensPosition: 0.6
             ),
@@ -1174,6 +1170,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 resolution: "1920x1440",
                 frameRate: "30",
                 autoFocus: false,
+                autoExposure: true,
                 maxExposureDurationMS: "10",
                 fixedFocusLensPosition: 0.8
             ),
@@ -1182,8 +1179,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             barometerEnabled: true,
             geoLocationEnabled: true,
             deviceMotionEnabled: true,
-            audioEnabled: true,
-            storageFormat: "CSV"
+            audioEnabled: true
         )
 
         private static let storageKey = "sensor_recorder.settings.v1"
@@ -1303,8 +1299,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var diagnosticLayer: CALayer?
     private let sessionQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.capture")
 
-    private var wideOutput: AVCaptureMovieFileOutput?
-    private var ultraWideOutput: AVCaptureMovieFileOutput?
     private var wideVideoPort: AVCaptureInput.Port?
     private var ultraWideVideoPort: AVCaptureInput.Port?
     private var wideDevice: AVCaptureDevice?
@@ -1328,16 +1322,11 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private var ultraWidePreviewLayer: AVCaptureVideoPreviewLayer?
 
     private var isConfigured = false
-    private var isRecordingConfigured = false
     private var isRecording = false
     private var recordingGridOriginSec: TimeInterval?
     private var lastWideRecordSlot: Int64?
     private var lastUltraWideRecordSlot: Int64?
-    private var recordingStartAligned = false
-    private var pendingWideStartFrame: PendingStartFrame?
-    private var pendingUltraWideStartFrame: PendingStartFrame?
     private var pendingLocationPermissionCompletion: ((Bool) -> Void)?
-    private let recordingStartToleranceSec: TimeInterval = 1.0 / 60.0
     private let defaultCameraAutoExposureMaxDurationMS = "10"
     private let defaultWideFixedFocusLensPosition = 0.6
     private let defaultUltraWideFixedFocusLensPosition = 0.8
@@ -1345,8 +1334,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private let previewOnlyMode = false
     private let previewDebugMode: PreviewDebugMode = .dual
     private var observesSessionRuntimeErrors = false
-    private var pendingMovieFinishes = 0
-
     private var outDirURL: URL!
     private var diskCapacity: String = "?"
     private var startTime: Date!
@@ -1395,7 +1382,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
     private func sanitizeRecorderSettingsForCurrentDevice() {
         let capabilities = cameraCapabilities()
         var updated = recorderSettings
-        updated.storageFormat = "CSV"
         updated.wide = sanitizedCameraCaptureSettings(
             updated.wide,
             defaultLensPosition: defaultWideFixedFocusLensPosition
@@ -1423,8 +1409,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             updated.wide.enabled = true
         }
 
-        if updated.storageFormat != recorderSettings.storageFormat ||
-            updated.wide != recorderSettings.wide ||
+        if updated.wide != recorderSettings.wide ||
             updated.ultraWide != recorderSettings.ultraWide {
             recorderSettings = updated
             recorderSettings.save()
@@ -1436,6 +1421,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         defaultLensPosition: Double
     ) -> CameraCaptureSettings {
         var sanitized = settings
+        sanitized.autoExposure = isAutoExposureEnabled(for: sanitized)
         if sanitized.maxExposureDurationMS == nil ||
             !["1", "5", "10", "20", "30"].contains(maxExposureDurationLabel(for: sanitized)) {
             sanitized.maxExposureDurationMS = defaultCameraAutoExposureMaxDurationMS
@@ -1820,7 +1806,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         if let wideOutput = widePreviewOutput, output === wideOutput {
             wideFrameCount += 1
             if isRecording {
-                handleRecordingSample(sampleBuffer, camera: .wide)
+                appendRecordingSample(sampleBuffer, camera: .wide)
             }
             enqueuePreview(sampleBuffer, on: wideDisplayLayer, camera: .wide)
             guard wideFrameCount % 30 == 0 else { return }
@@ -1831,7 +1817,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         if let ultraWideOutput = ultraWidePreviewOutput, output === ultraWideOutput {
             ultraWideFrameCount += 1
             if isRecording {
-                handleRecordingSample(sampleBuffer, camera: .ultraWide)
+                appendRecordingSample(sampleBuffer, camera: .ultraWide)
             }
             enqueuePreview(sampleBuffer, on: ultraWideDisplayLayer, camera: .ultraWide)
             guard ultraWideFrameCount % 30 == 0 else { return }
@@ -1872,63 +1858,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return copiedSampleBuffer
     }
 
-    private func handleRecordingSample(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera) {
-        guard shouldSynchronizeRecordingStart() else {
-            appendRecordingSample(sampleBuffer, camera: camera)
-            return
-        }
-
-        guard !recordingStartAligned else {
-            appendRecordingSample(sampleBuffer, camera: camera)
-            return
-        }
-
-        let sensorSec = sensorSeconds(for: sampleBuffer)
-        guard sensorSec.isFinite else {
-            recordingStartAligned = true
-            appendRecordingSample(sampleBuffer, camera: camera)
-            return
-        }
-
-        let pendingFrame = PendingStartFrame(sampleBuffer: sampleBuffer, sensorSec: sensorSec)
-        switch camera {
-        case .wide:
-            pendingWideStartFrame = pendingFrame
-        case .ultraWide:
-            pendingUltraWideStartFrame = pendingFrame
-        }
-        alignPendingRecordingStartIfNeeded()
-    }
-
-    private func alignPendingRecordingStartIfNeeded() {
-        guard let wideFrame = pendingWideStartFrame,
-              let ultraWideFrame = pendingUltraWideStartFrame else {
-            return
-        }
-
-        let delta = wideFrame.sensorSec - ultraWideFrame.sensorSec
-        guard abs(delta) <= recordingStartToleranceSec else {
-            if delta < 0 {
-                pendingWideStartFrame = nil
-            } else {
-                pendingUltraWideStartFrame = nil
-            }
-            return
-        }
-
-        recordingStartAligned = true
-        pendingWideStartFrame = nil
-        pendingUltraWideStartFrame = nil
-        appendRecordingSample(wideFrame.sampleBuffer, camera: .wide)
-        appendRecordingSample(ultraWideFrame.sampleBuffer, camera: .ultraWide)
-    }
-
-    private func shouldSynchronizeRecordingStart() -> Bool {
-        // Keep recording responsive. Offline pairing should use per-frame host timestamps
-        // from info.csv instead of blocking either stream at the first frame.
-        return false
-    }
-
     private func appendRecordingSample(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera) {
         guard let recordSlot = recordingSlotIfFrameShouldBeWritten(sampleBuffer, camera: camera) else {
             return
@@ -1942,10 +1871,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
     }
 
-    private func resetRecordingStartAlignment() {
-        recordingStartAligned = false
-        pendingWideStartFrame = nil
-        pendingUltraWideStartFrame = nil
+    private func resetRecordingSamplingState() {
         recordingGridOriginSec = nil
         lastWideRecordSlot = nil
         lastUltraWideRecordSlot = nil
@@ -2254,43 +2180,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         return previewView
     }
 
-    private func configureRecordingOutputs() -> Bool {
-        guard !isRecordingConfigured else { return true }
-        guard let wideVideoPort = wideVideoPort, let ultraWideVideoPort = ultraWideVideoPort else {
-            return false
-        }
-
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
-
-        guard let wideMovieOutput = makeMovieOutput(for: wideVideoPort) else {
-            showError(msg: "Failed to configure wide video writer.")
-            return false
-        }
-        guard let ultraWideMovieOutput = makeMovieOutput(for: ultraWideVideoPort) else {
-            showError(msg: "Failed to configure ultra-wide video writer.")
-            return false
-        }
-
-        wideOutput = wideMovieOutput
-        ultraWideOutput = ultraWideMovieOutput
-        isRecordingConfigured = true
-        return true
-    }
-
-    private func makeMovieOutput(for videoPort: AVCaptureInput.Port) -> AVCaptureMovieFileOutput? {
-        let movieOutput = AVCaptureMovieFileOutput()
-        movieOutput.movieFragmentInterval = CMTime(value: 1, timescale: 1)
-        guard session.canAddOutput(movieOutput) else { return nil }
-        session.addOutputWithNoConnections(movieOutput)
-
-        let connection = AVCaptureConnection(inputPorts: [videoPort], output: movieOutput)
-        guard session.canAddConnection(connection) else { return nil }
-        session.addConnection(connection)
-        configureVideoConnection(connection)
-        return movieOutput
-    }
-
     private func configureDeviceForPreview(
         _ device: AVCaptureDevice,
         settings: CameraCaptureSettings,
@@ -2318,7 +2207,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         } else if device.isFocusModeSupported(.locked) {
             if device.isLockingFocusWithCustomLensPositionSupported {
                 device.setFocusModeLocked(
-                    lensPosition: lensPosition(for: settings),
+                    lensPosition: lensPosition(for: settings, device: device),
                     completionHandler: nil
                 )
             } else {
@@ -2335,11 +2224,21 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         clampedLensPosition(value ?? fallback)
     }
 
-    private func lensPosition(for settings: CameraCaptureSettings) -> Float {
-        Float(clampedLensPosition(settings.fixedFocusLensPosition, fallback: defaultWideFixedFocusLensPosition))
+    private func lensPosition(for settings: CameraCaptureSettings, device: AVCaptureDevice) -> Float {
+        let defaultLensPosition = device.deviceType == .builtInUltraWideCamera
+            ? defaultUltraWideFixedFocusLensPosition
+            : defaultWideFixedFocusLensPosition
+        return Float(clampedLensPosition(settings.fixedFocusLensPosition, fallback: defaultLensPosition))
     }
 
     private func applyAutoExposurePolicy(to device: AVCaptureDevice, settings: CameraCaptureSettings) {
+        guard isAutoExposureEnabled(for: settings) else {
+            if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
+            }
+            return
+        }
+
         if device.isExposureModeSupported(.continuousAutoExposure) {
             device.exposureMode = .continuousAutoExposure
         } else if device.isExposureModeSupported(.autoExpose) {
@@ -2447,6 +2346,10 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
 
     private func targetRecordingFrameRate(for settings: CameraCaptureSettings) -> Double {
         clampedFrameRate(from: settings.frameRate)
+    }
+
+    private func isAutoExposureEnabled(for settings: CameraCaptureSettings) -> Bool {
+        settings.autoExposure ?? true
     }
 
     private func maxExposureDurationSeconds(for settings: CameraCaptureSettings) -> TimeInterval {
@@ -2767,7 +2670,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         logRecordingStartStep("files", startClock: startClock)
 
         sessionQueue.async {
-            self.resetRecordingStartAlignment()
+            self.resetRecordingSamplingState()
 
             if self.recorderSettings.wide.enabled {
                 self.wideRecorder = CameraStreamRecorder(
@@ -2850,7 +2753,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         timeWriteLabel.text = "mp4,csv"
 
         sessionQueue.async {
-            self.resetRecordingStartAlignment()
+            self.resetRecordingSamplingState()
             let group = DispatchGroup()
             if let wideRecorder = self.wideRecorder {
                 group.enter()
@@ -2874,36 +2777,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 }
             }
         }
-    }
-
-    func fileOutput(
-        _ output: AVCaptureFileOutput,
-        didStartRecordingTo fileURL: URL,
-        from connections: [AVCaptureConnection]
-    ) {
-        os_log("Started recording: %@", fileURL.path)
-    }
-
-    func fileOutput(
-        _ output: AVCaptureFileOutput,
-        didFinishRecordingTo outputFileURL: URL,
-        from connections: [AVCaptureConnection],
-        error: Error?
-    ) {
-        if let error = error {
-            os_log("Finished recording with error %@: %@", type: .error, outputFileURL.path, error.localizedDescription)
-        } else {
-            os_log("Finished recording: %@", outputFileURL.path)
-        }
-        DispatchQueue.main.async {
-            self.movieOutputDidFinishOneFile()
-        }
-    }
-
-    private func movieOutputDidFinishOneFile() {
-        pendingMovieFinishes -= 1
-        guard pendingMovieFinishes <= 0 else { return }
-        updateSize()
     }
 
     private func openCaptureDirectory() {
@@ -3362,6 +3235,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             selectedValue: settings.frameRate,
             compact: true
         )
+        addSettingsRow(
+            to: compactStack,
+            key: "\(keyPrefix).autoExposure",
+            title: "Auto Exposure",
+            detail: "",
+            isOn: isAutoExposureEnabled(for: settings),
+            compact: true
+        )
         addSettingsMenuRow(
             to: compactStack,
             key: "\(keyPrefix).maxExposure",
@@ -3385,6 +3266,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             value: clampedLensPosition(settings.fixedFocusLensPosition, fallback: defaultLensPosition),
             compact: true
         )
+        updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: settings.enabled && available)
         updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: settings.enabled && available)
         updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: settings.enabled && available)
     }
@@ -3443,6 +3325,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
         enforceCameraSwitchCompatibility(changedKeyPrefix: keyPrefix)
         updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: sender.isOn)
+        updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: sender.isOn)
         updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: sender.isOn)
         updateCameraResolutionMenus()
     }
@@ -3455,10 +3338,12 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             if changedKeyPrefix == "wide" {
                 settingsSwitches["ultra.enabled"]?.setOn(false, animated: true)
                 updateCameraSettingsGroup(keyPrefix: "ultra", enabled: false)
+                updateAutoExposureControlState(keyPrefix: "ultra", cameraEnabled: false)
                 updateFixedFocusControlState(keyPrefix: "ultra", cameraEnabled: false)
             } else {
                 settingsSwitches["wide.enabled"]?.setOn(false, animated: true)
                 updateCameraSettingsGroup(keyPrefix: "wide", enabled: false)
+                updateAutoExposureControlState(keyPrefix: "wide", cameraEnabled: false)
                 updateFixedFocusControlState(keyPrefix: "wide", cameraEnabled: false)
             }
         }
@@ -3491,6 +3376,14 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         guard let group = cameraSettingsGroups[keyPrefix] else { return }
         group.isUserInteractionEnabled = enabled
         group.alpha = enabled ? 1.0 : 0.34
+    }
+
+    private func updateAutoExposureControlState(keyPrefix: String, cameraEnabled: Bool) {
+        guard let button = settingsMenuButtons["\(keyPrefix).maxExposure"] else { return }
+        let autoExposureEnabled = settingsSwitches["\(keyPrefix).autoExposure"]?.isOn ?? true
+        let enabled = cameraEnabled && autoExposureEnabled
+        button.isEnabled = enabled
+        button.alpha = enabled ? 1.0 : 0.34
     }
 
     private func updateFixedFocusControlState(keyPrefix: String, cameraEnabled: Bool) {
@@ -3743,6 +3636,8 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         sensorSwitch.accessibilityIdentifier = key
         if key.hasSuffix(".autoFocus") {
             sensorSwitch.addTarget(self, action: #selector(autoFocusSwitchChanged(_:)), for: .valueChanged)
+        } else if key.hasSuffix(".autoExposure") {
+            sensorSwitch.addTarget(self, action: #selector(autoExposureSwitchChanged(_:)), for: .valueChanged)
         }
         settingsSwitches[key] = sensorSwitch
 
@@ -3758,6 +3653,15 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         }
         let cameraEnabled = settingsSwitches["\(keyPrefix).enabled"]?.isOn ?? true
         updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: cameraEnabled)
+    }
+
+    @objc private func autoExposureSwitchChanged(_ sender: UISwitch) {
+        guard let switchKey = sender.accessibilityIdentifier,
+              let keyPrefix = switchKey.split(separator: ".").first.map(String.init) else {
+            return
+        }
+        let cameraEnabled = settingsSwitches["\(keyPrefix).enabled"]?.isOn ?? true
+        updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: cameraEnabled)
     }
 
     private func addSettingsActionButtons(to stack: UIStackView) {
@@ -3790,6 +3694,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 resolution: selectedSettingsValue(for: "wide.resolution", fallback: recorderSettings.wide.resolution),
                 frameRate: selectedSettingsValue(for: "wide.frameRate", fallback: recorderSettings.wide.frameRate),
                 autoFocus: settingsSwitches["wide.autoFocus"]?.isOn ?? recorderSettings.wide.autoFocus,
+                autoExposure: settingsSwitches["wide.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: recorderSettings.wide),
                 maxExposureDurationMS: selectedSettingsValue(
                     for: "wide.maxExposure",
                     fallback: maxExposureDurationLabel(for: recorderSettings.wide)
@@ -3807,6 +3712,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                 resolution: selectedSettingsValue(for: "ultra.resolution", fallback: recorderSettings.ultraWide.resolution),
                 frameRate: selectedSettingsValue(for: "ultra.frameRate", fallback: recorderSettings.ultraWide.frameRate),
                 autoFocus: settingsSwitches["ultra.autoFocus"]?.isOn ?? recorderSettings.ultraWide.autoFocus,
+                autoExposure: settingsSwitches["ultra.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: recorderSettings.ultraWide),
                 maxExposureDurationMS: selectedSettingsValue(
                     for: "ultra.maxExposure",
                     fallback: maxExposureDurationLabel(for: recorderSettings.ultraWide)
@@ -3824,8 +3730,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             barometerEnabled: settingsSwitches["baro"]?.isOn ?? recorderSettings.barometerEnabled,
             geoLocationEnabled: settingsSwitches["geo"]?.isOn ?? recorderSettings.geoLocationEnabled,
             deviceMotionEnabled: settingsSwitches["motion"]?.isOn ?? recorderSettings.deviceMotionEnabled,
-            audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled,
-            storageFormat: "CSV"
+            audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled
         )
         sanitizeRecorderSettingsForCurrentDevice()
         recorderSettings.save()
@@ -3849,7 +3754,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             self.sanitizeRecorderSettingsForCurrentDevice()
             self.session = self.makeCaptureSession(for: self.recorderSettings)
             self.isConfigured = false
-            self.isRecordingConfigured = false
             self.wideVideoPort = nil
             self.ultraWideVideoPort = nil
             self.wideDevice = nil
@@ -4147,8 +4051,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             "barometer_enabled": recorderSettings.barometerEnabled,
             "geo_location_enabled": recorderSettings.geoLocationEnabled,
             "device_motion_enabled": recorderSettings.deviceMotionEnabled,
-            "audio_enabled": recorderSettings.audioEnabled,
-            "storage_format": recorderSettings.storageFormat
+            "audio_enabled": recorderSettings.audioEnabled
         ]
     }
 
@@ -4161,6 +4064,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
             "resolution": settings.resolution,
             "target_frame_rate": targetRecordingFrameRate(for: settings),
             "auto_focus": settings.autoFocus,
+            "auto_exposure": isAutoExposureEnabled(for: settings),
             "fixed_focus_lens_position_requested": clampedLensPosition(
                 settings.fixedFocusLensPosition,
                 fallback: defaultLensPosition
@@ -4175,7 +4079,6 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
         let wideCaptureFPS = activeFrameRate(for: wideDevice, settings: recorderSettings.wide)
         let ultraCaptureFPS = activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide)
         return [
-            "sync_first_frame": shouldSynchronizeRecordingStart(),
             "sampling_rule": "Cameras run at capture_fps; MP4/info rows are downsampled onto a shared host-time record_slot grid at target_fps.",
             "wide_target_fps": wideTargetFPS,
             "wide_capture_fps": wideCaptureFPS,
@@ -4244,6 +4147,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "capture_fps": activeFrameRate(for: wideDevice, settings: recorderSettings.wide),
                     "requested_resolution": recorderSettings.wide.resolution,
                     "auto_focus": recorderSettings.wide.autoFocus,
+                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.wide),
                     "fixed_focus_lens_position_requested": clampedLensPosition(
                         recorderSettings.wide.fixedFocusLensPosition,
                         fallback: defaultWideFixedFocusLensPosition
@@ -4262,6 +4166,7 @@ class ViewController: UIViewController, AVCaptureFileOutputRecordingDelegate, AV
                     "capture_fps": activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide),
                     "requested_resolution": recorderSettings.ultraWide.resolution,
                     "auto_focus": recorderSettings.ultraWide.autoFocus,
+                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.ultraWide),
                     "fixed_focus_lens_position_requested": clampedLensPosition(
                         recorderSettings.ultraWide.fixedFocusLensPosition,
                         fallback: defaultUltraWideFixedFocusLensPosition
