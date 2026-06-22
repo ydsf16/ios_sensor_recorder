@@ -27,7 +27,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Record synchronized wide and ultra-wide camera videos.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Record location metadata during capture sessions.</string>
+	<string>Record location data during capture sessions.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record microphone audio together with captured video.</string>
 	<key>NSMotionUsageDescription</key>
@@ -53,12 +53,10 @@
 	<true/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
