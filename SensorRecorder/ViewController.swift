@@ -2,6 +2,7 @@ import UIKit
 import AVFoundation
 import CoreLocation
 import CoreMotion
+import StoreKit
 import os.log
 import simd
 
@@ -31,6 +32,134 @@ private extension UILabel {
 private extension UIView {
     func subviewsRecursive() -> [UIView] {
         subviews + subviews.flatMap { $0.subviewsRecursive() }
+    }
+}
+
+private final class PurchaseManager {
+    static let shared = PurchaseManager()
+    static let premiumProductID = "com.grape.SensorRecorder.unlimited"
+
+    enum PurchaseOutcome {
+        case purchased
+        case pending
+        case cancelled
+    }
+
+    private let premiumCacheKey = "sensor_recorder.premium_unlocked"
+    private var premiumProduct: Product?
+    private var transactionUpdatesTask: Task<Void, Never>?
+
+    var isPremiumUnlocked: Bool {
+        UserDefaults.standard.bool(forKey: premiumCacheKey)
+    }
+
+    var premiumDisplayPrice: String? {
+        premiumProduct?.displayPrice
+    }
+
+    private init() {}
+
+    func start() {
+        guard transactionUpdatesTask == nil else { return }
+        transactionUpdatesTask = Task.detached { [weak self] in
+            for await result in Transaction.updates {
+                guard let self = self else { return }
+                if case .verified(let transaction) = result,
+                   transaction.productID == Self.premiumProductID {
+                    self.setPremiumUnlocked(transaction.revocationDate == nil)
+                    await transaction.finish()
+                }
+            }
+        }
+
+        Task {
+            _ = try? await loadPremiumProduct()
+            await refreshEntitlements()
+        }
+    }
+
+    func stop() {
+        transactionUpdatesTask?.cancel()
+        transactionUpdatesTask = nil
+    }
+
+    @discardableResult
+    func loadPremiumProduct() async throws -> Product? {
+        if let premiumProduct {
+            return premiumProduct
+        }
+        let products = try await Product.products(for: [Self.premiumProductID])
+        premiumProduct = products.first(where: { $0.id == Self.premiumProductID })
+        return premiumProduct
+    }
+
+    func purchasePremium() async throws -> PurchaseOutcome {
+        guard let product = try await loadPremiumProduct() else {
+            throw PurchaseError.productUnavailable
+        }
+
+        let result = try await product.purchase()
+        switch result {
+        case .success(let verification):
+            let transaction = try verifiedTransaction(from: verification)
+            setPremiumUnlocked(transaction.revocationDate == nil)
+            await transaction.finish()
+            return .purchased
+        case .pending:
+            return .pending
+        case .userCancelled:
+            return .cancelled
+        @unknown default:
+            return .cancelled
+        }
+    }
+
+    func restorePurchases() async throws -> Bool {
+        try await AppStore.sync()
+        await refreshEntitlements()
+        return isPremiumUnlocked
+    }
+
+    func refreshEntitlements() async {
+        var unlocked = false
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result,
+                  transaction.productID == Self.premiumProductID,
+                  transaction.revocationDate == nil else {
+                continue
+            }
+            unlocked = true
+        }
+        setPremiumUnlocked(unlocked)
+    }
+
+    private func verifiedTransaction(
+        from result: VerificationResult<Transaction>
+    ) throws -> Transaction {
+        switch result {
+        case .verified(let transaction):
+            return transaction
+        case .unverified:
+            throw PurchaseError.unverifiedTransaction
+        }
+    }
+
+    private func setPremiumUnlocked(_ unlocked: Bool) {
+        UserDefaults.standard.set(unlocked, forKey: premiumCacheKey)
+    }
+
+    enum PurchaseError: LocalizedError {
+        case productUnavailable
+        case unverifiedTransaction
+
+        var errorDescription: String? {
+            switch self {
+            case .productUnavailable:
+                return "The upgrade product is not available yet. Please check the App Store configuration."
+            case .unverifiedTransaction:
+                return "The App Store could not verify this purchase."
+            }
+        }
     }
 }
 
@@ -318,7 +447,7 @@ private final class CameraStreamRecorder {
         let cx = intrinsics?.cx ?? .nan
         let cy = intrinsics?.cy ?? .nan
         writeInfoLine(String(
-            format: "%d,%lld,%.9f,%.9f,%.9f,%.3f,%d,%d,%.9f,%.9f,%.9f,%.9f",
+            format: "%d,%lld,%.6f,%.6f,%.9f,%.3f,%d,%d,%.9f,%.9f,%.9f,%.9f",
             frameIndex, recordSlot, sensorSec, utcSec, exposureSec, iso, width, height, fx, fy, cx, cy
         ))
     }
@@ -479,7 +608,7 @@ private final class AudioStreamRecorder {
         let format = audioFormat(sampleBuffer)
         recordAudioFormat(format)
         writeInfoLine(String(
-            format: "%d,%.9f,%.9f,%.9f,%d,%.3f,%d",
+            format: "%d,%.6f,%.6f,%.6f,%d,%.3f,%d",
             frameIndex,
             sensorSec,
             utcSec,
@@ -793,7 +922,7 @@ private final class SensorStreamRecorder {
                 z: az
             )
             self.accelerometerWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f,%.9f",
                 sensorSec, utcSec, ax, ay, az
             ))
         }
@@ -816,7 +945,7 @@ private final class SensorStreamRecorder {
             let utcSec = sensorSec + self.utcMinusSensorOffsetSec
             self.recordGyroscopeSample(sensorSec)
             self.gyroscopeWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f,%.9f",
                 sensorSec, utcSec, data.rotationRate.x, data.rotationRate.y, data.rotationRate.z
             ))
             guard let accelerometer = self.latestAccelerometerSample else {
@@ -824,7 +953,7 @@ private final class SensorStreamRecorder {
             }
             self.recordIMUSample(sensorSec)
             self.imuWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.6f,%.6f",
                 sensorSec,
                 utcSec,
                 accelerometer.x,
@@ -866,7 +995,7 @@ private final class SensorStreamRecorder {
             let userAccelZ = self.metersPerSecondSquared(fromG: data.userAcceleration.z)
             self.recordDeviceMotionSample(sensorSec)
             self.deviceMotionWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d,%.9f",
                 sensorSec,
                 utcSec,
                 quaternion.w,
@@ -915,7 +1044,7 @@ private final class SensorStreamRecorder {
             let utcSec = sensorSec + self.utcMinusSensorOffsetSec
             self.recordMagnetometerSample(sensorSec)
             self.magnetometerWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f,%.9f",
                 sensorSec, utcSec, data.magneticField.x, data.magneticField.y, data.magneticField.z
             ))
         }
@@ -937,7 +1066,7 @@ private final class SensorStreamRecorder {
             let utcSec = sensorSec + self.utcMinusSensorOffsetSec
             self.recordBarometerSample(sensorSec)
             self.barometerWriter?.writeLine(String(
-                format: "%.9f,%.9f,%.9f,%.9f",
+                format: "%.6f,%.6f,%.9f,%.9f",
                 sensorSec, utcSec, data.pressure.doubleValue, data.relativeAltitude.doubleValue
             ))
         }
@@ -1057,7 +1186,7 @@ private final class GeoLocationStreamRecorder {
 
         recordSample(sensorSec)
         writer.writeLine(String(
-            format: "%.9f,%.9f,%.9f,%.9f,%.9f,%.3f,%.3f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d",
+            format: "%.6f,%.6f,%.9f,%.9f,%.9f,%.3f,%.3f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d",
             sensorSec,
             utcSec,
             location.coordinate.latitude,
@@ -1282,6 +1411,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var captureStatusRows: [String: UILabel] = [:]
     private var cameraStatusBadges: [String: UIView] = [:]
     private var captureStatusBadges: [String: UIView] = [:]
+    private var freeCountdownLabel: UILabel?
     private var rightControlRail: UIView?
     private var sensorMonitorBar: UIView?
     private var hudContentRect: CGRect = .zero
@@ -1330,10 +1460,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private let defaultCameraAutoExposureMaxDurationMS = "10"
     private let defaultWideFixedFocusLensPosition = 0.6
     private let defaultUltraWideFixedFocusLensPosition = 0.8
+    private let freeRecordingLimitSeconds: TimeInterval = 120
+    private let freeCountdownVisibleThresholdSeconds: TimeInterval = 20
     private let embedAudioInCameraMP4 = false
     private let previewOnlyMode = false
     private let previewDebugMode: PreviewDebugMode = .dual
     private var observesSessionRuntimeErrors = false
+    private var freeRecordingLimitStopRequested = false
     private var outDirURL: URL!
     private var diskCapacity: String = "?"
     private var startTime: Date!
@@ -1436,6 +1569,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        PurchaseManager.shared.start()
         recorderSettings = RecorderSettings.load()
         sanitizeRecorderSettingsForCurrentDevice()
         view.backgroundColor = .black
@@ -1446,6 +1580,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         sceneView.backgroundColor = .black
         sceneView.layer.borderWidth = 0
         configureLocationManager()
+    }
+
+    deinit {
+        PurchaseManager.shared.stop()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -2603,6 +2741,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if let sensorMonitorBar {
             view.bringSubviewToFront(sensorMonitorBar)
         }
+        if let freeCountdownLabel {
+            view.bringSubviewToFront(freeCountdownLabel)
+        }
         if let rightControlRail {
             view.bringSubviewToFront(rightControlRail)
         }
@@ -2720,6 +2861,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
             DispatchQueue.main.async {
                 self.startTime = Date()
+                self.freeRecordingLimitStopRequested = false
                 self.toggleRecording(val: true)
                 if self.recorderSettings.geoLocationEnabled {
                     self.startLocationRecording()
@@ -2743,7 +2885,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         os_log("REC_START %{public}@ %.3fs", type: .info, step, elapsed)
     }
 
-    private func stopRecording() {
+    private func stopRecording(showUpgradePromptAfterFinish: Bool = false) {
         toggleRecording(val: false)
         recordingTimer?.invalidate()
         recordingTimer = nil
@@ -2774,6 +2916,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.audioRecorder = nil
                 DispatchQueue.main.async {
                     self.updateSize()
+                    if showUpgradePromptAfterFinish {
+                        self.showFreeRecordingLimitAlert()
+                    }
                 }
             }
         }
@@ -2791,6 +2936,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         updateAuxiliaryRailButtons(isRecording: val)
         captureStatusBadges["summary"]?.isHidden = !val
         val ? startRECBlinking() : stopRECBlinking()
+        if !val {
+            hideFreeCountdown()
+        }
         refreshOverlayStatus()
         if val {
             fpsStepper.isEnabled = false
@@ -2865,6 +3013,27 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         cameraStatusRows["wide"] = wideBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+
+        let countdownLabel = UILabel()
+        countdownLabel.translatesAutoresizingMaskIntoConstraints = false
+        countdownLabel.isHidden = true
+        countdownLabel.textAlignment = .center
+        countdownLabel.font = UIFont.monospacedSystemFont(ofSize: 20, weight: .bold)
+        countdownLabel.textColor = .white
+        countdownLabel.backgroundColor = UIColor.black.withAlphaComponent(0.48)
+        countdownLabel.layer.cornerRadius = 16
+        countdownLabel.layer.cornerCurve = .continuous
+        countdownLabel.layer.masksToBounds = true
+        countdownLabel.layer.borderWidth = 1
+        countdownLabel.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        view.addSubview(countdownLabel)
+        freeCountdownLabel = countdownLabel
+        NSLayoutConstraint.activate([
+            countdownLabel.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
+            countdownLabel.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor, constant: -22),
+            countdownLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
+            countdownLabel.heightAnchor.constraint(equalToConstant: 52)
+        ])
 
         let sensorBar = UIView()
         sensorBar.translatesAutoresizingMaskIntoConstraints = false
@@ -3066,14 +3235,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         titleLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
         titleLabel.textColor = .white
 
-        let detailLabel = UILabel()
-        detailLabel.text = "Unavailable cameras are disabled automatically. Higher resolutions appear when only one camera is enabled."
-        detailLabel.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .medium)
-        detailLabel.textColor = UIColor.white.withAlphaComponent(0.58)
-        detailLabel.numberOfLines = 2
-
         stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(detailLabel)
     }
 
     private func addSettingsFootnote(to stack: UIStackView, text: String) {
@@ -3093,7 +3255,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             capabilities.hasLiDAR ? "LiDAR" : nil
         ].compactMap { $0 }.joined(separator: " / ")
         let multiCam = capabilities.supportsMultiCam ? "MultiCam supported" : "Single-camera capture only"
-        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam). Tele/LiDAR are reserved for future versions."
+        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam)."
     }
 
     private func addSettingsMenuRow(
@@ -3515,14 +3677,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             configPanel.centerXAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.centerXAnchor),
             configPanel.widthAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.widthAnchor, multiplier: 0.74),
             configPanel.widthAnchor.constraint(lessThanOrEqualToConstant: 900),
-            configPanel.topAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.topAnchor, constant: 18),
-            configPanel.bottomAnchor.constraint(equalTo: dimView.safeAreaLayoutGuide.bottomAnchor, constant: -18)
+            configPanel.topAnchor.constraint(equalTo: dimView.topAnchor),
+            configPanel.bottomAnchor.constraint(equalTo: dimView.bottomAnchor)
         ])
 
         let scrollView = UIScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.showsVerticalScrollIndicator = true
+        scrollView.indicatorStyle = .white
+        scrollView.verticalScrollIndicatorInsets = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
         configPanel.contentView.addSubview(scrollView)
+
+        let scrollHintTrack = UIView()
+        scrollHintTrack.translatesAutoresizingMaskIntoConstraints = false
+        scrollHintTrack.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        scrollHintTrack.layer.cornerRadius = 1
+        scrollHintTrack.layer.cornerCurve = .continuous
+        configPanel.contentView.addSubview(scrollHintTrack)
 
         let actionBar = UIStackView()
         actionBar.translatesAutoresizingMaskIntoConstraints = false
@@ -3539,9 +3710,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 18),
-            scrollView.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -18),
+            scrollView.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
             scrollView.topAnchor.constraint(equalTo: configPanel.contentView.topAnchor, constant: 18),
             scrollView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -14),
+
+            scrollHintTrack.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -8),
+            scrollHintTrack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 8),
+            scrollHintTrack.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: -8),
+            scrollHintTrack.widthAnchor.constraint(equalToConstant: 2),
 
             actionBar.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 24),
             actionBar.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
@@ -3556,6 +3732,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ])
 
         addSettingsHeader(to: stack)
+        addPurchaseSection(to: stack)
         addSettingsSectionTitle(to: stack, title: "Camera")
         let capabilities = cameraCapabilities()
         addSettingsFootnote(to: stack, text: cameraCapabilityText(capabilities))
@@ -3594,8 +3771,91 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         addSettingsRow(to: stack, key: "geo", title: "GeoLoc", detail: "CoreLocation fused geographic fixes", isOn: recorderSettings.geoLocationEnabled)
         addSettingsRow(to: stack, key: "motion", title: "Device Motion", detail: "Fused attitude + gravity", isOn: recorderSettings.deviceMotionEnabled)
         addSettingsRow(to: stack, key: "audio", title: "Audio", detail: "M4A AAC, device input channels", isOn: recorderSettings.audioEnabled)
-
         addSettingsActionButtons(to: actionBar)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            scrollView.flashScrollIndicators()
+        }
+    }
+
+    private func addPurchaseSection(to stack: UIStackView) {
+        let statusLabel = UILabel()
+        statusLabel.text = purchaseStatusText()
+        statusLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        statusLabel.textColor = UIColor.white.withAlphaComponent(0.58)
+        statusLabel.numberOfLines = 1
+        stack.addArrangedSubview(statusLabel)
+
+        let buttonRow = UIStackView()
+        buttonRow.axis = .horizontal
+        buttonRow.alignment = .center
+        buttonRow.distribution = .fillEqually
+        buttonRow.spacing = 12
+
+        let upgradeButton = makePurchaseButton(
+            title: upgradeButtonTitle(),
+            backgroundColor: .systemTeal,
+            foregroundColor: .black
+        )
+        upgradeButton.isEnabled = !PurchaseManager.shared.isPremiumUnlocked
+        upgradeButton.alpha = PurchaseManager.shared.isPremiumUnlocked ? 0.34 : 1.0
+        upgradeButton.addTarget(self, action: #selector(upgradeButtonTapped), for: .touchUpInside)
+
+        let restoreButton = makePurchaseButton(
+            title: "Restore Purchase",
+            backgroundColor: UIColor.white.withAlphaComponent(0.14),
+            foregroundColor: .white
+        )
+        restoreButton.addTarget(self, action: #selector(restorePurchaseButtonTapped), for: .touchUpInside)
+
+        buttonRow.addArrangedSubview(upgradeButton)
+        buttonRow.addArrangedSubview(restoreButton)
+        stack.addArrangedSubview(buttonRow)
+    }
+
+    private func makePurchaseButton(
+        title: String,
+        backgroundColor: UIColor,
+        foregroundColor: UIColor
+    ) -> UIButton {
+        let button = UIButton(type: .system)
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.attributedTitle = AttributedString(
+            title,
+            attributes: AttributeContainer([
+                .font: UIFont.systemFont(ofSize: 12, weight: .semibold)
+            ])
+        )
+        config.baseBackgroundColor = backgroundColor
+        config.baseForegroundColor = foregroundColor
+        config.cornerStyle = .large
+        config.contentInsets = NSDirectionalEdgeInsets(top: 7, leading: 12, bottom: 7, trailing: 12)
+        button.configuration = config
+        button.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        return button
+    }
+
+    private func purchaseStatusText() -> String {
+        if PurchaseManager.shared.isPremiumUnlocked {
+            return "Premium unlocked · Unlimited recordings"
+        }
+        return "Free version · \(freeRecordingLimitMinutesText()) per recording"
+    }
+
+    private func upgradeButtonTitle() -> String {
+        if let price = PurchaseManager.shared.premiumDisplayPrice {
+            return "Upgrade \(price)"
+        }
+        return "Upgrade"
+    }
+
+    private func freeRecordingLimitMinutesText() -> String {
+        if freeRecordingLimitSeconds < 60 {
+            return "\(Int(freeRecordingLimitSeconds)) seconds"
+        }
+        let minutes = Int(freeRecordingLimitSeconds / 60)
+        return "\(minutes) minutes"
     }
 
     private func addSettingsRow(
@@ -3662,6 +3922,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         let cameraEnabled = settingsSwitches["\(keyPrefix).enabled"]?.isOn ?? true
         updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: cameraEnabled)
+    }
+
+    @objc private func upgradeButtonTapped() {
+        purchasePremium()
+    }
+
+    @objc private func restorePurchaseButtonTapped() {
+        restorePurchases()
     }
 
     private func addSettingsActionButtons(to stack: UIStackView) {
@@ -3809,7 +4077,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     @objc private func updateTime() {
-        var elapsed = Int64(round(Date().timeIntervalSince(startTime)))
+        let elapsedSeconds = Date().timeIntervalSince(startTime)
+        if shouldStopAtFreeRecordingLimit(elapsedSeconds: elapsedSeconds) {
+            handleFreeRecordingLimitReached()
+            return
+        }
+        updateFreeCountdown(elapsedSeconds: elapsedSeconds)
+
+        var elapsed = Int64(round(elapsedSeconds))
         let hours: Int64 = elapsed / 3600
         elapsed = elapsed % 3600
         let mins: Int64 = elapsed / 60
@@ -3820,6 +4095,40 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         updateSize()
         refreshOverlayStatus()
+    }
+
+    private func shouldStopAtFreeRecordingLimit(elapsedSeconds: TimeInterval) -> Bool {
+        isRecording &&
+            !PurchaseManager.shared.isPremiumUnlocked &&
+            !freeRecordingLimitStopRequested &&
+            elapsedSeconds >= freeRecordingLimitSeconds
+    }
+
+    private func handleFreeRecordingLimitReached() {
+        freeRecordingLimitStopRequested = true
+        hideFreeCountdown()
+        timeLabel.text = "Limit reached"
+        stopRecording(showUpgradePromptAfterFinish: true)
+    }
+
+    private func updateFreeCountdown(elapsedSeconds: TimeInterval) {
+        guard isRecording, !PurchaseManager.shared.isPremiumUnlocked else {
+            hideFreeCountdown()
+            return
+        }
+
+        let secondsLeft = max(Int(ceil(freeRecordingLimitSeconds - elapsedSeconds)), 0)
+        guard secondsLeft <= Int(freeCountdownVisibleThresholdSeconds), secondsLeft > 0 else {
+            hideFreeCountdown()
+            return
+        }
+
+        freeCountdownLabel?.text = "Free session time left: \(secondsLeft)s"
+        freeCountdownLabel?.isHidden = false
+    }
+
+    private func hideFreeCountdown() {
+        freeCountdownLabel?.isHidden = true
     }
 
     private func refreshOverlayStatus() {
@@ -4005,6 +4314,105 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
+    private func showMessage(title: String, message: String) {
+        DispatchQueue.main.async {
+            guard self.presentedViewController == nil else { return }
+            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .cancel, handler: nil))
+            self.present(alert, animated: true, completion: nil)
+        }
+    }
+
+    private func showFreeRecordingLimitAlert() {
+        DispatchQueue.main.async {
+            guard self.presentedViewController == nil else { return }
+            let alert = UIAlertController(
+                title: "Free Recording Limit Reached",
+                message: "Free users can record up to \(self.freeRecordingLimitMinutesText()) per session. Upgrade once to unlock unlimited recording length.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "Upgrade", style: .default) { _ in
+                self.purchasePremium()
+            })
+            alert.addAction(UIAlertAction(title: "Restore Purchase", style: .default) { _ in
+                self.restorePurchases()
+            })
+            alert.addAction(UIAlertAction(title: "Later", style: .cancel, handler: nil))
+            self.present(alert, animated: true, completion: nil)
+        }
+    }
+
+    private func purchasePremium() {
+        setStatus("Loading upgrade")
+        Task {
+            do {
+                let outcome = try await PurchaseManager.shared.purchasePremium()
+                await MainActor.run {
+                    switch outcome {
+                    case .purchased:
+                        self.setStatus("Premium unlocked")
+                        self.hideFreeCountdown()
+                        self.refreshSettingsOverlayIfVisible()
+                        self.showMessage(
+                            title: "Premium Unlocked",
+                            message: "Unlimited recording length is now enabled."
+                        )
+                    case .pending:
+                        self.setStatus("Purchase pending")
+                        self.showMessage(
+                            title: "Purchase Pending",
+                            message: "The App Store is still processing this purchase. Unlimited recording will unlock after approval."
+                        )
+                    case .cancelled:
+                        self.setStatus("Upgrade cancelled")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.setStatus("Upgrade unavailable")
+                    self.showError(msg: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func restorePurchases() {
+        setStatus("Restoring")
+        Task {
+            do {
+                let restored = try await PurchaseManager.shared.restorePurchases()
+                await MainActor.run {
+                    if restored {
+                        self.setStatus("Premium restored")
+                        self.hideFreeCountdown()
+                        self.refreshSettingsOverlayIfVisible()
+                        self.showMessage(
+                            title: "Purchase Restored",
+                            message: "Unlimited recording length is now enabled."
+                        )
+                    } else {
+                        self.setStatus("No purchase found")
+                        self.showMessage(
+                            title: "No Purchase Found",
+                            message: "No previous unlimited recording purchase was found for this Apple ID."
+                        )
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.setStatus("Restore failed")
+                    self.showError(msg: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func refreshSettingsOverlayIfVisible() {
+        guard settingsOverlayView != nil else { return }
+        hideSettingsOverlay()
+        showSettingsOverlay()
+    }
+
     private func showPermissionSettingsAlert(title: String, message: String) {
         DispatchQueue.main.async {
             guard self.presentedViewController == nil else { return }
@@ -4051,7 +4459,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "barometer_enabled": recorderSettings.barometerEnabled,
             "geo_location_enabled": recorderSettings.geoLocationEnabled,
             "device_motion_enabled": recorderSettings.deviceMotionEnabled,
-            "audio_enabled": recorderSettings.audioEnabled
+            "audio_enabled": recorderSettings.audioEnabled,
+            "premium_unlocked": PurchaseManager.shared.isPremiumUnlocked,
+            "free_recording_limit_sec": freeRecordingLimitSeconds
         ]
     }
 
