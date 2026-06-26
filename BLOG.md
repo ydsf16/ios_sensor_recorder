@@ -1,5 +1,9 @@
 # 把 iPhone 变成科研传感器平台：一个面向 VIO、机器人与具身智能的数据采集工具
 
+![Sensor Recorder Pro recording UI](docs/images/sensor-recorder-recording-ui.png)
+
+English summary: [Turn an iPhone into a research sensor platform](#english-summary-turn-an-iphone-into-a-research-sensor-platform)
+
 最近几年，AR 眼镜、Always-On 设备、具身智能、机器人、无人机、空间计算这些方向都越来越热。它们看起来是不同的产品形态，但底层其实有一个共同点：都需要一套稳定、同步、多模态的传感器系统。
 
 一台 AR 眼镜需要相机、IMU、麦克风、定位、姿态估计；一台机器人需要视觉、惯性、位姿、环境信息；无人机和无人车也需要多传感器时间同步、标定和数据记录。换句话说，真正支撑这些系统工作的，不只是算法模型本身，还有一套可靠的数据采集基础设施。
@@ -77,6 +81,8 @@ SensorRec 会尽量保留两类时间：
 
 这对 VIO、SLAM、多传感器融合非常重要。因为我们最终关心的不是“视频看起来顺不顺”，而是每一帧图像和 IMU 数据在时间轴上能不能对齐。
 
+![Rerun visualization of camera, IMU, audio, attitude, and Geo streams](docs/images/sensor-recorder-rerun-view.png)
+
 ## 它可以用来做什么
 
 我希望 SensorRec 可以服务几类人：
@@ -127,3 +133,48 @@ GitHub 地址会放在这里：
 如果我们把它当成一个认真可用的传感器平台，也许很多 AR、机器人、具身智能、VIO、多模态感知的实验，都可以更低成本地开始。
 
 这就是我做 SensorRec 的初衷：释放 iPhone 和智能手机作为科研工具的能力，让更多人可以方便地记录真实世界的数据。
+
+## 参考图：手机作为 Always-On / Ego-centric 传感器
+
+这些图不是 Sensor Recorder Pro 的产品截图，而是这篇文章想表达的方向：手机可以成为随身、低成本、可复现的第一人称数据采集设备。
+
+![Ego-centric data collection reference](docs/images/egocentric-data-collection-reference.png)
+
+![Phone robot reference](docs/images/phone-robot-reference.png)
+
+![AR reference](docs/images/ar-reference.png)
+
+![iPhone head mount concept](docs/images/iphone-head-mount-concept.png)
+
+## English Summary: Turn an iPhone into a research sensor platform
+
+Modern phones are no longer just consumer devices. An iPhone already contains high-quality cameras, IMU, magnetometer, barometer, GNSS/location, microphones, storage, battery, and a stable software platform. For many robotics, VIO, SLAM, AR/VR, embodied AI, and multimodal sensing experiments, this is already a capable sensor package.
+
+Sensor Recorder Pro is built around one practical idea: use the phone as a reliable data collection platform first, then do synchronization, validation, visualization, and format conversion offline.
+
+The app records:
+
+- Wide and ultra-wide camera videos.
+- Per-frame camera indexes with timestamps, exposure, ISO, resolution, and intrinsics.
+- Raw accelerometer and gyroscope streams.
+- Gyro-keyed IMU rows.
+- CoreMotion device motion.
+- Magnetometer, barometer, Geo location, and audio.
+- A `meta.json` manifest describing schemas, codecs, device information, and timestamp semantics.
+
+The most important design choice is the time model. Every stream keeps:
+
+- `sensor_sec`: a monotonic sensor timeline for camera, IMU, audio, and motion alignment.
+- `utc_sec`: Unix UTC time for wall-clock, Geo, external events, and experiment logs.
+
+This keeps the phone-side recorder simple and robust. Videos stay as standard MP4 files, audio stays as M4A, sensors stay as CSV, and the offline tools convert the session into Rerun for visual playback and inspection.
+
+The Rerun post-processing view shows:
+
+- Ultra-wide and wide camera streams side by side.
+- IMU acceleration and gyro curves.
+- The raw `audio.m4a` waveform.
+- Attitude roll/pitch/yaw.
+- Geo position converted into relative east/north/up meters.
+
+The long-term goal is to make iPhone-based data capture useful for researchers, engineers, and builders who want real-world multimodal data without starting from expensive custom hardware.
