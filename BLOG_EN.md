@@ -1,5 +1,11 @@
 # [PhoneAI] Turning a Phone into a Data Recorder: Sensor Recorder Pro
 
+## Summary
+
+Sensor Recorder Pro turns an iPhone into a low-cost real-world data recorder. It synchronously captures dual-camera video, audio, IMU, Motion, GNSS, and other sensor streams, then exports structured session files for robotics, XR, embodied AI, Physical AI, and scientific experiments.
+
+The main idea is simple: use the phone as a reliable data collection platform first, keep raw data transparent and reproducible, and move visualization, synchronization checks, and format conversion to offline tools such as Rerun.
+
 I recently built an iPhone multi-sensor recording app called Sensor Recorder Pro. The goal is to turn a phone into a low-cost real-world data collection device.
 
 The current version supports iPhone / iOS. It can synchronously record multiple data streams, including dual camera video, audio, IMU, Motion, and GNSS, and export them as structured data files. The app has been released on the App Store.

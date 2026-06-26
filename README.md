@@ -1,8 +1,8 @@
 # Sensor Recorder Pro
 
-![Sensor Recorder Pro recording UI](docs/images/sensor-recorder-recording-ui.png)
-
 ## English
+
+### Summary
 
 Sensor Recorder Pro turns an iPhone into a low-cost, reproducible, multi-sensor data recorder for VIO, SLAM, robotics, XR, embodied AI, Physical AI, and field experiments.
 
@@ -65,6 +65,8 @@ The saved Rerun layout shows:
 - [中文文章：把手机变成数据采集器](BLOG_ZH.md)
 
 ## 中文
+
+### 摘要
 
 Sensor Recorder Pro 把 iPhone 变成一个低成本、可复现、多模态的真实世界数据采集器，面向 VIO、SLAM、机器人、XR、具身智能、Physical AI 和科学实验。
 
