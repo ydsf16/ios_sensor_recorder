@@ -1,5 +1,11 @@
 # [PhoneAI] 把手机变成数据采集器：Sensor Recorder Pro
 
+## 摘要
+
+Sensor Recorder Pro 把 iPhone 变成一个低成本的真实世界数据采集器。它可以同步记录双路相机视频、音频、IMU、Motion、GNSS 等多源数据，并导出为结构化 session 文件，用于机器人、XR、具身智能、Physical AI 和科学实验。
+
+核心思路很简单：先让手机稳定记录透明、可复现的原始数据，再把可视化、同步检查和格式转换放到离线工具链里完成，例如 Rerun。
+
 最近做了一个 iPhone 多传感器数据记录 App：Sensor Recorder Pro。目标是把手机变成一个低成本的真实世界数据采集器。
 
 当前支持 iPhone / iOS，可以同步记录两路相机视频、音频、IMU、Motion、GNSS 等多源数据，并导出为规范的数据文件。App 已发布到 App Store。
