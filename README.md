@@ -6,6 +6,11 @@
 
 Sensor Recorder Pro turns an iPhone into a low-cost, reproducible, multi-sensor data recorder for VIO, SLAM, robotics, XR, embodied AI, Physical AI, and field experiments.
 
+### Downloads
+
+- App Store: [Sensor Recorder Pro](https://apps.apple.com/search?term=Sensor%20Recorder%20Pro)
+- Open data: [Baidu Netdisk](https://pan.baidu.com/s/1AkZOUvUq2zS3ihPHkEMs9g), password: `inv0`
+
 The app records synchronized real-world signals from iPhone hardware:
 
 - Wide and ultra-wide camera video.
@@ -69,6 +74,11 @@ The saved Rerun layout shows:
 ### 摘要
 
 Sensor Recorder Pro 把 iPhone 变成一个低成本、可复现、多模态的真实世界数据采集器，面向 VIO、SLAM、机器人、XR、具身智能、Physical AI 和科学实验。
+
+### 下载与数据
+
+- App Store 下载：[Sensor Recorder Pro](https://apps.apple.com/search?term=Sensor%20Recorder%20Pro)
+- 开放数据：[百度网盘](https://pan.baidu.com/s/1AkZOUvUq2zS3ihPHkEMs9g)，密码：`inv0`
 
 这个 App 可以同步记录 iPhone 硬件中的多源传感器数据：
 
