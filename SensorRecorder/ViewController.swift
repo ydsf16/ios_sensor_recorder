@@ -1248,6 +1248,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private enum RecordingCamera {
         case wide
         case ultraWide
+        case telephoto
+        case front
     }
 
     private enum PreviewDebugMode: String {
@@ -1269,6 +1271,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private struct CameraCapabilities {
         let hasWide: Bool
         let hasUltraWide: Bool
+        let hasFront: Bool
         let hasTelephoto: Bool
         let hasLiDAR: Bool
         let supportsMultiCam: Bool
@@ -1277,12 +1280,66 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private struct RecorderSettings: Codable {
         var wide: CameraCaptureSettings
         var ultraWide: CameraCaptureSettings
+        var telephoto: CameraCaptureSettings
+        var front: CameraCaptureSettings
         var imuEnabled: Bool
         var magnetometerEnabled: Bool
         var barometerEnabled: Bool
         var geoLocationEnabled: Bool
         var deviceMotionEnabled: Bool
         var audioEnabled: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case wide
+            case ultraWide
+            case telephoto
+            case front
+            case imuEnabled
+            case magnetometerEnabled
+            case barometerEnabled
+            case geoLocationEnabled
+            case deviceMotionEnabled
+            case audioEnabled
+        }
+
+        init(
+            wide: CameraCaptureSettings,
+            ultraWide: CameraCaptureSettings,
+            telephoto: CameraCaptureSettings,
+            front: CameraCaptureSettings,
+            imuEnabled: Bool,
+            magnetometerEnabled: Bool,
+            barometerEnabled: Bool,
+            geoLocationEnabled: Bool,
+            deviceMotionEnabled: Bool,
+            audioEnabled: Bool
+        ) {
+            self.wide = wide
+            self.ultraWide = ultraWide
+            self.telephoto = telephoto
+            self.front = front
+            self.imuEnabled = imuEnabled
+            self.magnetometerEnabled = magnetometerEnabled
+            self.barometerEnabled = barometerEnabled
+            self.geoLocationEnabled = geoLocationEnabled
+            self.deviceMotionEnabled = deviceMotionEnabled
+            self.audioEnabled = audioEnabled
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let defaults = Self.defaults
+            wide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .wide) ?? defaults.wide
+            ultraWide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .ultraWide) ?? defaults.ultraWide
+            telephoto = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .telephoto) ?? defaults.telephoto
+            front = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .front) ?? defaults.front
+            imuEnabled = try container.decodeIfPresent(Bool.self, forKey: .imuEnabled) ?? defaults.imuEnabled
+            magnetometerEnabled = try container.decodeIfPresent(Bool.self, forKey: .magnetometerEnabled) ?? defaults.magnetometerEnabled
+            barometerEnabled = try container.decodeIfPresent(Bool.self, forKey: .barometerEnabled) ?? defaults.barometerEnabled
+            geoLocationEnabled = try container.decodeIfPresent(Bool.self, forKey: .geoLocationEnabled) ?? defaults.geoLocationEnabled
+            deviceMotionEnabled = try container.decodeIfPresent(Bool.self, forKey: .deviceMotionEnabled) ?? defaults.deviceMotionEnabled
+            audioEnabled = try container.decodeIfPresent(Bool.self, forKey: .audioEnabled) ?? defaults.audioEnabled
+        }
 
         static let defaults = RecorderSettings(
             wide: CameraCaptureSettings(
@@ -1302,6 +1359,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 autoExposure: true,
                 maxExposureDurationMS: "10",
                 fixedFocusLensPosition: 0.8
+            ),
+            telephoto: CameraCaptureSettings(
+                enabled: true,
+                resolution: "1920x1440",
+                frameRate: "30",
+                autoFocus: false,
+                autoExposure: true,
+                maxExposureDurationMS: "10",
+                fixedFocusLensPosition: 0.6
+            ),
+            front: CameraCaptureSettings(
+                enabled: false,
+                resolution: "1920x1440",
+                frameRate: "30",
+                autoFocus: true,
+                autoExposure: true,
+                maxExposureDurationMS: "10",
+                fixedFocusLensPosition: 0.6
             ),
             imuEnabled: true,
             magnetometerEnabled: true,
@@ -1424,6 +1499,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var singlePreviewView: CameraPreviewView?
     private var wideCameraPreviewView: CameraPreviewView?
     private var ultraWideCameraPreviewView: CameraPreviewView?
+    private var telephotoCameraPreviewView: CameraPreviewView?
+    private var frontCameraPreviewView: CameraPreviewView?
     private var singleVideoOutput: AVCaptureVideoDataOutput?
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
@@ -1431,35 +1508,55 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private var wideVideoPort: AVCaptureInput.Port?
     private var ultraWideVideoPort: AVCaptureInput.Port?
+    private var telephotoVideoPort: AVCaptureInput.Port?
+    private var frontVideoPort: AVCaptureInput.Port?
     private var wideDevice: AVCaptureDevice?
     private var ultraWideDevice: AVCaptureDevice?
+    private var telephotoDevice: AVCaptureDevice?
+    private var frontDevice: AVCaptureDevice?
     private var widePreviewOutput: AVCaptureVideoDataOutput?
     private var ultraWidePreviewOutput: AVCaptureVideoDataOutput?
+    private var telephotoPreviewOutput: AVCaptureVideoDataOutput?
+    private var frontPreviewOutput: AVCaptureVideoDataOutput?
     private var audioOutput: AVCaptureAudioDataOutput?
     private var wideRecorder: CameraStreamRecorder?
     private var ultraWideRecorder: CameraStreamRecorder?
+    private var telephotoRecorder: CameraStreamRecorder?
+    private var frontRecorder: CameraStreamRecorder?
     private var audioRecorder: AudioStreamRecorder?
     private var sensorRecorder: SensorStreamRecorder?
     private let locationManager = CLLocationManager()
     private var locationRecorder: GeoLocationStreamRecorder?
     private var wideDisplayLayer: AVSampleBufferDisplayLayer?
     private var ultraWideDisplayLayer: AVSampleBufferDisplayLayer?
+    private var telephotoDisplayLayer: AVSampleBufferDisplayLayer?
+    private var frontDisplayLayer: AVSampleBufferDisplayLayer?
     private var widePreviewEnqueuePending = false
     private var ultraWidePreviewEnqueuePending = false
+    private var telephotoPreviewEnqueuePending = false
+    private var frontPreviewEnqueuePending = false
     private var wideFrameCount = 0
     private var ultraWideFrameCount = 0
+    private var telephotoFrameCount = 0
+    private var frontFrameCount = 0
     private var widePreviewLayer: AVCaptureVideoPreviewLayer?
     private var ultraWidePreviewLayer: AVCaptureVideoPreviewLayer?
+    private var telephotoPreviewLayer: AVCaptureVideoPreviewLayer?
+    private var frontPreviewLayer: AVCaptureVideoPreviewLayer?
 
     private var isConfigured = false
     private var isRecording = false
     private var recordingGridOriginSec: TimeInterval?
     private var lastWideRecordSlot: Int64?
     private var lastUltraWideRecordSlot: Int64?
+    private var lastTelephotoRecordSlot: Int64?
+    private var lastFrontRecordSlot: Int64?
     private var pendingLocationPermissionCompletion: ((Bool) -> Void)?
     private let defaultCameraAutoExposureMaxDurationMS = "10"
     private let defaultWideFixedFocusLensPosition = 0.6
     private let defaultUltraWideFixedFocusLensPosition = 0.8
+    private let defaultTelephotoFixedFocusLensPosition = 0.6
+    private let defaultFrontFixedFocusLensPosition = 0.6
     private let freeRecordingLimitSeconds: TimeInterval = 120
     private let freeCountdownVisibleThresholdSeconds: TimeInterval = 20
     private let embedAudioInCameraMP4 = false
@@ -1475,7 +1572,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var recBlinkVisible = true
 
     private var hasEnabledCamera: Bool {
-        recorderSettings.wide.enabled || recorderSettings.ultraWide.enabled
+        enabledCameraCount(in: recorderSettings) > 0
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
@@ -1495,17 +1592,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func makeCaptureSession(for settings: RecorderSettings) -> AVCaptureSession {
-        let wantsDualCamera = settings.wide.enabled && settings.ultraWide.enabled
-        if wantsDualCamera && AVCaptureMultiCamSession.isMultiCamSupported {
+        if enabledCameraCount(in: settings) > 1 && AVCaptureMultiCamSession.isMultiCamSupported {
             return AVCaptureMultiCamSession()
         }
         return AVCaptureSession()
     }
 
+    private func enabledCameraCount(in settings: RecorderSettings) -> Int {
+        [settings.wide.enabled, settings.ultraWide.enabled, settings.telephoto.enabled, settings.front.enabled].filter { $0 }.count
+    }
+
+    private enum CameraKey: String {
+        case wide
+        case ultra
+        case telephoto
+        case front
+    }
+
+    private let cameraPreferenceOrder: [CameraKey] = [.wide, .ultra, .telephoto, .front]
+    private let maxConcurrentCameras = 3
+
     private func cameraCapabilities() -> CameraCapabilities {
         CameraCapabilities(
             hasWide: AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) != nil,
             hasUltraWide: AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) != nil,
+            hasFront: AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) != nil,
             hasTelephoto: AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) != nil,
             hasLiDAR: AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) != nil,
             supportsMultiCam: AVCaptureMultiCamSession.isMultiCamSupported
@@ -1523,6 +1634,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             updated.ultraWide,
             defaultLensPosition: defaultUltraWideFixedFocusLensPosition
         )
+        updated.telephoto = sanitizedCameraCaptureSettings(
+            updated.telephoto,
+            defaultLensPosition: defaultTelephotoFixedFocusLensPosition
+        )
+        updated.front = sanitizedCameraCaptureSettings(
+            updated.front,
+            defaultLensPosition: defaultFrontFixedFocusLensPosition
+        )
 
         if updated.wide.enabled && !capabilities.hasWide {
             updated.wide.enabled = false
@@ -1530,23 +1649,114 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if updated.ultraWide.enabled && !capabilities.hasUltraWide {
             updated.ultraWide.enabled = false
         }
+        if updated.telephoto.enabled && !capabilities.hasTelephoto {
+            updated.telephoto.enabled = false
+        }
+        if updated.front.enabled && !capabilities.hasFront {
+            updated.front.enabled = false
+        }
 
-        let wantsDualCamera = updated.wide.enabled && updated.ultraWide.enabled
-        if wantsDualCamera && !capabilities.supportsMultiCam {
-            // Prefer wide for older single-camera devices. Ultra-wide can still be
-            // used as a single camera on devices that have it but cannot MultiCam.
+        if enabledCameraCount(in: updated) > 1 && !capabilities.supportsMultiCam {
+            updated.telephoto.enabled = false
+            updated.front.enabled = false
             updated.ultraWide.enabled = false
         }
 
-        if !updated.wide.enabled && !updated.ultraWide.enabled && capabilities.hasWide {
+        enforceMaxConcurrentCameras(settings: &updated)
+        while enabledCameraCount(in: updated) > 1 && !isCameraSetSupportedByMultiCam(settings: updated) {
+            guard disableLowestPriorityCamera(in: &updated) != nil else { break }
+        }
+
+        if enabledCameraCount(in: updated) == 0 && capabilities.hasWide {
             updated.wide.enabled = true
         }
 
         if updated.wide != recorderSettings.wide ||
-            updated.ultraWide != recorderSettings.ultraWide {
+            updated.ultraWide != recorderSettings.ultraWide ||
+            updated.telephoto != recorderSettings.telephoto ||
+            updated.front != recorderSettings.front {
             recorderSettings = updated
             recorderSettings.save()
         }
+    }
+
+    private func enforceMaxConcurrentCameras(settings: inout RecorderSettings) {
+        while enabledCameraCount(in: settings) > maxConcurrentCameras {
+            guard disableLowestPriorityCamera(in: &settings) != nil else { break }
+        }
+    }
+
+    @discardableResult
+    private func disableLowestPriorityCamera(in settings: inout RecorderSettings) -> CameraKey? {
+        for key in cameraPreferenceOrder.reversed() where isCameraEnabled(key, in: settings) {
+            setCameraEnabled(key, enabled: false, in: &settings)
+            return key
+        }
+        return nil
+    }
+
+    private func isCameraEnabled(_ key: CameraKey, in settings: RecorderSettings) -> Bool {
+        switch key {
+        case .wide:
+            return settings.wide.enabled
+        case .ultra:
+            return settings.ultraWide.enabled
+        case .telephoto:
+            return settings.telephoto.enabled
+        case .front:
+            return settings.front.enabled
+        }
+    }
+
+    private func setCameraEnabled(_ key: CameraKey, enabled: Bool, in settings: inout RecorderSettings) {
+        switch key {
+        case .wide:
+            settings.wide.enabled = enabled
+        case .ultra:
+            settings.ultraWide.enabled = enabled
+        case .telephoto:
+            settings.telephoto.enabled = enabled
+        case .front:
+            settings.front.enabled = enabled
+        }
+    }
+
+    private func isCameraSetSupportedByMultiCam(settings: RecorderSettings) -> Bool {
+        guard enabledCameraCount(in: settings) > 1 else { return true }
+        guard AVCaptureMultiCamSession.isMultiCamSupported else { return false }
+
+        let wantedDevices = activeCameraDevices(for: settings)
+        guard wantedDevices.count == enabledCameraCount(in: settings) else { return false }
+
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera],
+            mediaType: .video,
+            position: .unspecified
+        )
+        return discovery.supportedMultiCamDeviceSets.contains { supportedSet in
+            wantedDevices.allSatisfy { device in supportedSet.contains(device) }
+        }
+    }
+
+    private func activeCameraDevices(for settings: RecorderSettings) -> [AVCaptureDevice] {
+        var devices: [AVCaptureDevice] = []
+        if settings.ultraWide.enabled,
+           let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
+            devices.append(device)
+        }
+        if settings.wide.enabled,
+           let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
+            devices.append(device)
+        }
+        if settings.telephoto.enabled,
+           let device = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) {
+            devices.append(device)
+        }
+        if settings.front.enabled,
+           let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) {
+            devices.append(device)
+        }
+        return devices
     }
 
     private func sanitizedCameraCaptureSettings(
@@ -1616,7 +1826,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func requiredPermissions(for settings: RecorderSettings) -> [CapturePermission] {
         var permissions: [CapturePermission] = []
-        if settings.wide.enabled || settings.ultraWide.enabled {
+        if enabledCameraCount(in: settings) > 0 {
             permissions.append(.camera)
         }
         if settings.audioEnabled {
@@ -1815,7 +2025,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard !isConfigured else { return }
         sanitizeRecorderSettingsForCurrentDevice()
         setStatus("Preview")
-        let cameraEnabled = recorderSettings.wide.enabled || recorderSettings.ultraWide.enabled
+        let cameraEnabled = enabledCameraCount(in: recorderSettings) > 0
 
         let configureAfterCameraPermission: () -> Void = {
             if self.previewDebugMode == .wideOnly {
@@ -1963,6 +2173,28 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return
         }
 
+        if let telephotoOutput = telephotoPreviewOutput, output === telephotoOutput {
+            telephotoFrameCount += 1
+            if isRecording {
+                appendRecordingSample(sampleBuffer, camera: .telephoto)
+            }
+            enqueuePreview(sampleBuffer, on: telephotoDisplayLayer, camera: .telephoto)
+            guard telephotoFrameCount % 30 == 0 else { return }
+            setStatus("Frames")
+            return
+        }
+
+        if let frontOutput = frontPreviewOutput, output === frontOutput {
+            frontFrameCount += 1
+            if isRecording {
+                appendRecordingSample(sampleBuffer, camera: .front)
+            }
+            enqueuePreview(sampleBuffer, on: frontDisplayLayer, camera: .front)
+            guard frontFrameCount % 30 == 0 else { return }
+            setStatus("Frames")
+            return
+        }
+
         singleFrameCount += 1
         guard singleFrameCount % 30 == 0 else { return }
         setStatus("Frames \(singleFrameCount)")
@@ -1979,6 +2211,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         if let ultraAudioSample = copySampleBuffer(sampleBuffer) {
             ultraWideRecorder?.appendAudio(ultraAudioSample)
+        }
+        if let telephotoAudioSample = copySampleBuffer(sampleBuffer) {
+            telephotoRecorder?.appendAudio(telephotoAudioSample)
+        }
+        if let frontAudioSample = copySampleBuffer(sampleBuffer) {
+            frontRecorder?.appendAudio(frontAudioSample)
         }
     }
 
@@ -2006,6 +2244,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             wideRecorder?.append(sampleBuffer, device: wideDevice, sessionClock: captureSessionClock(), recordSlot: recordSlot)
         case .ultraWide:
             ultraWideRecorder?.append(sampleBuffer, device: ultraWideDevice, sessionClock: captureSessionClock(), recordSlot: recordSlot)
+        case .telephoto:
+            telephotoRecorder?.append(sampleBuffer, device: telephotoDevice, sessionClock: captureSessionClock(), recordSlot: recordSlot)
+        case .front:
+            frontRecorder?.append(sampleBuffer, device: frontDevice, sessionClock: captureSessionClock(), recordSlot: recordSlot)
         }
     }
 
@@ -2013,6 +2255,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         recordingGridOriginSec = nil
         lastWideRecordSlot = nil
         lastUltraWideRecordSlot = nil
+        lastTelephotoRecordSlot = nil
+        lastFrontRecordSlot = nil
     }
 
     private func recordingSlotIfFrameShouldBeWritten(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera) -> Int64? {
@@ -2033,6 +2277,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         case .ultraWide:
             guard lastUltraWideRecordSlot != slot else { return nil }
             lastUltraWideRecordSlot = slot
+        case .telephoto:
+            guard lastTelephotoRecordSlot != slot else { return nil }
+            lastTelephotoRecordSlot = slot
+        case .front:
+            guard lastFrontRecordSlot != slot else { return nil }
+            lastFrontRecordSlot = slot
         }
         return slot
     }
@@ -2063,6 +2313,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return widePreviewEnqueuePending
         case .ultraWide:
             return ultraWidePreviewEnqueuePending
+        case .telephoto:
+            return telephotoPreviewEnqueuePending
+        case .front:
+            return frontPreviewEnqueuePending
         }
     }
 
@@ -2072,6 +2326,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             widePreviewEnqueuePending = pending
         case .ultraWide:
             ultraWidePreviewEnqueuePending = pending
+        case .telephoto:
+            telephotoPreviewEnqueuePending = pending
+        case .front:
+            frontPreviewEnqueuePending = pending
         }
     }
 
@@ -2100,15 +2358,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let wideEnabled = recorderSettings.wide.enabled
         let ultraWideEnabled = recorderSettings.ultraWide.enabled
-        let dualCameraCapture = wideEnabled && ultraWideEnabled && session is AVCaptureMultiCamSession
+        let telephotoEnabled = recorderSettings.telephoto.enabled
+        let frontEnabled = recorderSettings.front.enabled
+        let multiCameraCapture = enabledCameraCount(in: recorderSettings) > 1 && session is AVCaptureMultiCamSession
 
         if (previewDebugMode == .wideOnly || previewDebugMode == .dual) && wideEnabled {
             guard configurePreviewCamera(
                 deviceType: .builtInWideAngleCamera,
+                position: .back,
                 cameraName: "wide",
                 previewIndex: 0,
                 settings: recorderSettings.wide,
-                requiresMultiCamFormat: dualCameraCapture
+                requiresMultiCamFormat: multiCameraCapture
             ) else {
                 os_log("Failed to configure wide camera.", type: .error)
                 showError(msg: "Failed to configure wide camera.")
@@ -2119,14 +2380,41 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if (previewDebugMode == .ultraWideOnly || previewDebugMode == .dual) && ultraWideEnabled {
             guard configurePreviewCamera(
                 deviceType: .builtInUltraWideCamera,
+                position: .back,
                 cameraName: "ultrawide",
                 previewIndex: 1,
                 settings: recorderSettings.ultraWide,
-                requiresMultiCamFormat: dualCameraCapture
+                requiresMultiCamFormat: multiCameraCapture
             ) else {
                 os_log("Failed to configure ultra-wide camera.", type: .error)
                 showError(msg: "Failed to configure ultra-wide camera.")
                 return
+            }
+        }
+
+        if previewDebugMode == .dual && telephotoEnabled {
+            if !configurePreviewCamera(
+                deviceType: .builtInTelephotoCamera,
+                position: .back,
+                cameraName: "telephoto",
+                previewIndex: 2,
+                settings: recorderSettings.telephoto,
+                requiresMultiCamFormat: multiCameraCapture
+            ) {
+                disableConfiguredCamera(.telephoto, reason: "Telephoto camera disabled; keeping supported camera combination.")
+            }
+        }
+
+        if previewDebugMode == .dual && frontEnabled {
+            if !configurePreviewCamera(
+                deviceType: .builtInWideAngleCamera,
+                position: .front,
+                cameraName: "front",
+                previewIndex: 3,
+                settings: recorderSettings.front,
+                requiresMultiCamFormat: multiCameraCapture
+            ) {
+                disableConfiguredCamera(.front, reason: "Front camera disabled; keeping supported camera combination.")
             }
         }
 
@@ -2136,8 +2424,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         reduceFormatsForMulticamBudgetIfNeeded()
+        while multicamBudgetIsExceeded(), let disabledKey = disableLowestPriorityActiveCamera() {
+            os_log("MultiCam budget exceeded; disabled %@", type: .error, disabledKey.rawValue)
+        }
         isConfigured = true
-        setStatus(dualCameraCapture ? "dual preview" : "single preview")
+        setStatus(enabledCameraCount(in: recorderSettings) > 1 ? "multi preview" : "single preview")
     }
 
     private func configureSessionPresetForActiveFormats() {
@@ -2160,23 +2451,37 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func configurePreviewCamera(
         deviceType: AVCaptureDevice.DeviceType,
+        position: AVCaptureDevice.Position,
         cameraName: String,
         previewIndex: Int,
         settings: CameraCaptureSettings,
         requiresMultiCamFormat: Bool
     ) -> Bool {
-        guard let device = AVCaptureDevice.default(deviceType, for: .video, position: .back) else {
+        guard let device = AVCaptureDevice.default(deviceType, for: .video, position: position) else {
             os_log("Camera unavailable: %@", type: .error, deviceType.rawValue)
             return false
         }
 
         do {
+            var addedInput: AVCaptureDeviceInput?
+            var addedOutput: AVCaptureVideoDataOutput?
+            func cleanupPartialCameraConfiguration() {
+                if let output = addedOutput {
+                    session.removeOutput(output)
+                }
+                if let input = addedInput {
+                    session.removeInput(input)
+                }
+            }
+
             try configureDeviceForPreview(device, settings: settings, requiresMultiCamFormat: requiresMultiCamFormat)
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else { return false }
             session.addInputWithNoConnections(input)
+            addedInput = input
 
             guard let videoPort = input.ports.first(where: { $0.mediaType == .video }) else {
+                cleanupPartialCameraConfiguration()
                 return false
             }
 
@@ -2188,11 +2493,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             ]
             videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
-            guard session.canAddOutput(videoOutput) else { return false }
+            guard session.canAddOutput(videoOutput) else {
+                cleanupPartialCameraConfiguration()
+                return false
+            }
             session.addOutputWithNoConnections(videoOutput)
+            addedOutput = videoOutput
 
             let videoConnection = AVCaptureConnection(inputPorts: [videoPort], output: videoOutput)
-            guard session.canAddConnection(videoConnection) else { return false }
+            guard session.canAddConnection(videoConnection) else {
+                cleanupPartialCameraConfiguration()
+                return false
+            }
             session.addConnection(videoConnection)
             configureVideoConnection(videoConnection)
             if videoConnection.isCameraIntrinsicMatrixDeliverySupported {
@@ -2204,8 +2516,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.sceneView.layer.insertSublayer(displayLayer, at: 0)
                 if cameraName == "wide" {
                     self.wideDisplayLayer = displayLayer
-                } else {
+                } else if cameraName == "ultrawide" {
                     self.ultraWideDisplayLayer = displayLayer
+                } else if cameraName == "telephoto" {
+                    self.telephotoDisplayLayer = displayLayer
+                } else {
+                    self.frontDisplayLayer = displayLayer
                 }
                 self.layoutPreviewLayers()
                 self.view.bringSubviewToFront(self.startStopButton.superview ?? self.startStopButton)
@@ -2215,10 +2531,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 wideVideoPort = videoPort
                 wideDevice = device
                 widePreviewOutput = videoOutput
-            } else {
+            } else if cameraName == "ultrawide" {
                 ultraWideVideoPort = videoPort
                 ultraWideDevice = device
                 ultraWidePreviewOutput = videoOutput
+            } else if cameraName == "telephoto" {
+                telephotoVideoPort = videoPort
+                telephotoDevice = device
+                telephotoPreviewOutput = videoOutput
+            } else {
+                frontVideoPort = videoPort
+                frontDevice = device
+                frontPreviewOutput = videoOutput
             }
             let activeDimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
             os_log(
@@ -2479,6 +2803,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return clampedFrameRate(from: recorderSettings.wide.frameRate)
         case .ultraWide:
             return clampedFrameRate(from: recorderSettings.ultraWide.frameRate)
+        case .telephoto:
+            return clampedFrameRate(from: recorderSettings.telephoto.frameRate)
+        case .front:
+            return clampedFrameRate(from: recorderSettings.front.frameRate)
         }
     }
 
@@ -2534,22 +2862,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func reduceFormatsForMulticamBudgetIfNeeded() {
         guard previewDebugMode == .dual,
-              let multiCamSession = session as? AVCaptureMultiCamSession,
-              let wideDevice = wideDevice,
-              let ultraWideDevice = ultraWideDevice else {
+              let multiCamSession = session as? AVCaptureMultiCamSession else {
             return
         }
 
         while multiCamSession.hardwareCost > 1.0 || multiCamSession.systemPressureCost > 1.0 {
-            let wideArea = activeFormatArea(for: wideDevice)
-            let ultraWideArea = activeFormatArea(for: ultraWideDevice)
-            let firstChoice = wideArea >= ultraWideArea ? wideDevice : ultraWideDevice
-            let secondChoice = wideArea >= ultraWideArea ? ultraWideDevice : wideDevice
+            let activeDevices = [wideDevice, ultraWideDevice, telephotoDevice, frontDevice]
+                .compactMap { $0 }
+                .sorted { activeFormatArea(for: $0) > activeFormatArea(for: $1) }
 
-            if downgradeFormat(for: firstChoice) {
-                continue
+            var downgraded = false
+            for device in activeDevices {
+                if downgradeFormat(for: device) {
+                    downgraded = true
+                    break
+                }
             }
-            if downgradeFormat(for: secondChoice) {
+            if downgraded {
                 continue
             }
             os_log(
@@ -2562,8 +2891,112 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
+    private func multicamBudgetIsExceeded() -> Bool {
+        guard let multiCamSession = session as? AVCaptureMultiCamSession else { return false }
+        return multiCamSession.hardwareCost > 1.0 || multiCamSession.systemPressureCost > 1.0
+    }
+
+    @discardableResult
+    private func disableLowestPriorityActiveCamera() -> CameraKey? {
+        for key in cameraPreferenceOrder.reversed() where isConfiguredCameraActive(key) {
+            disableConfiguredCamera(key, reason: "MultiCam budget exceeded; disabled \(key.rawValue).")
+            return key
+        }
+        return nil
+    }
+
+    private func isConfiguredCameraActive(_ key: CameraKey) -> Bool {
+        switch key {
+        case .wide:
+            return widePreviewOutput != nil
+        case .ultra:
+            return ultraWidePreviewOutput != nil
+        case .telephoto:
+            return telephotoPreviewOutput != nil
+        case .front:
+            return frontPreviewOutput != nil
+        }
+    }
+
+    private func disableConfiguredCamera(_ key: CameraKey, reason: String) {
+        switch key {
+        case .wide:
+            removeConfiguredCamera(output: widePreviewOutput, device: wideDevice)
+            wideVideoPort = nil
+            wideDevice = nil
+            widePreviewOutput = nil
+            wideFrameCount = 0
+            widePreviewEnqueuePending = false
+            recorderSettings.wide.enabled = false
+        case .ultra:
+            removeConfiguredCamera(output: ultraWidePreviewOutput, device: ultraWideDevice)
+            ultraWideVideoPort = nil
+            ultraWideDevice = nil
+            ultraWidePreviewOutput = nil
+            ultraWideFrameCount = 0
+            ultraWidePreviewEnqueuePending = false
+            recorderSettings.ultraWide.enabled = false
+        case .telephoto:
+            removeConfiguredCamera(output: telephotoPreviewOutput, device: telephotoDevice)
+            telephotoVideoPort = nil
+            telephotoDevice = nil
+            telephotoPreviewOutput = nil
+            telephotoFrameCount = 0
+            telephotoPreviewEnqueuePending = false
+            recorderSettings.telephoto.enabled = false
+        case .front:
+            removeConfiguredCamera(output: frontPreviewOutput, device: frontDevice)
+            frontVideoPort = nil
+            frontDevice = nil
+            frontPreviewOutput = nil
+            frontFrameCount = 0
+            frontPreviewEnqueuePending = false
+            recorderSettings.front.enabled = false
+        }
+        recorderSettings.save()
+        DispatchQueue.main.async {
+            switch key {
+            case .wide:
+                self.wideDisplayLayer?.removeFromSuperlayer()
+                self.wideDisplayLayer = nil
+            case .ultra:
+                self.ultraWideDisplayLayer?.removeFromSuperlayer()
+                self.ultraWideDisplayLayer = nil
+            case .telephoto:
+                self.telephotoDisplayLayer?.removeFromSuperlayer()
+                self.telephotoDisplayLayer = nil
+            case .front:
+                self.frontDisplayLayer?.removeFromSuperlayer()
+                self.frontDisplayLayer = nil
+            }
+            self.layoutPreviewLayers()
+            self.refreshOverlayStatus()
+        }
+        os_log("%@", type: .error, reason)
+        setStatus("\(key.rawValue) disabled")
+    }
+
+    private func removeConfiguredCamera(output: AVCaptureVideoDataOutput?, device: AVCaptureDevice?) {
+        if let output {
+            session.removeOutput(output)
+        }
+        if let device,
+           let input = session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first(where: { $0.device === device }) {
+            session.removeInput(input)
+        }
+    }
+
     private func downgradeFormat(for device: AVCaptureDevice) -> Bool {
-        let settings = device === wideDevice ? recorderSettings.wide : recorderSettings.ultraWide
+        let settings: CameraCaptureSettings
+        if device === ultraWideDevice {
+            settings = recorderSettings.ultraWide
+        } else if device === telephotoDevice {
+            settings = recorderSettings.telephoto
+        } else if device === frontDevice {
+            settings = recorderSettings.front
+        } else {
+            settings = recorderSettings.wide
+        }
         let formats = preferredFormats(for: device, settings: settings, requiresMultiCamFormat: true)
         guard let currentIndex = formats.firstIndex(where: { $0 === device.activeFormat }),
               currentIndex + 1 < formats.count else {
@@ -2632,7 +3065,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func applyRecordingCameraSettings() {
-        let requiresMultiCamFormat = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled && session is AVCaptureMultiCamSession
+        let requiresMultiCamFormat = enabledCameraCount(in: recorderSettings) > 1 && session is AVCaptureMultiCamSession
         if let wideDevice {
             do {
                 try configureDeviceForPreview(
@@ -2655,6 +3088,28 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 os_log("Failed to apply ultra-wide recording settings: %@", type: .error, error.localizedDescription)
             }
         }
+        if let telephotoDevice {
+            do {
+                try configureDeviceForPreview(
+                    telephotoDevice,
+                    settings: recorderSettings.telephoto,
+                    requiresMultiCamFormat: requiresMultiCamFormat
+                )
+            } catch {
+                os_log("Failed to apply telephoto recording settings: %@", type: .error, error.localizedDescription)
+            }
+        }
+        if let frontDevice {
+            do {
+                try configureDeviceForPreview(
+                    frontDevice,
+                    settings: recorderSettings.front,
+                    requiresMultiCamFormat: requiresMultiCamFormat
+                )
+            } catch {
+                os_log("Failed to apply front recording settings: %@", type: .error, error.localizedDescription)
+            }
+        }
     }
 
     private func layoutPreviewLayers() {
@@ -2666,43 +3121,43 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if previewDebugMode != .dual {
             layoutSampleBufferDisplayLayer(wideDisplayLayer, in: bounds)
             layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: bounds)
+            layoutSampleBufferDisplayLayer(telephotoDisplayLayer, in: bounds)
+            layoutSampleBufferDisplayLayer(frontDisplayLayer, in: bounds)
             wideCameraPreviewView?.frame = bounds
             ultraWideCameraPreviewView?.frame = bounds
+            telephotoCameraPreviewView?.frame = bounds
+            frontCameraPreviewView?.frame = bounds
             widePreviewLayer?.frame = wideCameraPreviewView?.bounds ?? bounds
             ultraWidePreviewLayer?.frame = ultraWideCameraPreviewView?.bounds ?? bounds
+            telephotoPreviewLayer?.frame = telephotoCameraPreviewView?.bounds ?? bounds
+            frontPreviewLayer?.frame = frontCameraPreviewView?.bounds ?? bounds
             return
         }
 
-        hudContentRect = dualCameraContentRect(in: bounds)
-        let wideEnabled = recorderSettings.wide.enabled
-        let ultraEnabled = recorderSettings.ultraWide.enabled
-        let halfWidth = hudContentRect.width / 2
-        let ultraFrame: CGRect
-        let wideFrame: CGRect
-        if wideEnabled && ultraEnabled {
-            ultraFrame = CGRect(x: hudContentRect.minX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
-            wideFrame = CGRect(x: hudContentRect.midX, y: hudContentRect.minY, width: halfWidth, height: hudContentRect.height)
-        } else if wideEnabled {
-            wideFrame = hudContentRect
-            ultraFrame = .zero
-        } else if ultraEnabled {
-            ultraFrame = hudContentRect
-            wideFrame = .zero
-        } else {
-            wideFrame = .zero
-            ultraFrame = .zero
-        }
+        let activeCount = max(enabledCameraCount(in: recorderSettings), 1)
+        hudContentRect = cameraContentRect(in: bounds, activeCameraCount: activeCount)
+        let frames = cameraFrames(in: hudContentRect)
+        let ultraFrame = frames["ultra"] ?? .zero
+        let wideFrame = frames["wide"] ?? .zero
+        let telephotoFrame = frames["telephoto"] ?? .zero
+        let frontFrame = frames["front"] ?? .zero
         layoutSampleBufferDisplayLayer(wideDisplayLayer, in: wideFrame)
         layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: ultraFrame)
+        layoutSampleBufferDisplayLayer(telephotoDisplayLayer, in: telephotoFrame)
+        layoutSampleBufferDisplayLayer(frontDisplayLayer, in: frontFrame)
         wideCameraPreviewView?.frame = wideFrame
         ultraWideCameraPreviewView?.frame = ultraFrame
+        telephotoCameraPreviewView?.frame = telephotoFrame
+        frontCameraPreviewView?.frame = frontFrame
         widePreviewLayer?.frame = wideCameraPreviewView?.bounds ?? .zero
         ultraWidePreviewLayer?.frame = ultraWideCameraPreviewView?.bounds ?? .zero
-        layoutHUDOverlays(wideFrame: wideFrame, ultraFrame: ultraFrame)
+        telephotoPreviewLayer?.frame = telephotoCameraPreviewView?.bounds ?? .zero
+        frontPreviewLayer?.frame = frontCameraPreviewView?.bounds ?? .zero
+        layoutHUDOverlays(wideFrame: wideFrame, ultraFrame: ultraFrame, telephotoFrame: telephotoFrame, frontFrame: frontFrame)
     }
 
-    private func dualCameraContentRect(in bounds: CGRect) -> CGRect {
-        let targetAspect: CGFloat = 8.0 / 3.0
+    private func cameraContentRect(in bounds: CGRect, activeCameraCount: Int) -> CGRect {
+        let targetAspect = CGFloat(max(activeCameraCount, 1)) * 4.0 / 3.0
         var width = bounds.width
         var height = width / targetAspect
         if height > bounds.height {
@@ -2717,15 +3172,46 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ).integral
     }
 
-    private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect) {
+    private func cameraFrames(in contentRect: CGRect) -> [String: CGRect] {
+        let activeKeys = [
+            recorderSettings.ultraWide.enabled ? "ultra" : nil,
+            recorderSettings.wide.enabled ? "wide" : nil,
+            recorderSettings.telephoto.enabled ? "telephoto" : nil,
+            recorderSettings.front.enabled ? "front" : nil
+        ].compactMap { $0 }
+        guard !activeKeys.isEmpty else { return [:] }
+
+        let columnWidth = contentRect.width / CGFloat(activeKeys.count)
+        return Dictionary(uniqueKeysWithValues: activeKeys.enumerated().map { index, key in
+            (
+                key,
+                CGRect(
+                    x: contentRect.minX + CGFloat(index) * columnWidth,
+                    y: contentRect.minY,
+                    width: columnWidth,
+                    height: contentRect.height
+                )
+            )
+        })
+    }
+
+    private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect, telephotoFrame: CGRect, frontFrame: CGRect) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
         cameraStatusBadges["ultra"]?.isHidden = ultraFrame.isEmpty
         cameraStatusBadges["wide"]?.isHidden = wideFrame.isEmpty
+        cameraStatusBadges["telephoto"]?.isHidden = telephotoFrame.isEmpty
+        cameraStatusBadges["front"]?.isHidden = frontFrame.isEmpty
         if !ultraFrame.isEmpty {
             cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 2, width: 348, height: 30)
         }
         if !wideFrame.isEmpty {
             cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 2, width: 300, height: 30)
+        }
+        if !telephotoFrame.isEmpty {
+            cameraStatusBadges["telephoto"]?.frame = CGRect(x: telephotoFrame.midX - 150, y: telephotoFrame.minY + 2, width: 300, height: 30)
+        }
+        if !frontFrame.isEmpty {
+            cameraStatusBadges["front"]?.frame = CGRect(x: frontFrame.midX - 150, y: frontFrame.minY + 2, width: 300, height: 30)
         }
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         let summaryY = max(4, hudContentRect.minY - 42)
@@ -2737,6 +3223,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         )
         cameraStatusBadges["wide"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["ultra"].map { sceneView.bringSubviewToFront($0) }
+        cameraStatusBadges["telephoto"].map { sceneView.bringSubviewToFront($0) }
+        cameraStatusBadges["front"].map { sceneView.bringSubviewToFront($0) }
         captureStatusBadges["summary"].map { view.bringSubviewToFront($0) }
         if let sensorMonitorBar {
             view.bringSubviewToFront(sensorMonitorBar)
@@ -2771,7 +3259,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if !self.isRecording {
                 self.timeLabel.text = status
             }
-            self.frameCounterLabel.text = "\(self.previewDebugMode.rawValue), \(running), W \(self.wideFrameCount), U \(self.ultraWideFrameCount), S \(self.singleFrameCount), \(Int(frame.width))x\(Int(frame.height))"
+            self.frameCounterLabel.text = "\(self.previewDebugMode.rawValue), \(running), W \(self.wideFrameCount), U \(self.ultraWideFrameCount), T \(self.telephotoFrameCount), F \(self.frontFrameCount), S \(self.singleFrameCount), \(Int(frame.width))x\(Int(frame.height))"
             self.refreshOverlayStatus()
         }
     }
@@ -2835,6 +3323,30 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     captureFrameRate: self.activeFrameRate(for: self.ultraWideDevice, settings: self.recorderSettings.ultraWide)
                 )
                 self.ultraWideRecorder?.writeDeviceFormat(self.ultraWideDevice)
+            }
+
+            if self.recorderSettings.telephoto.enabled {
+                self.telephotoRecorder = CameraStreamRecorder(
+                    cameraName: "telephoto",
+                    videoURL: self.outDirURL.appendingPathComponent("telephoto.mp4"),
+                    infoURL: self.outDirURL.appendingPathComponent("tele_info.csv"),
+                    includeAudioTrack: self.embedAudioInCameraMP4 && self.recorderSettings.audioEnabled,
+                    targetFrameRate: self.targetRecordingFrameRate(for: self.recorderSettings.telephoto),
+                    captureFrameRate: self.activeFrameRate(for: self.telephotoDevice, settings: self.recorderSettings.telephoto)
+                )
+                self.telephotoRecorder?.writeDeviceFormat(self.telephotoDevice)
+            }
+
+            if self.recorderSettings.front.enabled {
+                self.frontRecorder = CameraStreamRecorder(
+                    cameraName: "front",
+                    videoURL: self.outDirURL.appendingPathComponent("front.mp4"),
+                    infoURL: self.outDirURL.appendingPathComponent("front_info.csv"),
+                    includeAudioTrack: self.embedAudioInCameraMP4 && self.recorderSettings.audioEnabled,
+                    targetFrameRate: self.targetRecordingFrameRate(for: self.recorderSettings.front),
+                    captureFrameRate: self.activeFrameRate(for: self.frontDevice, settings: self.recorderSettings.front)
+                )
+                self.frontRecorder?.writeDeviceFormat(self.frontDevice)
             }
             self.logRecordingStartStep("camera_recorders", startClock: startClock)
 
@@ -2905,6 +3417,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 group.enter()
                 ultraWideRecorder.finish { group.leave() }
             }
+            if let telephotoRecorder = self.telephotoRecorder {
+                group.enter()
+                telephotoRecorder.finish { group.leave() }
+            }
+            if let frontRecorder = self.frontRecorder {
+                group.enter()
+                frontRecorder.finish { group.leave() }
+            }
             if let audioRecorder = self.audioRecorder {
                 group.enter()
                 audioRecorder.finish { group.leave() }
@@ -2913,6 +3433,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.writeCaptureMetaJSON(state: "finished")
                 self.wideRecorder = nil
                 self.ultraWideRecorder = nil
+                self.telephotoRecorder = nil
+                self.frontRecorder = nil
                 self.audioRecorder = nil
                 DispatchQueue.main.async {
                     self.updateSize()
@@ -3002,16 +3524,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let wideBadge = makeHUDLabelBadge()
         let ultraBadge = makeHUDLabelBadge()
+        let telephotoBadge = makeHUDLabelBadge()
+        let frontBadge = makeHUDLabelBadge()
         let summaryBadge = makeTransparentHUDLabel(textColor: .systemRed)
         sceneView.addSubview(wideBadge)
         sceneView.addSubview(ultraBadge)
+        sceneView.addSubview(telephotoBadge)
+        sceneView.addSubview(frontBadge)
         view.addSubview(summaryBadge)
         cameraStatusBadges["wide"] = wideBadge
         cameraStatusBadges["ultra"] = ultraBadge
+        cameraStatusBadges["telephoto"] = telephotoBadge
+        cameraStatusBadges["front"] = frontBadge
         captureStatusBadges["summary"] = summaryBadge
         summaryBadge.isHidden = true
         cameraStatusRows["wide"] = wideBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+        cameraStatusRows["telephoto"] = telephotoBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+        cameraStatusRows["front"] = frontBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
 
         let countdownLabel = UILabel()
@@ -3252,6 +3782,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             capabilities.hasWide ? "Wide" : nil,
             capabilities.hasUltraWide ? "UltraWide" : nil,
             capabilities.hasTelephoto ? "Tele" : nil,
+            capabilities.hasFront ? "Front" : nil,
             capabilities.hasLiDAR ? "LiDAR" : nil
         ].compactMap { $0 }.joined(separator: " / ")
         let multiCam = capabilities.supportsMultiCam ? "MultiCam supported" : "Single-camera capture only"
@@ -3493,28 +4024,71 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func enforceCameraSwitchCompatibility(changedKeyPrefix: String) {
-        let capabilities = cameraCapabilities()
-        if !capabilities.supportsMultiCam,
-           settingsSwitches["wide.enabled"]?.isOn == true,
-           settingsSwitches["ultra.enabled"]?.isOn == true {
-            if changedKeyPrefix == "wide" {
-                settingsSwitches["ultra.enabled"]?.setOn(false, animated: true)
-                updateCameraSettingsGroup(keyPrefix: "ultra", enabled: false)
-                updateAutoExposureControlState(keyPrefix: "ultra", cameraEnabled: false)
-                updateFixedFocusControlState(keyPrefix: "ultra", cameraEnabled: false)
+        var proposed = recorderSettings
+        proposed.wide.enabled = settingsSwitches["wide.enabled"]?.isOn ?? proposed.wide.enabled
+        proposed.ultraWide.enabled = settingsSwitches["ultra.enabled"]?.isOn ?? proposed.ultraWide.enabled
+        proposed.telephoto.enabled = settingsSwitches["telephoto.enabled"]?.isOn ?? proposed.telephoto.enabled
+        proposed.front.enabled = settingsSwitches["front.enabled"]?.isOn ?? proposed.front.enabled
+
+        if enabledCameraCount(in: proposed) > maxConcurrentCameras {
+            if let changedKey = cameraKey(for: changedKeyPrefix) {
+                var withoutChanged = proposed
+                setCameraEnabled(changedKey, enabled: false, in: &withoutChanged)
+                disableLowestPriorityCamera(in: &withoutChanged)
+                setCameraEnabled(changedKey, enabled: true, in: &withoutChanged)
+                proposed = withoutChanged
             } else {
-                settingsSwitches["wide.enabled"]?.setOn(false, animated: true)
-                updateCameraSettingsGroup(keyPrefix: "wide", enabled: false)
-                updateAutoExposureControlState(keyPrefix: "wide", cameraEnabled: false)
-                updateFixedFocusControlState(keyPrefix: "wide", cameraEnabled: false)
+                enforceMaxConcurrentCameras(settings: &proposed)
             }
+        }
+
+        if enabledCameraCount(in: proposed) > 1 && !cameraCapabilities().supportsMultiCam {
+            while enabledCameraCount(in: proposed) > 1 {
+                guard disableLowestPriorityCamera(in: &proposed) != nil else { break }
+            }
+        }
+        while enabledCameraCount(in: proposed) > 1 && !isCameraSetSupportedByMultiCam(settings: proposed) {
+            guard disableLowestPriorityCamera(in: &proposed) != nil else { break }
+        }
+        applyCameraSwitchState(from: proposed)
+    }
+
+    private func cameraKey(for keyPrefix: String) -> CameraKey? {
+        switch keyPrefix {
+        case "wide":
+            return .wide
+        case "ultra":
+            return .ultra
+        case "telephoto":
+            return .telephoto
+        case "front":
+            return .front
+        default:
+            return nil
+        }
+    }
+
+    private func applyCameraSwitchState(from settings: RecorderSettings) {
+        let states: [(String, Bool)] = [
+            ("wide", settings.wide.enabled),
+            ("ultra", settings.ultraWide.enabled),
+            ("telephoto", settings.telephoto.enabled),
+            ("front", settings.front.enabled)
+        ]
+        for (keyPrefix, enabled) in states {
+            settingsSwitches["\(keyPrefix).enabled"]?.setOn(enabled, animated: true)
+            updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: enabled)
+            updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: enabled)
+            updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: enabled)
         }
     }
 
     private func updateCameraResolutionMenus() {
         let wideEnabled = settingsSwitches["wide.enabled"]?.isOn ?? recorderSettings.wide.enabled
         let ultraEnabled = settingsSwitches["ultra.enabled"]?.isOn ?? recorderSettings.ultraWide.enabled
-        let requiresMultiCamFormat = wideEnabled && ultraEnabled && AVCaptureMultiCamSession.isMultiCamSupported
+        let telephotoEnabled = settingsSwitches["telephoto.enabled"]?.isOn ?? recorderSettings.telephoto.enabled
+        let frontEnabled = settingsSwitches["front.enabled"]?.isOn ?? recorderSettings.front.enabled
+        let requiresMultiCamFormat = [wideEnabled, ultraEnabled, telephotoEnabled, frontEnabled].filter { $0 }.count > 1 && AVCaptureMultiCamSession.isMultiCamSupported
 
         updateSettingsMenu(
             key: "wide.resolution",
@@ -3528,6 +4102,22 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             key: "ultra.resolution",
             items: cameraResolutionOptions(
                 for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamFormat
+            ),
+            compact: true
+        )
+        updateSettingsMenu(
+            key: "front.resolution",
+            items: cameraResolutionOptions(
+                for: frontDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+                requiresMultiCamFormat: requiresMultiCamFormat
+            ),
+            compact: true
+        )
+        updateSettingsMenu(
+            key: "telephoto.resolution",
+            items: cameraResolutionOptions(
+                for: telephotoDevice ?? AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back),
                 requiresMultiCamFormat: requiresMultiCamFormat
             ),
             compact: true
@@ -3736,7 +4326,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         addSettingsSectionTitle(to: stack, title: "Camera")
         let capabilities = cameraCapabilities()
         addSettingsFootnote(to: stack, text: cameraCapabilityText(capabilities))
-        let requiresMultiCamResolutionOptions = recorderSettings.wide.enabled && recorderSettings.ultraWide.enabled && capabilities.supportsMultiCam
+        let requiresMultiCamResolutionOptions = enabledCameraCount(in: recorderSettings) > 1 && capabilities.supportsMultiCam
         addCameraSettingsSection(
             to: stack,
             title: "Wide Camera",
@@ -3762,6 +4352,32 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             defaultLensPosition: defaultUltraWideFixedFocusLensPosition,
             available: capabilities.hasUltraWide,
             unavailableReason: capabilities.hasUltraWide ? nil : "Not available on this device"
+        )
+        addCameraSettingsSection(
+            to: stack,
+            title: "Telephoto Camera",
+            keyPrefix: "telephoto",
+            settings: recorderSettings.telephoto,
+            resolutionItems: cameraResolutionOptions(
+                for: telephotoDevice ?? AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back),
+                requiresMultiCamFormat: requiresMultiCamResolutionOptions
+            ),
+            defaultLensPosition: defaultTelephotoFixedFocusLensPosition,
+            available: capabilities.hasTelephoto,
+            unavailableReason: capabilities.hasTelephoto ? nil : "Not available on this device"
+        )
+        addCameraSettingsSection(
+            to: stack,
+            title: "Front Camera",
+            keyPrefix: "front",
+            settings: recorderSettings.front,
+            resolutionItems: cameraResolutionOptions(
+                for: frontDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+                requiresMultiCamFormat: requiresMultiCamResolutionOptions
+            ),
+            defaultLensPosition: defaultFrontFixedFocusLensPosition,
+            available: capabilities.hasFront,
+            unavailableReason: capabilities.hasFront ? nil : "Not available on this device"
         )
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
@@ -3993,6 +4609,42 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     )
                 )
             ),
+            telephoto: CameraCaptureSettings(
+                enabled: settingsSwitches["telephoto.enabled"]?.isOn ?? recorderSettings.telephoto.enabled,
+                resolution: selectedSettingsValue(for: "telephoto.resolution", fallback: recorderSettings.telephoto.resolution),
+                frameRate: selectedSettingsValue(for: "telephoto.frameRate", fallback: recorderSettings.telephoto.frameRate),
+                autoFocus: settingsSwitches["telephoto.autoFocus"]?.isOn ?? recorderSettings.telephoto.autoFocus,
+                autoExposure: settingsSwitches["telephoto.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: recorderSettings.telephoto),
+                maxExposureDurationMS: selectedSettingsValue(
+                    for: "telephoto.maxExposure",
+                    fallback: maxExposureDurationLabel(for: recorderSettings.telephoto)
+                ),
+                fixedFocusLensPosition: selectedSliderValue(
+                    for: "telephoto.fixedFocus",
+                    fallback: clampedLensPosition(
+                        recorderSettings.telephoto.fixedFocusLensPosition,
+                        fallback: defaultTelephotoFixedFocusLensPosition
+                    )
+                )
+            ),
+            front: CameraCaptureSettings(
+                enabled: settingsSwitches["front.enabled"]?.isOn ?? recorderSettings.front.enabled,
+                resolution: selectedSettingsValue(for: "front.resolution", fallback: recorderSettings.front.resolution),
+                frameRate: selectedSettingsValue(for: "front.frameRate", fallback: recorderSettings.front.frameRate),
+                autoFocus: settingsSwitches["front.autoFocus"]?.isOn ?? recorderSettings.front.autoFocus,
+                autoExposure: settingsSwitches["front.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: recorderSettings.front),
+                maxExposureDurationMS: selectedSettingsValue(
+                    for: "front.maxExposure",
+                    fallback: maxExposureDurationLabel(for: recorderSettings.front)
+                ),
+                fixedFocusLensPosition: selectedSliderValue(
+                    for: "front.fixedFocus",
+                    fallback: clampedLensPosition(
+                        recorderSettings.front.fixedFocusLensPosition,
+                        fallback: defaultFrontFixedFocusLensPosition
+                    )
+                )
+            ),
             imuEnabled: settingsSwitches["imu"]?.isOn ?? recorderSettings.imuEnabled,
             magnetometerEnabled: settingsSwitches["mag"]?.isOn ?? recorderSettings.magnetometerEnabled,
             barometerEnabled: settingsSwitches["baro"]?.isOn ?? recorderSettings.barometerEnabled,
@@ -4024,19 +4676,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.isConfigured = false
             self.wideVideoPort = nil
             self.ultraWideVideoPort = nil
+            self.telephotoVideoPort = nil
+            self.frontVideoPort = nil
             self.wideDevice = nil
             self.ultraWideDevice = nil
+            self.telephotoDevice = nil
+            self.frontDevice = nil
             self.widePreviewOutput = nil
             self.ultraWidePreviewOutput = nil
+            self.telephotoPreviewOutput = nil
+            self.frontPreviewOutput = nil
             self.audioOutput = nil
             self.wideFrameCount = 0
             self.ultraWideFrameCount = 0
+            self.telephotoFrameCount = 0
+            self.frontFrameCount = 0
 
             DispatchQueue.main.async {
                 self.wideDisplayLayer?.removeFromSuperlayer()
                 self.ultraWideDisplayLayer?.removeFromSuperlayer()
+                self.telephotoDisplayLayer?.removeFromSuperlayer()
+                self.frontDisplayLayer?.removeFromSuperlayer()
                 self.wideDisplayLayer = nil
                 self.ultraWideDisplayLayer = nil
+                self.telephotoDisplayLayer = nil
+                self.frontDisplayLayer = nil
                 self.refreshOverlayStatus()
                 self.preparePreviewSession()
             }
@@ -4146,6 +4810,20 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             settings: recorderSettings.ultraWide
         )
         updateCameraStatusColor(key: "ultra", enabled: recorderSettings.ultraWide.enabled, activeRecorder: ultraWideRecorder != nil)
+        cameraStatusRows["telephoto"]?.text = cameraStatusText(
+            frameCount: telephotoFrameCount,
+            device: telephotoDevice,
+            fallbackName: "telephoto.mp4",
+            settings: recorderSettings.telephoto
+        )
+        updateCameraStatusColor(key: "telephoto", enabled: recorderSettings.telephoto.enabled, activeRecorder: telephotoRecorder != nil)
+        cameraStatusRows["front"]?.text = cameraStatusText(
+            frameCount: frontFrameCount,
+            device: frontDevice,
+            fallbackName: "front.mp4",
+            settings: recorderSettings.front
+        )
+        updateCameraStatusColor(key: "front", enabled: recorderSettings.front.enabled, activeRecorder: frontRecorder != nil)
 
         let sensorRows = sensorRecorder?.statusRows() ?? [:]
         updateSensorPill(key: "imu", title: "IMU", value: sensorRows["imu"] ?? "0Hz")
@@ -4171,7 +4849,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             resolution = settings.resolution
         }
 
-        let cameraName = fallbackName.hasPrefix("wide") ? "WIDE" : "ULTRAWIDE"
+        let cameraName: String
+        if fallbackName.hasPrefix("wide") {
+            cameraName = "WIDE"
+        } else if fallbackName.hasPrefix("telephoto") {
+            cameraName = "TELE"
+        } else if fallbackName.hasPrefix("front") {
+            cameraName = "FRONT"
+        } else {
+            cameraName = "ULTRAWIDE"
+        }
         let hz = frameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", targetRecordingFrameRate(for: settings))
         return "\(cameraName) \(aspectLabel(for: resolution)) | \(resolution) | \(hz)"
     }
@@ -4454,6 +5141,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 recorderSettings.ultraWide,
                 defaultLensPosition: defaultUltraWideFixedFocusLensPosition
             ),
+            "telephoto": cameraSettingsJSON(
+                recorderSettings.telephoto,
+                defaultLensPosition: defaultTelephotoFixedFocusLensPosition
+            ),
+            "front": cameraSettingsJSON(
+                recorderSettings.front,
+                defaultLensPosition: defaultFrontFixedFocusLensPosition
+            ),
             "imu_enabled": recorderSettings.imuEnabled,
             "magnetometer_enabled": recorderSettings.magnetometerEnabled,
             "barometer_enabled": recorderSettings.barometerEnabled,
@@ -4486,14 +5181,22 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func recordingStartJSON() -> [String: Any] {
         let wideTargetFPS = targetRecordingFrameRate(for: recorderSettings.wide)
         let ultraTargetFPS = targetRecordingFrameRate(for: recorderSettings.ultraWide)
+        let telephotoTargetFPS = targetRecordingFrameRate(for: recorderSettings.telephoto)
+        let frontTargetFPS = targetRecordingFrameRate(for: recorderSettings.front)
         let wideCaptureFPS = activeFrameRate(for: wideDevice, settings: recorderSettings.wide)
         let ultraCaptureFPS = activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide)
+        let telephotoCaptureFPS = activeFrameRate(for: telephotoDevice, settings: recorderSettings.telephoto)
+        let frontCaptureFPS = activeFrameRate(for: frontDevice, settings: recorderSettings.front)
         return [
             "sampling_rule": "Cameras run at capture_fps; MP4/info rows are downsampled onto a shared host-time record_slot grid at target_fps.",
             "wide_target_fps": wideTargetFPS,
             "wide_capture_fps": wideCaptureFPS,
             "ultrawide_target_fps": ultraTargetFPS,
-            "ultrawide_capture_fps": ultraCaptureFPS
+            "ultrawide_capture_fps": ultraCaptureFPS,
+            "telephoto_target_fps": telephotoTargetFPS,
+            "telephoto_capture_fps": telephotoCaptureFPS,
+            "front_target_fps": frontTargetFPS,
+            "front_capture_fps": frontCaptureFPS
         ]
     }
 
@@ -4586,11 +5289,49 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "utc_column": "utc_sec",
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
+                "telephoto_camera": [
+                    "enabled": recorderSettings.telephoto.enabled,
+                    "media_file": "telephoto.mp4",
+                    "index_file": "tele_info.csv",
+                    "codec": videoCodecName(for: recorderSettings.telephoto),
+                    "target_fps": targetRecordingFrameRate(for: recorderSettings.telephoto),
+                    "capture_fps": activeFrameRate(for: telephotoDevice, settings: recorderSettings.telephoto),
+                    "requested_resolution": recorderSettings.telephoto.resolution,
+                    "auto_focus": recorderSettings.telephoto.autoFocus,
+                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.telephoto),
+                    "fixed_focus_lens_position_requested": clampedLensPosition(
+                        recorderSettings.telephoto.fixedFocusLensPosition,
+                        fallback: defaultTelephotoFixedFocusLensPosition
+                    ),
+                    "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.telephoto),
+                    "timestamp_column": "sensor_sec",
+                    "utc_column": "utc_sec",
+                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                ],
+                "front_camera": [
+                    "enabled": recorderSettings.front.enabled,
+                    "media_file": "front.mp4",
+                    "index_file": "front_info.csv",
+                    "codec": videoCodecName(for: recorderSettings.front),
+                    "target_fps": targetRecordingFrameRate(for: recorderSettings.front),
+                    "capture_fps": activeFrameRate(for: frontDevice, settings: recorderSettings.front),
+                    "requested_resolution": recorderSettings.front.resolution,
+                    "auto_focus": recorderSettings.front.autoFocus,
+                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.front),
+                    "fixed_focus_lens_position_requested": clampedLensPosition(
+                        recorderSettings.front.fixedFocusLensPosition,
+                        fallback: defaultFrontFixedFocusLensPosition
+                    ),
+                    "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.front),
+                    "timestamp_column": "sensor_sec",
+                    "utc_column": "utc_sec",
+                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                ],
                 "audio": [
                     "enabled": recorderSettings.audioEnabled,
                     "media_file": "audio.m4a",
                     "index_file": "audio_info.csv",
-                    "embedded_in": embedAudioInCameraMP4 ? ["wide.mp4", "ultrawide.mp4"] : [],
+                    "embedded_in": embedAudioInCameraMP4 ? ["wide.mp4", "ultrawide.mp4", "telephoto.mp4", "front.mp4"] : [],
                     "codec": "aac",
                     "container": "m4a",
                     "requested_channels": 2,

@@ -17,8 +17,10 @@ from typing import Any, Iterable
 
 
 CAMERA_STREAMS = {
-    "wide": ("wide.mp4", "wide_info.csv"),
     "ultrawide": ("ultrawide.mp4", "ultra_info.csv"),
+    "wide": ("wide.mp4", "wide_info.csv"),
+    "telephoto": ("telephoto.mp4", "tele_info.csv"),
+    "front": ("front.mp4", "front_info.csv"),
 }
 
 SENSOR_FILES: dict[str, list[str]] = {
@@ -249,7 +251,9 @@ def send_default_blueprint(rr: Any) -> None:
                 rrb.Horizontal(
                     rrb.Spatial2DView(name="Ultra Wide", origin="/camera/ultrawide"),
                     rrb.Spatial2DView(name="Wide", origin="/camera/wide"),
-                    column_shares=[1, 1],
+                    rrb.Spatial2DView(name="Telephoto", origin="/camera/telephoto"),
+                    rrb.Spatial2DView(name="Front", origin="/camera/front"),
+                    column_shares=[1, 1, 1, 1],
                 ),
                 rrb.Horizontal(
                     rrb.Vertical(
@@ -384,6 +388,8 @@ def recording_sensor_window(capture_dir: Path) -> tuple[float, float] | None:
     for file_name in [
         "wide_info.csv",
         "ultra_info.csv",
+        "tele_info.csv",
+        "front_info.csv",
         "audio_info.csv",
         "imu.csv",
         "device_motion.csv",
