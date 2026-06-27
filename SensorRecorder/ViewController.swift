@@ -2,9 +2,12 @@ import UIKit
 import AVFoundation
 import CoreLocation
 import CoreMotion
+import CoreVideo
+import ImageIO
 import StoreKit
 import os.log
 import simd
+import UniformTypeIdentifiers
 
 private final class CameraPreviewView: UIView {
     override class var layerClass: AnyClass {
@@ -489,6 +492,143 @@ private final class CameraStreamRecorder {
         guard !didWriteCSVHeader else { return }
         didWriteCSVHeader = true
         writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,exposure_sec,iso,width_px,height_px,fx_px,fy_px,cx_px,cy_px")
+    }
+}
+
+private final class LiDARDepthStreamRecorder {
+    private let depthDirectoryURL: URL
+    private let infoURL: URL
+    private var infoHandle: FileHandle?
+    private let utcMinusSensorOffsetSec: TimeInterval
+    private var frameIndex = 0
+
+    init(outputDirectory: URL) {
+        depthDirectoryURL = outputDirectory.appendingPathComponent("lidar_depth", isDirectory: true)
+        infoURL = outputDirectory.appendingPathComponent("lidar_depth_info.csv")
+        utcMinusSensorOffsetSec = Date().timeIntervalSince1970 - CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+        try? FileManager.default.removeItem(at: depthDirectoryURL)
+        try? FileManager.default.removeItem(at: infoURL)
+        try? FileManager.default.createDirectory(at: depthDirectoryURL, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: infoURL.path, contents: nil)
+        infoHandle = try? FileHandle(forWritingTo: infoURL)
+        writeInfoLine("frame_index,sensor_sec,utc_sec,file_name,width_px,height_px,pixel_format,bytes_per_pixel,depth_unit,depth_scale,min_depth_m,max_depth_m,fx_px,fy_px,cx_px,cy_px")
+    }
+
+    func append(depthData: AVDepthData, sensorSec: TimeInterval) {
+        let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+        let pixelBuffer = converted.depthDataMap
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytesPerPixel = MemoryLayout<UInt16>.size
+        let depthScale: Float = 1000
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+
+        var depthMillimeters = [UInt16](repeating: 0, count: width * height)
+        var minDepth = Float.greatestFiniteMagnitude
+        var maxDepth: Float = 0
+        for row in 0..<height {
+            let rowBase = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: Float32.self)
+            for column in 0..<width {
+                let value = rowBase[column]
+                if value.isFinite && value > 0 {
+                    minDepth = min(minDepth, value)
+                    maxDepth = max(maxDepth, value)
+                    depthMillimeters[row * width + column] = UInt16(min(max((value * depthScale).rounded(), 0), Float(UInt16.max)))
+                }
+            }
+        }
+        if minDepth == Float.greatestFiniteMagnitude {
+            minDepth = .nan
+            maxDepth = .nan
+        }
+
+        frameIndex += 1
+        let fileName = String(format: "depth_%06d.png", frameIndex)
+        let fileURL = depthDirectoryURL.appendingPathComponent(fileName)
+        writeDepthPNG(depthMillimeters, width: width, height: height, to: fileURL)
+
+        let intrinsics = scaledDepthIntrinsics(
+            calibration: converted.cameraCalibrationData,
+            width: width,
+            height: height
+        )
+        let utcSec = sensorSec + utcMinusSensorOffsetSec
+        writeInfoLine([
+            "\(frameIndex)",
+            String(format: "%.9f", sensorSec),
+            String(format: "%.9f", utcSec),
+            fileName,
+            "\(width)",
+            "\(height)",
+            "DepthUInt16",
+            "\(bytesPerPixel)",
+            "millimeter",
+            String(format: "%.1f", depthScale),
+            String(format: "%.6f", minDepth),
+            String(format: "%.6f", maxDepth),
+            String(format: "%.6f", intrinsics.fx),
+            String(format: "%.6f", intrinsics.fy),
+            String(format: "%.6f", intrinsics.cx),
+            String(format: "%.6f", intrinsics.cy)
+        ].joined(separator: ","))
+    }
+
+    private func writeDepthPNG(_ values: [UInt16], width: Int, height: Int, to url: URL) {
+        let data = Data(bytes: values, count: values.count * MemoryLayout<UInt16>.size)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 16,
+                bitsPerPixel: 16,
+                bytesPerRow: width * MemoryLayout<UInt16>.size,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Little.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ),
+              let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            return
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationFinalize(destination)
+    }
+
+    private func scaledDepthIntrinsics(
+        calibration: AVCameraCalibrationData?,
+        width: Int,
+        height: Int
+    ) -> (fx: Float, fy: Float, cx: Float, cy: Float) {
+        guard let calibration else {
+            return (.nan, .nan, .nan, .nan)
+        }
+        let intrinsics = calibration.intrinsicMatrix
+        let reference = calibration.intrinsicMatrixReferenceDimensions
+        let scaleX = reference.width > 0 ? Float(width) / Float(reference.width) : 1
+        let scaleY = reference.height > 0 ? Float(height) / Float(reference.height) : 1
+        return (
+            fx: intrinsics.columns.0.x * scaleX,
+            fy: intrinsics.columns.1.y * scaleY,
+            cx: intrinsics.columns.2.x * scaleX,
+            cy: intrinsics.columns.2.y * scaleY
+        )
+    }
+
+    func finish() {
+        infoHandle?.synchronizeFile()
+        infoHandle?.closeFile()
+        infoHandle = nil
+    }
+
+    private func writeInfoLine(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        infoHandle?.write(data)
     }
 }
 
@@ -1244,7 +1384,7 @@ private final class GeoLocationStreamRecorder {
     }
 }
 
-class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
+class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate, CLLocationManagerDelegate {
     private enum RecordingCamera {
         case wide
         case ultraWide
@@ -1288,6 +1428,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var geoLocationEnabled: Bool
         var deviceMotionEnabled: Bool
         var audioEnabled: Bool
+        var lidarDepthEnabled: Bool
 
         private enum CodingKeys: String, CodingKey {
             case wide
@@ -1300,6 +1441,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             case geoLocationEnabled
             case deviceMotionEnabled
             case audioEnabled
+            case lidarDepthEnabled
         }
 
         init(
@@ -1312,7 +1454,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             barometerEnabled: Bool,
             geoLocationEnabled: Bool,
             deviceMotionEnabled: Bool,
-            audioEnabled: Bool
+            audioEnabled: Bool,
+            lidarDepthEnabled: Bool
         ) {
             self.wide = wide
             self.ultraWide = ultraWide
@@ -1324,6 +1467,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.geoLocationEnabled = geoLocationEnabled
             self.deviceMotionEnabled = deviceMotionEnabled
             self.audioEnabled = audioEnabled
+            self.lidarDepthEnabled = lidarDepthEnabled
         }
 
         init(from decoder: Decoder) throws {
@@ -1339,6 +1483,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             geoLocationEnabled = try container.decodeIfPresent(Bool.self, forKey: .geoLocationEnabled) ?? defaults.geoLocationEnabled
             deviceMotionEnabled = try container.decodeIfPresent(Bool.self, forKey: .deviceMotionEnabled) ?? defaults.deviceMotionEnabled
             audioEnabled = try container.decodeIfPresent(Bool.self, forKey: .audioEnabled) ?? defaults.audioEnabled
+            lidarDepthEnabled = try container.decodeIfPresent(Bool.self, forKey: .lidarDepthEnabled) ?? defaults.lidarDepthEnabled
         }
 
         static let defaults = RecorderSettings(
@@ -1383,7 +1528,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             barometerEnabled: true,
             geoLocationEnabled: true,
             deviceMotionEnabled: true,
-            audioEnabled: true
+            audioEnabled: true,
+            lidarDepthEnabled: true
         )
 
         private static let storageKey = "sensor_recorder.settings.v1"
@@ -1501,6 +1647,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var ultraWideCameraPreviewView: CameraPreviewView?
     private var telephotoCameraPreviewView: CameraPreviewView?
     private var frontCameraPreviewView: CameraPreviewView?
+    private var depthPreviewView: UIImageView?
     private var singleVideoOutput: AVCaptureVideoDataOutput?
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
@@ -1510,19 +1657,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var ultraWideVideoPort: AVCaptureInput.Port?
     private var telephotoVideoPort: AVCaptureInput.Port?
     private var frontVideoPort: AVCaptureInput.Port?
+    private var lidarDepthPort: AVCaptureInput.Port?
     private var wideDevice: AVCaptureDevice?
     private var ultraWideDevice: AVCaptureDevice?
     private var telephotoDevice: AVCaptureDevice?
     private var frontDevice: AVCaptureDevice?
+    private var lidarDevice: AVCaptureDevice?
     private var widePreviewOutput: AVCaptureVideoDataOutput?
     private var ultraWidePreviewOutput: AVCaptureVideoDataOutput?
     private var telephotoPreviewOutput: AVCaptureVideoDataOutput?
     private var frontPreviewOutput: AVCaptureVideoDataOutput?
+    private var lidarDepthOutput: AVCaptureDepthDataOutput?
     private var audioOutput: AVCaptureAudioDataOutput?
     private var wideRecorder: CameraStreamRecorder?
     private var ultraWideRecorder: CameraStreamRecorder?
     private var telephotoRecorder: CameraStreamRecorder?
     private var frontRecorder: CameraStreamRecorder?
+    private var lidarDepthRecorder: LiDARDepthStreamRecorder?
     private var audioRecorder: AudioStreamRecorder?
     private var sensorRecorder: SensorStreamRecorder?
     private let locationManager = CLLocationManager()
@@ -1539,10 +1690,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var ultraWideFrameCount = 0
     private var telephotoFrameCount = 0
     private var frontFrameCount = 0
+    private var lidarDepthFrameCount = 0
+    private var firstDepthSensorSec: TimeInterval?
+    private var latestDepthSensorSec: TimeInterval?
     private var widePreviewLayer: AVCaptureVideoPreviewLayer?
     private var ultraWidePreviewLayer: AVCaptureVideoPreviewLayer?
     private var telephotoPreviewLayer: AVCaptureVideoPreviewLayer?
     private var frontPreviewLayer: AVCaptureVideoPreviewLayer?
+    private var depthPreviewImage: UIImage?
 
     private var isConfigured = false
     private var isRecording = false
@@ -1557,6 +1712,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private let defaultUltraWideFixedFocusLensPosition = 0.8
     private let defaultTelephotoFixedFocusLensPosition = 0.6
     private let defaultFrontFixedFocusLensPosition = 0.6
+    private let depthEnabledCameraFrameRateLimit = 10.0
     private let freeRecordingLimitSeconds: TimeInterval = 120
     private let freeCountdownVisibleThresholdSeconds: TimeInterval = 20
     private let embedAudioInCameraMP4 = false
@@ -1588,11 +1744,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private var needsRunningCaptureSession: Bool {
-        hasEnabledCamera || recorderSettings.audioEnabled
+        hasEnabledCamera || recorderSettings.lidarDepthEnabled || recorderSettings.audioEnabled
     }
 
     private func makeCaptureSession(for settings: RecorderSettings) -> AVCaptureSession {
-        if enabledCameraCount(in: settings) > 1 && AVCaptureMultiCamSession.isMultiCamSupported {
+        if (enabledCameraCount(in: settings) > 1 || settings.lidarDepthEnabled) && AVCaptureMultiCamSession.isMultiCamSupported {
             return AVCaptureMultiCamSession()
         }
         return AVCaptureSession()
@@ -1655,6 +1811,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if updated.front.enabled && !capabilities.hasFront {
             updated.front.enabled = false
         }
+        if updated.lidarDepthEnabled && !capabilities.hasLiDAR {
+            updated.lidarDepthEnabled = false
+        }
 
         if enabledCameraCount(in: updated) > 1 && !capabilities.supportsMultiCam {
             updated.telephoto.enabled = false
@@ -1674,7 +1833,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if updated.wide != recorderSettings.wide ||
             updated.ultraWide != recorderSettings.ultraWide ||
             updated.telephoto != recorderSettings.telephoto ||
-            updated.front != recorderSettings.front {
+            updated.front != recorderSettings.front ||
+            updated.lidarDepthEnabled != recorderSettings.lidarDepthEnabled {
             recorderSettings = updated
             recorderSettings.save()
         }
@@ -1729,7 +1889,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard wantedDevices.count == enabledCameraCount(in: settings) else { return false }
 
         let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera],
+            deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera, .builtInLiDARDepthCamera],
             mediaType: .video,
             position: .unspecified
         )
@@ -1745,7 +1905,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             devices.append(device)
         }
         if settings.wide.enabled,
-           let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
+           let device = AVCaptureDevice.default(
+            settings.lidarDepthEnabled ? .builtInLiDARDepthCamera : .builtInWideAngleCamera,
+            for: .video,
+            position: .back
+           ) {
             devices.append(device)
         }
         if settings.telephoto.enabled,
@@ -1826,7 +1990,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func requiredPermissions(for settings: RecorderSettings) -> [CapturePermission] {
         var permissions: [CapturePermission] = []
-        if enabledCameraCount(in: settings) > 0 {
+        if enabledCameraCount(in: settings) > 0 || settings.lidarDepthEnabled {
             permissions.append(.camera)
         }
         if settings.audioEnabled {
@@ -2025,7 +2189,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard !isConfigured else { return }
         sanitizeRecorderSettingsForCurrentDevice()
         setStatus("Preview")
-        let cameraEnabled = enabledCameraCount(in: recorderSettings) > 0
+        let cameraEnabled = enabledCameraCount(in: recorderSettings) > 0 || recorderSettings.lidarDepthEnabled
 
         let configureAfterCameraPermission: () -> Void = {
             if self.previewDebugMode == .wideOnly {
@@ -2200,6 +2364,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         setStatus("Frames \(singleFrameCount)")
     }
 
+    func depthDataOutput(
+        _ output: AVCaptureDepthDataOutput,
+        didOutput depthData: AVDepthData,
+        timestamp: CMTime,
+        connection: AVCaptureConnection
+    ) {
+        guard output === lidarDepthOutput else { return }
+        lidarDepthFrameCount += 1
+        let sensorSec = sensorSeconds(for: timestamp)
+        if firstDepthSensorSec == nil {
+            firstDepthSensorSec = sensorSec
+        }
+        latestDepthSensorSec = sensorSec
+        if isRecording {
+            lidarDepthRecorder?.append(depthData: depthData, sensorSec: sensorSec)
+        }
+        if let image = depthPreviewImage(from: depthData) {
+            DispatchQueue.main.async {
+                self.depthPreviewView?.image = image
+            }
+        }
+        guard lidarDepthFrameCount % 15 == 0 else { return }
+        setStatus("Depth")
+    }
+
     private func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
         let sessionClock = captureSessionClock()
         if let audioSample = copySampleBuffer(sampleBuffer) {
@@ -2339,11 +2528,82 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func sensorSeconds(for sampleBuffer: CMSampleBuffer) -> TimeInterval {
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        return sensorSeconds(for: presentationTime)
+    }
+
+    private func sensorSeconds(for presentationTime: CMTime) -> TimeInterval {
         guard let sessionClock = captureSessionClock() else {
             return CMTimeGetSeconds(presentationTime)
         }
         let sensorTime = CMSyncConvertTime(presentationTime, from: sessionClock, to: CMClockGetHostTimeClock())
         return CMTimeGetSeconds(sensorTime)
+    }
+
+    private func depthPreviewImage(from depthData: AVDepthData) -> UIImage? {
+        let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+        let pixelBuffer = converted.depthDataMap
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard width > 0, height > 0,
+              let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return nil
+        }
+
+        var minDepth = Float.greatestFiniteMagnitude
+        var maxDepth: Float = 0
+        for row in 0..<height {
+            let rowBase = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: Float32.self)
+            for column in 0..<width {
+                let value = rowBase[column]
+                if value.isFinite && value > 0 {
+                    minDepth = min(minDepth, value)
+                    maxDepth = max(maxDepth, value)
+                }
+            }
+        }
+        guard minDepth.isFinite, maxDepth > minDepth else { return nil }
+
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let range = max(maxDepth - minDepth, 0.001)
+        for row in 0..<height {
+            let rowBase = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: Float32.self)
+            for column in 0..<width {
+                let value = rowBase[column]
+                let pixelIndex = (row * width + column) * 4
+                guard value.isFinite, value > 0 else {
+                    rgba[pixelIndex + 3] = 255
+                    continue
+                }
+                let nearWarm = 1.0 - min(max(Double((value - minDepth) / range), 0.0), 1.0)
+                rgba[pixelIndex + 0] = UInt8(255.0 * nearWarm)
+                rgba[pixelIndex + 1] = UInt8(255.0 * (1.0 - abs(nearWarm - 0.5) * 2.0))
+                rgba[pixelIndex + 2] = UInt8(255.0 * (1.0 - nearWarm))
+                rgba[pixelIndex + 3] = 255
+            }
+        }
+
+        let data = Data(rgba)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cgImage = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
     }
 
     private func configurePreviewSession(includeAudio: Bool) {
@@ -2364,7 +2624,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if (previewDebugMode == .wideOnly || previewDebugMode == .dual) && wideEnabled {
             guard configurePreviewCamera(
-                deviceType: .builtInWideAngleCamera,
+                deviceType: recorderSettings.lidarDepthEnabled ? .builtInLiDARDepthCamera : .builtInWideAngleCamera,
                 position: .back,
                 cameraName: "wide",
                 previewIndex: 0,
@@ -2418,6 +2678,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         }
 
+        if recorderSettings.lidarDepthEnabled {
+            configureLiDARDepthCaptureIfNeeded()
+        }
+
         if includeAudio {
             configureAudioSessionForCapture()
             configureAudioCapture()
@@ -2429,6 +2693,141 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         isConfigured = true
         setStatus(enabledCameraCount(in: recorderSettings) > 1 ? "multi preview" : "single preview")
+    }
+
+    private func configureLiDARDepthCaptureIfNeeded() {
+        guard lidarDepthOutput == nil else { return }
+        guard let device = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) else {
+            recorderSettings.lidarDepthEnabled = false
+            os_log("LiDAR depth camera unavailable.", type: .error)
+            return
+        }
+
+        do {
+            try configureLiDARDeviceForDepth(device)
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                os_log("Cannot add LiDAR depth input.", type: .error)
+                recorderSettings.lidarDepthEnabled = false
+                return
+            }
+            session.addInputWithNoConnections(input)
+
+            guard let depthPort = input.ports.first(where: { $0.mediaType == .depthData }) else {
+                os_log("LiDAR input has no depth port.", type: .error)
+                session.removeInput(input)
+                recorderSettings.lidarDepthEnabled = false
+                return
+            }
+
+            let output = AVCaptureDepthDataOutput()
+            output.isFilteringEnabled = true
+            output.alwaysDiscardsLateDepthData = true
+            output.setDelegate(self, callbackQueue: sessionQueue)
+            guard session.canAddOutput(output) else {
+                os_log("Cannot add LiDAR depth output.", type: .error)
+                session.removeInput(input)
+                recorderSettings.lidarDepthEnabled = false
+                return
+            }
+            session.addOutputWithNoConnections(output)
+
+            let connection = AVCaptureConnection(inputPorts: [depthPort], output: output)
+            guard session.canAddConnection(connection) else {
+                os_log("Cannot add LiDAR depth connection.", type: .error)
+                session.removeOutput(output)
+                session.removeInput(input)
+                recorderSettings.lidarDepthEnabled = false
+                return
+            }
+            session.addConnection(connection)
+
+            lidarDevice = device
+            lidarDepthPort = depthPort
+            lidarDepthOutput = output
+            DispatchQueue.main.async {
+                self.installDepthPreviewViewIfNeeded()
+                self.layoutPreviewLayers()
+                self.refreshOverlayStatus()
+            }
+        } catch {
+            recorderSettings.lidarDepthEnabled = false
+            os_log("Failed to configure LiDAR depth: %@", type: .error, error.localizedDescription)
+        }
+    }
+
+    private func configureDepthOutputIfNeeded(input: AVCaptureDeviceInput, device: AVCaptureDevice) {
+        guard lidarDepthOutput == nil else { return }
+        guard let depthPort = input.ports.first(where: { $0.mediaType == .depthData }) else {
+            os_log("LiDAR input has no depth port.", type: .error)
+            return
+        }
+
+        let output = AVCaptureDepthDataOutput()
+        output.isFilteringEnabled = true
+        output.alwaysDiscardsLateDepthData = true
+        output.setDelegate(self, callbackQueue: sessionQueue)
+        guard session.canAddOutput(output) else {
+            os_log("Cannot add LiDAR depth output.", type: .error)
+            return
+        }
+        session.addOutputWithNoConnections(output)
+
+        let connection = AVCaptureConnection(inputPorts: [depthPort], output: output)
+        guard session.canAddConnection(connection) else {
+            os_log("Cannot add LiDAR depth connection.", type: .error)
+            session.removeOutput(output)
+            return
+        }
+        session.addConnection(connection)
+
+        lidarDevice = device
+        lidarDepthPort = depthPort
+        lidarDepthOutput = output
+        DispatchQueue.main.async {
+            self.installDepthPreviewViewIfNeeded()
+            self.layoutPreviewLayers()
+            self.refreshOverlayStatus()
+        }
+    }
+
+    private func configureLiDARDeviceForDepth(_ device: AVCaptureDevice) throws {
+        let formatPair = preferredDepthFormatPair(for: device)
+        guard let videoFormat = formatPair.videoFormat,
+              let depthFormat = formatPair.depthFormat else {
+            throw NSError(
+                domain: "SensorRecorder",
+                code: -10,
+                userInfo: [NSLocalizedDescriptionKey: "No supported LiDAR depth format found."]
+            )
+        }
+
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        device.activeFormat = videoFormat
+        device.activeDepthDataFormat = depthFormat
+
+        let fps = supportedFrameRate(for: videoFormat, requested: depthEnabledCameraFrameRateLimit)
+        let duration = frameDuration(for: min(fps, depthEnabledCameraFrameRateLimit))
+        device.activeVideoMinFrameDuration = duration
+        device.activeVideoMaxFrameDuration = duration
+    }
+
+    private func preferredDepthFormatPair(for device: AVCaptureDevice) -> (videoFormat: AVCaptureDevice.Format?, depthFormat: AVCaptureDevice.Format?) {
+        var candidates: [(videoFormat: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format, score: Int)] = []
+        for videoFormat in device.formats {
+            for depthFormat in videoFormat.supportedDepthDataFormats {
+                let subtype = CMFormatDescriptionGetMediaSubType(depthFormat.formatDescription)
+                guard subtype == kCVPixelFormatType_DepthFloat32 || subtype == kCVPixelFormatType_DepthFloat16 else {
+                    continue
+                }
+                let dimensions = CMVideoFormatDescriptionGetDimensions(depthFormat.formatDescription)
+                let area = Int(dimensions.width) * Int(dimensions.height)
+                let floatScore = subtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0
+                candidates.append((videoFormat, depthFormat, floatScore + area))
+            }
+        }
+        return candidates.max(by: { $0.score < $1.score }).map { ($0.videoFormat, $0.depthFormat) } ?? (nil, nil)
     }
 
     private func configureSessionPresetForActiveFormats() {
@@ -2510,6 +2909,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if videoConnection.isCameraIntrinsicMatrixDeliverySupported {
                 videoConnection.isCameraIntrinsicMatrixDeliveryEnabled = true
             }
+            if cameraName == "wide",
+               device.deviceType == .builtInLiDARDepthCamera,
+               recorderSettings.lidarDepthEnabled {
+                configureDepthOutputIfNeeded(input: input, device: device)
+            }
 
             DispatchQueue.main.async {
                 let displayLayer = self.makeDisplayLayer(for: cameraName)
@@ -2530,6 +2934,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if cameraName == "wide" {
                 wideVideoPort = videoPort
                 wideDevice = device
+                if device.deviceType == .builtInLiDARDepthCamera {
+                    lidarDevice = device
+                }
                 widePreviewOutput = videoOutput
             } else if cameraName == "ultrawide" {
                 ultraWideVideoPort = videoPort
@@ -2621,6 +3028,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return displayLayer
     }
 
+    private func installDepthPreviewViewIfNeeded() {
+        guard depthPreviewView == nil else { return }
+        let imageView = UIImageView(frame: .zero)
+        imageView.backgroundColor = .black
+        imageView.contentMode = .scaleAspectFit
+        imageView.clipsToBounds = true
+        imageView.isUserInteractionEnabled = false
+        sceneView.insertSubview(imageView, at: 0)
+        depthPreviewView = imageView
+    }
+
     private func makePreviewView(for cameraName: String) -> CameraPreviewView {
         if Thread.isMainThread {
             return createPreviewView(for: cameraName)
@@ -2659,6 +3077,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         device.activeVideoMinFrameDuration = duration
         device.activeVideoMaxFrameDuration = duration
         applyAutoExposurePolicy(to: device, settings: settings)
+        configureDepthFormatIfAvailable(for: device)
 
         if settings.autoFocus {
             if device.isFocusModeSupported(.continuousAutoFocus) {
@@ -2676,6 +3095,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 device.focusMode = .locked
             }
         }
+    }
+
+    private func configureDepthFormatIfAvailable(for device: AVCaptureDevice) {
+        guard device.deviceType == .builtInLiDARDepthCamera,
+              let depthFormat = preferredDepthFormat(for: device.activeFormat) else {
+            return
+        }
+        device.activeDepthDataFormat = depthFormat
+    }
+
+    private func preferredDepthFormat(for videoFormat: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
+        videoFormat.supportedDepthDataFormats
+            .filter {
+                let subtype = CMFormatDescriptionGetMediaSubType($0.formatDescription)
+                return subtype == kCVPixelFormatType_DepthFloat32 || subtype == kCVPixelFormatType_DepthFloat16
+            }
+            .max { lhs, rhs in
+                let lhsSubtype = CMFormatDescriptionGetMediaSubType(lhs.formatDescription)
+                let rhsSubtype = CMFormatDescriptionGetMediaSubType(rhs.formatDescription)
+                let lhsDimensions = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+                let rhsDimensions = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+                let lhsScore = (lhsSubtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0) + Int(lhsDimensions.width) * Int(lhsDimensions.height)
+                let rhsScore = (rhsSubtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0) + Int(rhsDimensions.width) * Int(rhsDimensions.height)
+                return lhsScore < rhsScore
+            }
     }
 
     private func clampedLensPosition(_ value: Double) -> Double {
@@ -2798,20 +3242,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func targetRecordingFrameRate(for camera: RecordingCamera) -> Double {
+        let requested: Double
         switch camera {
         case .wide:
-            return clampedFrameRate(from: recorderSettings.wide.frameRate)
+            requested = clampedFrameRate(from: recorderSettings.wide.frameRate)
         case .ultraWide:
-            return clampedFrameRate(from: recorderSettings.ultraWide.frameRate)
+            requested = clampedFrameRate(from: recorderSettings.ultraWide.frameRate)
         case .telephoto:
-            return clampedFrameRate(from: recorderSettings.telephoto.frameRate)
+            requested = clampedFrameRate(from: recorderSettings.telephoto.frameRate)
         case .front:
-            return clampedFrameRate(from: recorderSettings.front.frameRate)
+            requested = clampedFrameRate(from: recorderSettings.front.frameRate)
         }
+        return limitedCameraFrameRate(requested)
     }
 
     private func targetRecordingFrameRate(for settings: CameraCaptureSettings) -> Double {
-        clampedFrameRate(from: settings.frameRate)
+        limitedCameraFrameRate(clampedFrameRate(from: settings.frameRate))
+    }
+
+    private func limitedCameraFrameRate(_ requested: Double) -> Double {
+        recorderSettings.lidarDepthEnabled ? min(requested, depthEnabledCameraFrameRateLimit) : requested
     }
 
     private func isAutoExposureEnabled(for settings: CameraCaptureSettings) -> Bool {
@@ -3127,6 +3577,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             ultraWideCameraPreviewView?.frame = bounds
             telephotoCameraPreviewView?.frame = bounds
             frontCameraPreviewView?.frame = bounds
+            depthPreviewView?.frame = bounds
             widePreviewLayer?.frame = wideCameraPreviewView?.bounds ?? bounds
             ultraWidePreviewLayer?.frame = ultraWideCameraPreviewView?.bounds ?? bounds
             telephotoPreviewLayer?.frame = telephotoCameraPreviewView?.bounds ?? bounds
@@ -3134,13 +3585,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return
         }
 
-        let activeCount = max(enabledCameraCount(in: recorderSettings), 1)
-        hudContentRect = cameraContentRect(in: bounds, activeCameraCount: activeCount)
-        let frames = cameraFrames(in: hudContentRect)
+        let activeKeys = activePreviewTileKeys()
+        hudContentRect = previewContentRect(in: bounds, tileCount: activeKeys.count)
+        let frames = previewTileFrames(in: hudContentRect, activeKeys: activeKeys)
         let ultraFrame = frames["ultra"] ?? .zero
         let wideFrame = frames["wide"] ?? .zero
         let telephotoFrame = frames["telephoto"] ?? .zero
         let frontFrame = frames["front"] ?? .zero
+        let depthFrame = frames["depth"] ?? .zero
         layoutSampleBufferDisplayLayer(wideDisplayLayer, in: wideFrame)
         layoutSampleBufferDisplayLayer(ultraWideDisplayLayer, in: ultraFrame)
         layoutSampleBufferDisplayLayer(telephotoDisplayLayer, in: telephotoFrame)
@@ -3149,15 +3601,38 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ultraWideCameraPreviewView?.frame = ultraFrame
         telephotoCameraPreviewView?.frame = telephotoFrame
         frontCameraPreviewView?.frame = frontFrame
+        depthPreviewView?.frame = depthFrame
         widePreviewLayer?.frame = wideCameraPreviewView?.bounds ?? .zero
         ultraWidePreviewLayer?.frame = ultraWideCameraPreviewView?.bounds ?? .zero
         telephotoPreviewLayer?.frame = telephotoCameraPreviewView?.bounds ?? .zero
         frontPreviewLayer?.frame = frontCameraPreviewView?.bounds ?? .zero
-        layoutHUDOverlays(wideFrame: wideFrame, ultraFrame: ultraFrame, telephotoFrame: telephotoFrame, frontFrame: frontFrame)
+        layoutHUDOverlays(frames: frames)
     }
 
-    private func cameraContentRect(in bounds: CGRect, activeCameraCount: Int) -> CGRect {
-        let targetAspect = CGFloat(max(activeCameraCount, 1)) * 4.0 / 3.0
+    private func activePreviewTileKeys() -> [String] {
+        [
+            ultraWidePreviewOutput != nil ? "ultra" : nil,
+            widePreviewOutput != nil ? "wide" : nil,
+            telephotoPreviewOutput != nil ? "telephoto" : nil,
+            frontPreviewOutput != nil ? "front" : nil,
+            lidarDepthOutput != nil ? "depth" : nil
+        ].compactMap { $0 }
+    }
+
+    private func previewContentRect(in bounds: CGRect, tileCount: Int) -> CGRect {
+        let targetAspect: CGFloat
+        switch max(tileCount, 1) {
+        case 1:
+            targetAspect = 4.0 / 3.0
+        case 2:
+            targetAspect = 8.0 / 3.0
+        case 3:
+            targetAspect = 4.0
+        case 4:
+            targetAspect = 4.0 / 3.0
+        default:
+            targetAspect = 2.0
+        }
         var width = bounds.width
         var height = width / targetAspect
         if height > bounds.height {
@@ -3172,46 +3647,47 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ).integral
     }
 
-    private func cameraFrames(in contentRect: CGRect) -> [String: CGRect] {
-        let activeKeys = [
-            recorderSettings.ultraWide.enabled ? "ultra" : nil,
-            recorderSettings.wide.enabled ? "wide" : nil,
-            recorderSettings.telephoto.enabled ? "telephoto" : nil,
-            recorderSettings.front.enabled ? "front" : nil
-        ].compactMap { $0 }
+    private func previewTileFrames(in contentRect: CGRect, activeKeys: [String]) -> [String: CGRect] {
         guard !activeKeys.isEmpty else { return [:] }
 
-        let columnWidth = contentRect.width / CGFloat(activeKeys.count)
-        return Dictionary(uniqueKeysWithValues: activeKeys.enumerated().map { index, key in
-            (
-                key,
-                CGRect(
-                    x: contentRect.minX + CGFloat(index) * columnWidth,
-                    y: contentRect.minY,
-                    width: columnWidth,
-                    height: contentRect.height
-                )
-            )
-        })
+        let rows: [[String]]
+        switch activeKeys.count {
+        case 1, 2, 3:
+            rows = [activeKeys]
+        case 4:
+            rows = [Array(activeKeys.prefix(2)), Array(activeKeys.dropFirst(2))]
+        default:
+            rows = [Array(activeKeys.prefix(3)), Array(activeKeys.dropFirst(3).prefix(2))]
+        }
+
+        let maxColumns = rows.map(\.count).max() ?? 1
+        let rowHeight = contentRect.height / CGFloat(rows.count)
+        let tileWidth = contentRect.width / CGFloat(maxColumns)
+        return rows.enumerated().reduce(into: [:]) { result, rowEntry in
+            let rowIndex = rowEntry.offset
+            let rowKeys = rowEntry.element
+            let rowWidth = tileWidth * CGFloat(rowKeys.count)
+            let rowX = contentRect.minX + (contentRect.width - rowWidth) / 2
+            for (columnIndex, key) in rowKeys.enumerated() {
+                result[key] = CGRect(
+                    x: rowX + CGFloat(columnIndex) * tileWidth,
+                    y: contentRect.minY + CGFloat(rowIndex) * rowHeight,
+                    width: tileWidth,
+                    height: rowHeight
+                ).integral
+            }
+        }
     }
 
-    private func layoutHUDOverlays(wideFrame: CGRect, ultraFrame: CGRect, telephotoFrame: CGRect, frontFrame: CGRect) {
+    private func layoutHUDOverlays(frames: [String: CGRect]) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
-        cameraStatusBadges["ultra"]?.isHidden = ultraFrame.isEmpty
-        cameraStatusBadges["wide"]?.isHidden = wideFrame.isEmpty
-        cameraStatusBadges["telephoto"]?.isHidden = telephotoFrame.isEmpty
-        cameraStatusBadges["front"]?.isHidden = frontFrame.isEmpty
-        if !ultraFrame.isEmpty {
-            cameraStatusBadges["ultra"]?.frame = CGRect(x: ultraFrame.midX - 174, y: ultraFrame.minY + 2, width: 348, height: 30)
-        }
-        if !wideFrame.isEmpty {
-            cameraStatusBadges["wide"]?.frame = CGRect(x: wideFrame.midX - 150, y: wideFrame.minY + 2, width: 300, height: 30)
-        }
-        if !telephotoFrame.isEmpty {
-            cameraStatusBadges["telephoto"]?.frame = CGRect(x: telephotoFrame.midX - 150, y: telephotoFrame.minY + 2, width: 300, height: 30)
-        }
-        if !frontFrame.isEmpty {
-            cameraStatusBadges["front"]?.frame = CGRect(x: frontFrame.midX - 150, y: frontFrame.minY + 2, width: 300, height: 30)
+        for key in ["ultra", "wide", "telephoto", "front", "depth"] {
+            let frame = frames[key] ?? .zero
+            cameraStatusBadges[key]?.isHidden = frame.isEmpty
+            if !frame.isEmpty {
+                let width: CGFloat = key == "ultra" ? 348 : 300
+                cameraStatusBadges[key]?.frame = CGRect(x: frame.midX - width / 2, y: frame.minY + 2, width: width, height: 30)
+            }
         }
         let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
         let summaryY = max(4, hudContentRect.minY - 42)
@@ -3225,6 +3701,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         cameraStatusBadges["ultra"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["telephoto"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["front"].map { sceneView.bringSubviewToFront($0) }
+        cameraStatusBadges["depth"].map { sceneView.bringSubviewToFront($0) }
         captureStatusBadges["summary"].map { view.bringSubviewToFront($0) }
         if let sensorMonitorBar {
             view.bringSubviewToFront(sensorMonitorBar)
@@ -3358,6 +3835,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             self.logRecordingStartStep("audio_recorder", startClock: startClock)
 
+            if self.recorderSettings.lidarDepthEnabled && self.lidarDepthOutput != nil {
+                self.lidarDepthRecorder = LiDARDepthStreamRecorder(outputDirectory: self.outDirURL)
+            }
+            self.logRecordingStartStep("lidar_depth_recorder", startClock: startClock)
+
             let sensorOptions = SensorStreamRecorder.Options(
                 imuEnabled: self.recorderSettings.imuEnabled,
                 deviceMotionEnabled: self.recorderSettings.deviceMotionEnabled,
@@ -3429,6 +3911,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 group.enter()
                 audioRecorder.finish { group.leave() }
             }
+            self.lidarDepthRecorder?.finish()
             group.notify(queue: self.sessionQueue) {
                 self.writeCaptureMetaJSON(state: "finished")
                 self.wideRecorder = nil
@@ -3436,6 +3919,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.telephotoRecorder = nil
                 self.frontRecorder = nil
                 self.audioRecorder = nil
+                self.lidarDepthRecorder = nil
                 DispatchQueue.main.async {
                     self.updateSize()
                     if showUpgradePromptAfterFinish {
@@ -3526,22 +4010,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let ultraBadge = makeHUDLabelBadge()
         let telephotoBadge = makeHUDLabelBadge()
         let frontBadge = makeHUDLabelBadge()
+        let depthBadge = makeHUDLabelBadge()
         let summaryBadge = makeTransparentHUDLabel(textColor: .systemRed)
         sceneView.addSubview(wideBadge)
         sceneView.addSubview(ultraBadge)
         sceneView.addSubview(telephotoBadge)
         sceneView.addSubview(frontBadge)
+        sceneView.addSubview(depthBadge)
         view.addSubview(summaryBadge)
         cameraStatusBadges["wide"] = wideBadge
         cameraStatusBadges["ultra"] = ultraBadge
         cameraStatusBadges["telephoto"] = telephotoBadge
         cameraStatusBadges["front"] = frontBadge
+        cameraStatusBadges["depth"] = depthBadge
         captureStatusBadges["summary"] = summaryBadge
         summaryBadge.isHidden = true
         cameraStatusRows["wide"] = wideBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["ultra"] = ultraBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["telephoto"] = telephotoBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["front"] = frontBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+        cameraStatusRows["depth"] = depthBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
 
         let countdownLabel = UILabel()
@@ -3607,6 +4095,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         addSensorPill(to: sensorStack, key: "geo", title: "GeoLoc")
         addSensorPill(to: sensorStack, key: "motion", title: "Motion")
         addSensorPill(to: sensorStack, key: "audio", title: "Audio")
+        addSensorPill(to: sensorStack, key: "depth", title: "Depth")
 
         let rightRail = UIView()
         rightRail.translatesAutoresizingMaskIntoConstraints = false
@@ -3786,7 +4275,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             capabilities.hasLiDAR ? "LiDAR" : nil
         ].compactMap { $0 }.joined(separator: " / ")
         let multiCam = capabilities.supportsMultiCam ? "MultiCam supported" : "Single-camera capture only"
-        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam)."
+        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam). Up to 3 RGB cameras, or 3 RGB cameras + Depth. Depth limits camera capture to 10Hz; high resolution may still drop frames."
     }
 
     private func addSettingsMenuRow(
@@ -4379,6 +4868,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             available: capabilities.hasFront,
             unavailableReason: capabilities.hasFront ? nil : "Not available on this device"
         )
+        addSettingsRow(
+            to: stack,
+            key: "lidarDepth",
+            title: "LiDAR Depth",
+            detail: "Filtered 16-bit PNG depth in millimeters; camera Hz is capped at 10",
+            isOn: recorderSettings.lidarDepthEnabled && capabilities.hasLiDAR,
+            enabled: capabilities.hasLiDAR
+        )
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
         addSettingsRow(to: stack, key: "imu", title: "IMU", detail: "Raw accel + gyro", isOn: recorderSettings.imuEnabled)
@@ -4480,7 +4977,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         title: String,
         detail: String,
         isOn: Bool,
-        compact: Bool = false
+        compact: Bool = false,
+        enabled: Bool = true
     ) {
         let row = UIStackView()
         row.axis = .horizontal
@@ -4495,12 +4993,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let titleLabel = UILabel()
         titleLabel.text = title
         titleLabel.font = UIFont.systemFont(ofSize: compact ? 14 : 17, weight: .semibold)
-        titleLabel.textColor = .white
+        titleLabel.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
 
         let detailLabel = UILabel()
         detailLabel.text = detail
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 10 : 12, weight: .medium)
-        detailLabel.textColor = UIColor.white.withAlphaComponent(0.56)
+        detailLabel.textColor = UIColor.white.withAlphaComponent(enabled ? 0.56 : 0.28)
         detailLabel.isHidden = detail.isEmpty
 
         textStack.addArrangedSubview(titleLabel)
@@ -4508,6 +5006,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let sensorSwitch = UISwitch()
         sensorSwitch.isOn = isOn
+        sensorSwitch.isEnabled = enabled
         sensorSwitch.onTintColor = .systemTeal
         sensorSwitch.accessibilityIdentifier = key
         if key.hasSuffix(".autoFocus") {
@@ -4650,7 +5149,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             barometerEnabled: settingsSwitches["baro"]?.isOn ?? recorderSettings.barometerEnabled,
             geoLocationEnabled: settingsSwitches["geo"]?.isOn ?? recorderSettings.geoLocationEnabled,
             deviceMotionEnabled: settingsSwitches["motion"]?.isOn ?? recorderSettings.deviceMotionEnabled,
-            audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled
+            audioEnabled: settingsSwitches["audio"]?.isOn ?? recorderSettings.audioEnabled,
+            lidarDepthEnabled: settingsSwitches["lidarDepth"]?.isOn ?? recorderSettings.lidarDepthEnabled
         )
         sanitizeRecorderSettingsForCurrentDevice()
         recorderSettings.save()
@@ -4678,29 +5178,37 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.ultraWideVideoPort = nil
             self.telephotoVideoPort = nil
             self.frontVideoPort = nil
+            self.lidarDepthPort = nil
             self.wideDevice = nil
             self.ultraWideDevice = nil
             self.telephotoDevice = nil
             self.frontDevice = nil
+            self.lidarDevice = nil
             self.widePreviewOutput = nil
             self.ultraWidePreviewOutput = nil
             self.telephotoPreviewOutput = nil
             self.frontPreviewOutput = nil
+            self.lidarDepthOutput = nil
             self.audioOutput = nil
             self.wideFrameCount = 0
             self.ultraWideFrameCount = 0
             self.telephotoFrameCount = 0
             self.frontFrameCount = 0
+            self.lidarDepthFrameCount = 0
+            self.firstDepthSensorSec = nil
+            self.latestDepthSensorSec = nil
 
             DispatchQueue.main.async {
                 self.wideDisplayLayer?.removeFromSuperlayer()
                 self.ultraWideDisplayLayer?.removeFromSuperlayer()
                 self.telephotoDisplayLayer?.removeFromSuperlayer()
                 self.frontDisplayLayer?.removeFromSuperlayer()
+                self.depthPreviewView?.removeFromSuperview()
                 self.wideDisplayLayer = nil
                 self.ultraWideDisplayLayer = nil
                 self.telephotoDisplayLayer = nil
                 self.frontDisplayLayer = nil
+                self.depthPreviewView = nil
                 self.refreshOverlayStatus()
                 self.preparePreviewSession()
             }
@@ -4824,6 +5332,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             settings: recorderSettings.front
         )
         updateCameraStatusColor(key: "front", enabled: recorderSettings.front.enabled, activeRecorder: frontRecorder != nil)
+        cameraStatusRows["depth"]?.text = depthStatusText()
+        updateCameraStatusColor(key: "depth", enabled: recorderSettings.lidarDepthEnabled, activeRecorder: lidarDepthRecorder != nil)
 
         let sensorRows = sensorRecorder?.statusRows() ?? [:]
         updateSensorPill(key: "imu", title: "IMU", value: sensorRows["imu"] ?? "0Hz")
@@ -4832,6 +5342,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         updateSensorPill(key: "geo", title: "GeoLoc", value: locationRecorder?.statusValue() ?? "0Hz")
         updateSensorPill(key: "motion", title: "Motion", value: sensorRows["motion"] ?? "0Hz")
         updateSensorPill(key: "audio", title: "Audio", value: audioRecorder?.statusValue() ?? "0Hz")
+        updateSensorPill(key: "depth", title: "Depth", value: depthStatusValue())
 
         captureStatusRows["duration"]?.text = isRecording ? (timeLabel.text ?? "00:00:00") : "00:00:00"
         captureStatusRows["size"]?.text = fileSizeLabel.text ?? "? / ?"
@@ -4861,6 +5372,30 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         let hz = frameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", targetRecordingFrameRate(for: settings))
         return "\(cameraName) \(aspectLabel(for: resolution)) | \(resolution) | \(hz)"
+    }
+
+    private func depthStatusText() -> String {
+        guard recorderSettings.lidarDepthEnabled else {
+            return "DEPTH OFF"
+        }
+        guard let output = lidarDepthOutput else {
+            return "DEPTH --"
+        }
+        let dimensions = output.connections.first?.inputPorts.first?.formatDescription
+            .map(CMVideoFormatDescriptionGetDimensions)
+        let resolution = dimensions.map { "\($0.width)x\($0.height)" } ?? "--"
+        return "DEPTH \(resolution) | \(depthStatusValue())"
+    }
+
+    private func depthStatusValue() -> String {
+        guard lidarDepthFrameCount > 0 else { return "0Hz" }
+        guard let firstDepthSensorSec,
+              let latestDepthSensorSec,
+              latestDepthSensorSec > firstDepthSensorSec else {
+            return "Depth"
+        }
+        let hz = Double(max(lidarDepthFrameCount - 1, 1)) / (latestDepthSensorSec - firstDepthSensorSec)
+        return String(format: "%.0fHz", hz)
     }
 
     private func aspectLabel(for resolution: String) -> String {
@@ -4981,7 +5516,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let sensorStatus = sensorRecorder?.statusText() ?? "sensors starting"
         let locationStatus = locationRecorder?.statusText() ?? "L --"
         let audioStatus = audioRecorder?.statusText() ?? "AUD --"
-        return "\(sensorStatus) \(locationStatus) \(audioStatus)"
+        let depthStatus = lidarDepthRecorder == nil ? "D --" : "D raw"
+        return "\(sensorStatus) \(locationStatus) \(audioStatus) \(depthStatus)"
     }
 
     private func updateSize() {
@@ -5155,6 +5691,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "geo_location_enabled": recorderSettings.geoLocationEnabled,
             "device_motion_enabled": recorderSettings.deviceMotionEnabled,
             "audio_enabled": recorderSettings.audioEnabled,
+            "lidar_depth_enabled": recorderSettings.lidarDepthEnabled,
             "premium_unlocked": PurchaseManager.shared.isPremiumUnlocked,
             "free_recording_limit_sec": freeRecordingLimitSeconds
         ]
@@ -5196,7 +5733,37 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "telephoto_target_fps": telephotoTargetFPS,
             "telephoto_capture_fps": telephotoCaptureFPS,
             "front_target_fps": frontTargetFPS,
-            "front_capture_fps": frontCaptureFPS
+            "front_capture_fps": frontCaptureFPS,
+            "lidar_depth_enabled": recorderSettings.lidarDepthEnabled
+        ]
+    }
+
+    private func cameraExtrinsicsJSON() -> [String: Any] {
+        return [
+            "reference": "wide_camera",
+            "matrix_format": "3x4 row-major JSON array converted from Apple's column-major matrix_float4x3",
+            "unit": "rotation unitless, translation in meters when supplied by AVFoundation",
+            "T_wide_from_ultrawide": extrinsicJSON(from: ultraWideDevice, to: wideDevice),
+            "T_wide_from_telephoto": extrinsicJSON(from: telephotoDevice, to: wideDevice),
+            "T_wide_from_front": extrinsicJSON(from: frontDevice, to: wideDevice),
+            "T_wide_from_lidar": extrinsicJSON(from: lidarDevice, to: wideDevice)
+        ]
+    }
+
+    private func extrinsicJSON(from source: AVCaptureDevice?, to target: AVCaptureDevice?) -> Any {
+        guard let source, let target else { return NSNull() }
+        guard #available(iOS 17.0, *) else { return NSNull() }
+        guard let data = AVCaptureDevice.extrinsicMatrix(from: source, to: target),
+              data.count >= MemoryLayout<simd_float4x3>.size else {
+            return NSNull()
+        }
+        let matrix = data.withUnsafeBytes { rawBuffer -> simd_float4x3 in
+            rawBuffer.load(as: simd_float4x3.self)
+        }
+        return [
+            [matrix.columns.0.x, matrix.columns.1.x, matrix.columns.2.x, matrix.columns.3.x],
+            [matrix.columns.0.y, matrix.columns.1.y, matrix.columns.2.y, matrix.columns.3.y],
+            [matrix.columns.0.z, matrix.columns.1.z, matrix.columns.2.z, matrix.columns.3.z]
         ]
     }
 
@@ -5244,6 +5811,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "updated_utc_sec": utcSec,
             "recording_settings": currentRecordingSettingsJSON(),
             "recording_start": recordingStartJSON(),
+            "camera_extrinsics": cameraExtrinsicsJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
                 "utc_sec": "Unix UTC seconds",
@@ -5339,6 +5907,36 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": ["frame_index", "sensor_sec", "utc_sec", "duration_sec", "sample_count", "sample_rate_hz", "channels"]
+                ],
+                "lidar_depth": [
+                    "enabled": recorderSettings.lidarDepthEnabled,
+                    "directory": "lidar_depth",
+                    "index_file": "lidar_depth_info.csv",
+                    "pixel_format": "DepthUInt16",
+                    "depth_unit": "millimeter",
+                    "depth_scale": 1000,
+                    "filtering_enabled": true,
+                    "timestamp_column": "sensor_sec",
+                    "utc_column": "utc_sec",
+                    "raw_layout": "16-bit grayscale PNG depth map; value 0 means invalid, value / depth_scale gives meters",
+                    "schema": [
+                        "frame_index",
+                        "sensor_sec",
+                        "utc_sec",
+                        "file_name",
+                        "width_px",
+                        "height_px",
+                        "pixel_format",
+                        "bytes_per_pixel",
+                        "depth_unit",
+                        "depth_scale",
+                        "min_depth_m",
+                        "max_depth_m",
+                        "fx_px",
+                        "fy_px",
+                        "cx_px",
+                        "cy_px"
+                    ]
                 ],
                 "accelerometer": [
                     "enabled": recorderSettings.imuEnabled,
