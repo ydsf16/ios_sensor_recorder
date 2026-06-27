@@ -4067,6 +4067,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14)
         let button = UIButton(configuration: config)
         button.contentHorizontalAlignment = .leading
+        enableSettingsButtonTextWrapping(button)
         return button
     }
 
@@ -4076,6 +4077,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         label.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .bold)
         label.textColor = UIColor.white.withAlphaComponent(0.55)
         label.letterSpacing = 1.3
+        enableSettingsTextWrapping(label)
         stack.addArrangedSubview(label)
     }
 
@@ -4084,6 +4086,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         titleLabel.text = "SETTINGS"
         titleLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
         titleLabel.textColor = .white
+        enableSettingsTextWrapping(titleLabel)
 
         stack.addArrangedSubview(titleLabel)
     }
@@ -4093,8 +4096,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         label.text = text
         label.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .medium)
         label.textColor = UIColor.white.withAlphaComponent(0.46)
-        label.numberOfLines = 2
+        enableSettingsTextWrapping(label)
         stack.addArrangedSubview(label)
+    }
+
+    private func enableSettingsTextWrapping(_ label: UILabel) {
+        label.numberOfLines = 0
+        label.lineBreakMode = .byWordWrapping
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    private func enableSettingsButtonTextWrapping(_ button: UIButton) {
+        button.titleLabel?.numberOfLines = 0
+        button.titleLabel?.lineBreakMode = .byWordWrapping
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
     }
 
     private func cameraCapabilityText(_ capabilities: CameraCapabilities) -> String {
@@ -4106,7 +4122,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             capabilities.hasLiDAR ? "LiDAR" : nil
         ].compactMap { $0 }.joined(separator: " / ")
         let multiCam = capabilities.supportsMultiCam ? "MultiCam supported" : "Single-camera capture only"
-        return "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam). Up to 3 RGB cameras, or 3 RGB cameras + Depth. Depth limits camera capture to 10Hz; high resolution may still drop frames."
+        return [
+            "Detected: \(cameras.isEmpty ? "No back camera" : cameras). \(multiCam).",
+            "RGB recording supports up to 3 cameras.",
+            "Enabling LiDAR Depth limits all RGB cameras to 10Hz; high resolution may still drop frames."
+        ].joined(separator: "\n")
     }
 
     private func addSettingsMenuRow(
@@ -4119,17 +4139,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) {
         let row = UIStackView()
         row.axis = .horizontal
-        row.alignment = .center
+        row.alignment = .top
         row.spacing = compact ? 10 : 16
 
         let titleLabel = UILabel()
         titleLabel.text = title
         titleLabel.font = UIFont.systemFont(ofSize: compact ? 15 : 17, weight: .semibold)
         titleLabel.textColor = .white
+        enableSettingsTextWrapping(titleLabel)
         titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true
 
         let button = UIButton(type: .system)
         button.contentHorizontalAlignment = .leading
+        enableSettingsButtonTextWrapping(button)
         button.accessibilityValue = resolvedSelectedValue(in: items, preferred: selectedValue)
         button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue, compact: compact)
         button.menu = UIMenu(children: items.map { item in
@@ -4155,13 +4177,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) {
         let row = UIStackView()
         row.axis = .horizontal
-        row.alignment = .center
+        row.alignment = .top
         row.spacing = compact ? 10 : 16
 
         let titleLabel = UILabel()
         titleLabel.text = title
         titleLabel.font = UIFont.systemFont(ofSize: compact ? 15 : 17, weight: .semibold)
         titleLabel.textColor = .white
+        enableSettingsTextWrapping(titleLabel)
         titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true
 
         let slider = UISlider()
@@ -4178,6 +4201,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         valueLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 13 : 14, weight: .semibold)
         valueLabel.textColor = .white
         valueLabel.textAlignment = .right
+        enableSettingsTextWrapping(valueLabel)
         valueLabel.widthAnchor.constraint(equalToConstant: 48).isActive = true
 
         settingsSliders[key] = slider
@@ -4294,7 +4318,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) {
         let row = UIStackView()
         row.axis = .horizontal
-        row.alignment = .center
+        row.alignment = .top
         row.spacing = 12
 
         let textStack = UIStackView()
@@ -4305,6 +4329,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         label.text = title
         label.font = UIFont.systemFont(ofSize: 18, weight: .bold)
         label.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
+        enableSettingsTextWrapping(label)
         textStack.addArrangedSubview(label)
 
         if let detail, !detail.isEmpty {
@@ -4312,6 +4337,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             detailLabel.text = detail
             detailLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .medium)
             detailLabel.textColor = UIColor.white.withAlphaComponent(0.46)
+            enableSettingsTextWrapping(detailLabel)
             textStack.addArrangedSubview(detailLabel)
         }
 
@@ -4323,6 +4349,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             cameraSwitch.isEnabled = enabled
             cameraSwitch.onTintColor = .systemTeal
             cameraSwitch.accessibilityIdentifier = switchKey
+            cameraSwitch.setContentCompressionResistancePriority(.required, for: .horizontal)
             cameraSwitch.addTarget(self, action: #selector(cameraEnabledSwitchChanged(_:)), for: .valueChanged)
             settingsSwitches[switchKey] = cameraSwitch
             row.addArrangedSubview(cameraSwitch)
@@ -4732,7 +4759,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) {
         let row = UIStackView()
         row.axis = .horizontal
-        row.alignment = .center
+        row.alignment = .top
         row.spacing = compact ? 10 : 16
 
         let textStack = UIStackView()
@@ -4744,12 +4771,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         titleLabel.text = title
         titleLabel.font = UIFont.systemFont(ofSize: compact ? 14 : 17, weight: .semibold)
         titleLabel.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
+        enableSettingsTextWrapping(titleLabel)
 
         let detailLabel = UILabel()
         detailLabel.text = detail
         detailLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 10 : 12, weight: .medium)
         detailLabel.textColor = UIColor.white.withAlphaComponent(enabled ? 0.56 : 0.28)
         detailLabel.isHidden = detail.isEmpty
+        enableSettingsTextWrapping(detailLabel)
 
         textStack.addArrangedSubview(titleLabel)
         textStack.addArrangedSubview(detailLabel)
@@ -4759,6 +4788,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         sensorSwitch.isEnabled = enabled
         sensorSwitch.onTintColor = .systemTeal
         sensorSwitch.accessibilityIdentifier = key
+        sensorSwitch.setContentCompressionResistancePriority(.required, for: .horizontal)
         if key.hasSuffix(".autoFocus") {
             sensorSwitch.addTarget(self, action: #selector(autoFocusSwitchChanged(_:)), for: .valueChanged)
         } else if key.hasSuffix(".autoExposure") {
