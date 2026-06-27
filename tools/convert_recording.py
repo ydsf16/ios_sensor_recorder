@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Maximum video image rate written to Rerun. Use 0 to write every frame.",
     )
+    parser.add_argument(
+        "--depth-pixel-stride",
+        type=int,
+        default=2,
+        help="Pixel stride for LiDAR point clouds. Use 1 for full-resolution points.",
+    )
     return parser.parse_args()
 
 
@@ -149,7 +155,15 @@ def default_output_path(capture_dir: Path) -> Path:
     return capture_dir.with_suffix(".rrd")
 
 
-def convert_to_rerun(capture_dir: Path, output_path: Path, app_id: str, drop_nonfinite: bool, jpeg_quality: int, video_fps: float) -> None:
+def convert_to_rerun(
+    capture_dir: Path,
+    output_path: Path,
+    app_id: str,
+    drop_nonfinite: bool,
+    jpeg_quality: int,
+    video_fps: float,
+    depth_pixel_stride: int,
+) -> None:
     try:
         import numpy as np
         import rerun as rr
@@ -177,6 +191,7 @@ def convert_to_rerun(capture_dir: Path, output_path: Path, app_id: str, drop_non
             ),
             static=True,
         )
+    log_lidar_depth_metadata(rr=rr, capture_dir=capture_dir)
 
     for camera_name, (video_name, info_name) in CAMERA_STREAMS.items():
         video_path = capture_dir / video_name
@@ -204,6 +219,8 @@ def convert_to_rerun(capture_dir: Path, output_path: Path, app_id: str, drop_non
             fields=["record_slot", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"],
             drop_nonfinite=drop_nonfinite,
         )
+
+    log_lidar_depth(rr=rr, np=np, capture_dir=capture_dir, pixel_stride=depth_pixel_stride)
 
     for file_name, fields in SENSOR_FILES.items():
         rows = read_csv_rows(capture_dir / file_name)
@@ -253,8 +270,10 @@ def send_default_blueprint(rr: Any) -> None:
                     rrb.Spatial2DView(name="Wide", origin="/camera/wide"),
                     rrb.Spatial2DView(name="Telephoto", origin="/camera/telephoto"),
                     rrb.Spatial2DView(name="Front", origin="/camera/front"),
-                    column_shares=[1, 1, 1, 1],
+                    rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
+                    column_shares=[1, 1, 1, 1, 1],
                 ),
+                rrb.Spatial3DView(name="LiDAR Point Cloud", origin="/lidar/depth/points"),
                 rrb.Horizontal(
                     rrb.Vertical(
                         rrb.TimeSeriesView(
@@ -306,7 +325,7 @@ def send_default_blueprint(rr: Any) -> None:
                     ),
                     column_shares=[1, 1],
                 ),
-                row_shares=[4, 5],
+                row_shares=[3, 3, 5],
             ),
             collapse_panels=True,
         )
@@ -390,6 +409,7 @@ def recording_sensor_window(capture_dir: Path) -> tuple[float, float] | None:
         "ultra_info.csv",
         "tele_info.csv",
         "front_info.csv",
+        "lidar_depth_info.csv",
         "audio_info.csv",
         "imu.csv",
         "device_motion.csv",
@@ -404,6 +424,119 @@ def recording_sensor_window(capture_dir: Path) -> tuple[float, float] | None:
     if not starts or not ends:
         return None
     return min(starts), max(ends)
+
+
+def log_lidar_depth_metadata(rr: Any, capture_dir: Path) -> None:
+    info_path = capture_dir / "lidar_depth_info.csv"
+    depth_dir = capture_dir / "lidar_depth"
+    rows = read_csv_rows(info_path)
+    if not rows:
+        return
+
+    png_count = len(list(depth_dir.glob("depth_*.png"))) if depth_dir.exists() else 0
+    first = rows[0]
+    last = rows[-1]
+    rr.log(
+        "metadata/lidar_depth",
+        rr.TextDocument(
+            "\n".join(
+                [
+                    f"directory: {depth_dir}",
+                    f"index_file: {info_path}",
+                    "raw_depth: 16-bit PNG depth in millimeters, one PNG per frame",
+                    f"csv_rows: {len(rows)}",
+                    f"png_files: {png_count}",
+                    f"first_sensor_sec: {first.get('sensor_sec', '')}",
+                    f"last_sensor_sec: {last.get('sensor_sec', '')}",
+                    f"resolution: {first.get('width_px', '')}x{first.get('height_px', '')}",
+                    "note: Rerun conversion logs depth images and reconstructed per-frame point clouds.",
+                ]
+            )
+        ),
+        static=True,
+    )
+
+
+def log_lidar_depth(rr: Any, np: Any, capture_dir: Path, pixel_stride: int) -> None:
+    rows = read_csv_rows(capture_dir / "lidar_depth_info.csv")
+    depth_dir = capture_dir / "lidar_depth"
+    if not rows or not depth_dir.exists():
+        return
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise SystemExit("Missing dependency for LiDAR depth. Install with: python3 -m pip install pillow") from exc
+
+    pixel_stride = max(int(pixel_stride), 1)
+    for row in rows:
+        sensor_sec = parse_float(row.get("sensor_sec"))
+        utc_sec = parse_float(row.get("utc_sec"))
+        if sensor_sec is None:
+            continue
+
+        file_name = row.get("file_name") or f"depth_{int(float(row.get('frame_index', '0'))):06d}.png"
+        png_path = depth_dir / file_name
+        if not png_path.exists():
+            continue
+
+        depth_raw = np.asarray(Image.open(png_path), dtype=np.uint16)
+        if depth_raw.ndim != 2:
+            continue
+
+        depth_scale = parse_float(row.get("depth_scale")) or 1000.0
+        depth_m = depth_raw.astype(np.float32) / float(depth_scale)
+        valid = depth_raw > 0
+
+        rr.set_time("sensor_time", duration=sensor_sec)
+        if utc_sec is not None and math.isfinite(utc_sec):
+            rr.set_time("utc_time", timestamp=utc_sec)
+
+        if hasattr(rr, "DepthImage"):
+            rr.log("/lidar/depth/image", rr.DepthImage(depth_raw, meter=float(depth_scale)))
+        else:
+            rr.log("/lidar/depth/image", rr.Image(depth_colormap(np=np, depth_m=depth_m, valid=valid)))
+
+        points = depth_points_from_intrinsics(np=np, depth_m=depth_m, valid=valid, row=row, pixel_stride=pixel_stride)
+        if len(points):
+            rr.log("/lidar/depth/points", rr.Points3D(points))
+
+
+def depth_points_from_intrinsics(np: Any, depth_m: Any, valid: Any, row: dict[str, str], pixel_stride: int) -> Any:
+    fx = parse_float(row.get("fx_px"))
+    fy = parse_float(row.get("fy_px"))
+    cx = parse_float(row.get("cx_px"))
+    cy = parse_float(row.get("cy_px"))
+    if not all(value is not None and math.isfinite(value) and value > 0 for value in [fx, fy]):
+        return np.empty((0, 3), dtype=np.float32)
+
+    sampled_depth = depth_m[::pixel_stride, ::pixel_stride]
+    sampled_valid = valid[::pixel_stride, ::pixel_stride]
+    vv, uu = np.indices(sampled_depth.shape, dtype=np.float32)
+    uu *= pixel_stride
+    vv *= pixel_stride
+
+    z = sampled_depth[sampled_valid]
+    x = (uu[sampled_valid] - float(cx)) * z / float(fx)
+    y = (vv[sampled_valid] - float(cy)) * z / float(fy)
+    return np.stack([x, y, z], axis=1).astype(np.float32)
+
+
+def depth_colormap(np: Any, depth_m: Any, valid: Any) -> Any:
+    if not valid.any():
+        return np.zeros((*depth_m.shape, 3), dtype=np.uint8)
+    valid_depth = depth_m[valid]
+    lo = float(np.nanpercentile(valid_depth, 2))
+    hi = float(np.nanpercentile(valid_depth, 98))
+    scale = max(hi - lo, 1e-6)
+    t = np.clip((depth_m - lo) / scale, 0, 1)
+    near = 1.0 - t
+    rgb = np.zeros((*depth_m.shape, 3), dtype=np.uint8)
+    rgb[..., 0] = (255 * near).astype(np.uint8)
+    rgb[..., 1] = (255 * (1.0 - np.abs(near - 0.5) * 2.0)).astype(np.uint8)
+    rgb[..., 2] = (255 * (1.0 - near)).astype(np.uint8)
+    rgb[~valid] = 0
+    return rgb
 
 
 def filter_rows_to_sensor_window(rows: list[dict[str, str]], window: tuple[float, float]) -> list[dict[str, str]]:
@@ -602,7 +735,15 @@ def main() -> int:
     output_path = (args.output or default_output_path(capture_dir)).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    convert_to_rerun(capture_dir, output_path, args.app_id, args.drop_nonfinite, args.jpeg_quality, args.video_fps)
+    convert_to_rerun(
+        capture_dir,
+        output_path,
+        args.app_id,
+        args.drop_nonfinite,
+        args.jpeg_quality,
+        args.video_fps,
+        args.depth_pixel_stride,
+    )
 
     print(output_path)
     return 0
