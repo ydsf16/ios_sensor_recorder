@@ -1377,7 +1377,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 fixedFocusLensPosition: 0.8
             ),
             telephoto: CameraCaptureSettings(
-                enabled: true,
+                enabled: false,
                 resolution: "1920x1440",
                 frameRate: "30",
                 autoFocus: false,
