@@ -60,6 +60,8 @@ SENSOR_FILES: dict[str, list[str]] = {
     "audio_info.csv": ["duration_sec", "sample_count", "sample_rate_hz", "channels"],
 }
 
+ARKIT_POSE_FILE = "arkit_pose.csv"
+
 SENSOR_ENTITY_NAMES = {
     "geo_location.csv": "geo",
 }
@@ -193,10 +195,19 @@ def convert_to_rerun(
         )
     log_lidar_depth_metadata(rr=rr, capture_dir=capture_dir)
 
+    # Detect ARKit mode: if arkit_pose.csv exists, use it for wide camera timing
+    arkit_pose_path = capture_dir / ARKIT_POSE_FILE
+    is_arkit_mode = arkit_pose_path.exists()
+
     for camera_name, (video_name, info_name) in CAMERA_STREAMS.items():
         video_path = capture_dir / video_name
         info_path = capture_dir / info_name
         rows = read_csv_rows(info_path)
+
+        # In ARKit mode, wide.mp4 uses arkit_pose.csv for timing
+        if not rows and is_arkit_mode and camera_name == "wide":
+            rows = read_csv_rows(arkit_pose_path)
+
         if not video_path.exists() or not rows:
             continue
 
@@ -221,6 +232,7 @@ def convert_to_rerun(
         )
 
     log_lidar_depth(rr=rr, np=np, capture_dir=capture_dir, pixel_stride=depth_pixel_stride)
+    log_arkit_pose(rr=rr, np=np, capture_dir=capture_dir, video_fps=video_fps)
 
     for file_name, fields in SENSOR_FILES.items():
         rows = read_csv_rows(capture_dir / file_name)
@@ -321,7 +333,16 @@ def send_default_blueprint(rr: Any) -> None:
                                 "/sensors/geo_relative/horizontal_accuracy_m",
                             ],
                         ),
-                        row_shares=[1, 1],
+                        rrb.TimeSeriesView(
+                            name="ARKit Pose XYZ",
+                            origin="/sensors/arkit_pose",
+                            contents=[
+                                "/sensors/arkit_pose/tx_m",
+                                "/sensors/arkit_pose/ty_m",
+                                "/sensors/arkit_pose/tz_m",
+                            ],
+                        ),
+                        row_shares=[1, 1, 1],
                     ),
                     column_shares=[1, 1],
                 ),
@@ -537,6 +558,70 @@ def depth_colormap(np: Any, depth_m: Any, valid: Any) -> Any:
     rgb[..., 2] = (255 * (1.0 - near)).astype(np.uint8)
     rgb[~valid] = 0
     return rgb
+
+
+def log_arkit_pose(rr: Any, np: Any, capture_dir: Path, video_fps: float) -> None:
+    """Log ARKit 6-DOF poses and camera intrinsics from arkit_pose.csv."""
+    pose_path = capture_dir / ARKIT_POSE_FILE
+    if not pose_path.exists():
+        return
+
+    rows = read_csv_rows(pose_path)
+    if not rows:
+        return
+
+    # Log pose scalar fields
+    scalar_fields = [
+        "tx_m", "ty_m", "tz_m",
+        "qw", "qx", "qy", "qz",
+        "fx_px", "fy_px", "cx_px", "cy_px",
+        "width_px", "height_px",
+    ]
+    log_scalar_columns(
+        rr=rr,
+        np=np,
+        rows=rows,
+        base_path="sensors/arkit_pose",
+        fields=scalar_fields,
+        drop_nonfinite=False,
+    )
+
+    # Log camera poses as 3D transforms (Rerun Instances3D)
+    fps = video_fps if video_fps > 0 else 999
+    last_logged_time = -float("inf")
+    for row in rows:
+        sensor_sec = parse_float(row.get("sensor_sec"))
+        if sensor_sec is None:
+            continue
+        if fps < 999:
+            interval = 1.0 / fps
+            if sensor_sec - last_logged_time < interval:
+                continue
+        last_logged_time = sensor_sec
+
+        tx = parse_float(row.get("tx_m")) or 0.0
+        ty = parse_float(row.get("ty_m")) or 0.0
+        tz = parse_float(row.get("tz_m")) or 0.0
+        qw = parse_float(row.get("qw")) or 1.0
+        qx = parse_float(row.get("qx")) or 0.0
+        qy = parse_float(row.get("qy")) or 0.0
+        qz = parse_float(row.get("qz")) or 0.0
+
+        rr.set_time_seconds("sensor_time", sensor_sec)
+        rr.log(
+            "world/arkit_camera",
+            rr.Transform3D(
+                translation=[tx, ty, tz],
+                rotation=rr.Quaternion(xyzw=[qx, qy, qz, qw]),
+                from_parent=True,
+            ),
+        )
+
+        tracking = row.get("tracking_state", "unknown")
+        rr.log(
+            "world/arkit_camera/tracking",
+            rr.TextDocument(f"tracking: {tracking}"),
+        )
 
 
 def filter_rows_to_sensor_window(rows: list[dict[str, str]], window: tuple[float, float]) -> list[dict[str, str]]:

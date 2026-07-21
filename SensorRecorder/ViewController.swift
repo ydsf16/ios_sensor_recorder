@@ -8,6 +8,7 @@ import StoreKit
 import os.log
 import simd
 import UniformTypeIdentifiers
+import ARKit
 
 private final class CameraPreviewView: UIView {
     override class var layerClass: AnyClass {
@@ -495,6 +496,260 @@ private final class CameraStreamRecorder {
     }
 }
 
+private final class ARKitFrameRecorder {
+    private let videoURL: URL
+    private let infoURL: URL
+    private let targetFrameRate: Double
+    private let captureFrameRate: Double
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var infoHandle: FileHandle?
+    private var firstPTS: CMTime?
+    private let utcMinusSensorOffsetSec: TimeInterval
+    private var videoCodec: AVVideoCodecType = .h264
+    private var frameIndex = 0
+    private var isFinishing = false
+    private var didWriteCSVHeader = false
+
+    init(videoURL: URL, infoURL: URL, targetFrameRate: Double, captureFrameRate: Double) {
+        self.videoURL = videoURL
+        self.infoURL = infoURL
+        self.targetFrameRate = targetFrameRate
+        self.captureFrameRate = captureFrameRate
+        self.utcMinusSensorOffsetSec = Date().timeIntervalSince1970 - CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+        try? FileManager.default.removeItem(at: videoURL)
+        try? FileManager.default.removeItem(at: infoURL)
+        FileManager.default.createFile(atPath: infoURL.path, contents: nil)
+        infoHandle = try? FileHandle(forWritingTo: infoURL)
+        writeInfoLine("# camera,arkit")
+    }
+
+    func append(
+        pixelBuffer: CVPixelBuffer,
+        presentationTime: CMTime,
+        camera: ARCamera,
+        recordSlot: Int64
+    ) {
+        guard !isFinishing else { return }
+        if writer == nil {
+            configureWriter(pixelBuffer: pixelBuffer)
+        }
+        guard let writer = writer, let input = input else { return }
+
+        if firstPTS == nil {
+            firstPTS = presentationTime
+            writer.startWriting()
+            writer.startSession(atSourceTime: presentationTime)
+        }
+
+        guard writer.status == .writing, input.isReadyForMoreMediaData else {
+            if writer.status == .failed {
+                writeInfoLine("# writer_failed \(writer.error?.localizedDescription ?? "unknown")")
+            }
+            return
+        }
+
+        let sampleBuffer = makeSampleBuffer(pixelBuffer: pixelBuffer, presentationTime: presentationTime)
+        guard let sampleBuffer = sampleBuffer else {
+            writeInfoLine("# sample_buffer_failed \(frameIndex)")
+            return
+        }
+
+        guard input.append(sampleBuffer) else {
+            writeInfoLine("# append_failed \(frameIndex) \(writer.error?.localizedDescription ?? "unknown")")
+            return
+        }
+
+        writeInfo(
+            presentationTime: presentationTime,
+            camera: camera,
+            pixelBuffer: pixelBuffer,
+            recordSlot: recordSlot
+        )
+        frameIndex += 1
+    }
+
+    func finish(_ completion: @escaping () -> Void) {
+        guard !isFinishing else {
+            completion()
+            return
+        }
+        isFinishing = true
+        infoHandle?.synchronizeFile()
+        infoHandle?.closeFile()
+        infoHandle = nil
+
+        guard let writer = writer else {
+            completion()
+            return
+        }
+        input?.markAsFinished()
+        writer.finishWriting(completionHandler: completion)
+    }
+
+    func writeDeviceFormat(resolution: CGSize) {
+        writeInfoLine("# active_format,\(Int(resolution.width))x\(Int(resolution.height)),capture_fps,\(String(format: "%.3f", captureFrameRate))")
+        writeInfoLine("# recording,target_fps,\(String(format: "%.3f", targetFrameRate)),sampling,host_time_grid")
+    }
+
+    var codecName: String {
+        videoCodec.rawValue
+    }
+
+    private func makeSampleBuffer(pixelBuffer: CVPixelBuffer, presentationTime: CMTime) -> CMSampleBuffer? {
+        var formatDescription: CMFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription
+        ) == noErr, let formatDescription = formatDescription else {
+            return nil
+        }
+
+        var timingInfo = CMSampleTimingInfo(
+            duration: CMTimeMake(value: 1, timescale: Int32(captureFrameRate * 600)),
+            presentationTimeStamp: presentationTime,
+            decodeTimeStamp: .invalid
+        )
+
+        var sampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleTiming: &timingInfo,
+            sampleBufferOut: &sampleBuffer
+        ) == noErr else {
+            return nil
+        }
+        return sampleBuffer
+    }
+
+    private func configureWriter(pixelBuffer: CVPixelBuffer) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        do {
+            let writer = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
+            let settings = CameraStreamRecorder.videoOutputSettings(width: width, height: height)
+            let codec = settings[AVVideoCodecKey] as? AVVideoCodecType ?? .h264
+            videoCodec = codec
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            input.expectsMediaDataInRealTime = true
+            guard writer.canApply(outputSettings: settings, forMediaType: .video),
+                  writer.canAdd(input) else {
+                writeInfoLine("# writer_input_failed")
+                return
+            }
+            writer.add(input)
+            self.writer = writer
+            self.input = input
+            writeInfoLine("# video,\(width)x\(height),codec,\(codec.rawValue)")
+            writeCSVHeaderIfNeeded()
+        } catch {
+            writeInfoLine("# writer_init_failed \(error.localizedDescription)")
+        }
+    }
+
+    private func writeInfo(
+        presentationTime: CMTime,
+        camera: ARCamera,
+        pixelBuffer: CVPixelBuffer,
+        recordSlot: Int64
+    ) {
+        writeCSVHeaderIfNeeded()
+        let sensorTime = CMSyncConvertTime(presentationTime, from: CMClockGetHostTimeClock(), to: CMClockGetHostTimeClock())
+        let sensorSec = CMTimeGetSeconds(sensorTime)
+        let utcSec = sensorSec + utcMinusSensorOffsetSec
+
+        let transform = camera.transform
+        let tx = transform.columns.3.x
+        let ty = transform.columns.3.y
+        let tz = transform.columns.3.z
+        let (qw, qx, qy, qz) = quaternionFromRotationMatrix(transform)
+
+        let intrinsics = camera.intrinsics
+        let fx = intrinsics.columns.0.x
+        let fy = intrinsics.columns.1.y
+        let cx = intrinsics.columns.2.x
+        let cy = intrinsics.columns.2.y
+
+        let exposureSec = camera.exposureDuration
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        let trackingLabel = trackingStateLabel(camera.trackingState)
+
+        writeInfoLine(String(
+            format: "%d,%lld,%.6f,%.6f,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%@,%.9f,%.9f,%.9f,%.9f,%d,%d",
+            frameIndex, recordSlot, sensorSec, utcSec,
+            tx, ty, tz, qw, qx, qy, qz,
+            Float(exposureSec),
+            trackingLabel,
+            fx, fy, cx, cy,
+            width, height
+        ))
+    }
+
+    private func writeInfoLine(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        infoHandle?.write(data)
+    }
+
+    private func writeCSVHeaderIfNeeded() {
+        guard !didWriteCSVHeader else { return }
+        didWriteCSVHeader = true
+        writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,tx_m,ty_m,tz_m,qw,qx,qy,qz,exposure_sec,tracking_state,fx_px,fy_px,cx_px,cy_px,width_px,height_px")
+    }
+
+    private func trackingStateLabel(_ state: ARCamera.TrackingState) -> String {
+        switch state {
+        case .notAvailable: return "not_available"
+        case .limited: return "limited"
+        case .normal: return "normal"
+        }
+    }
+
+    private func quaternionFromRotationMatrix(_ m: simd_float4x4) -> (Float, Float, Float, Float) {
+        let rot = simd_float3x3(
+            simd_float3(m.columns.0.x, m.columns.0.y, m.columns.0.z),
+            simd_float3(m.columns.1.x, m.columns.1.y, m.columns.1.z),
+            simd_float3(m.columns.2.x, m.columns.2.y, m.columns.2.z)
+        )
+        let trace = rot.columns.0.x + rot.columns.1.y + rot.columns.2.z
+        let qw: Float, qx: Float, qy: Float, qz: Float
+        if trace > 0 {
+            let s = 0.5 / sqrtf(trace + 1.0)
+            qw = 0.25 / s
+            qx = (rot.columns.1.z - rot.columns.2.y) * s
+            qy = (rot.columns.2.x - rot.columns.0.z) * s
+            qz = (rot.columns.0.y - rot.columns.1.x) * s
+        } else if rot.columns.0.x > rot.columns.1.y && rot.columns.0.x > rot.columns.2.z {
+            let s = 2.0 * sqrtf(1.0 + rot.columns.0.x - rot.columns.1.y - rot.columns.2.z)
+            qw = (rot.columns.1.z - rot.columns.2.y) / s
+            qx = 0.25 * s
+            qy = (rot.columns.1.x + rot.columns.0.y) / s
+            qz = (rot.columns.2.x + rot.columns.0.z) / s
+        } else if rot.columns.1.y > rot.columns.2.z {
+            let s = 2.0 * sqrtf(1.0 + rot.columns.1.y - rot.columns.0.x - rot.columns.2.z)
+            qw = (rot.columns.2.x - rot.columns.0.z) / s
+            qx = (rot.columns.1.x + rot.columns.0.y) / s
+            qy = 0.25 * s
+            qz = (rot.columns.2.y + rot.columns.1.z) / s
+        } else {
+            let s = 2.0 * sqrtf(1.0 + rot.columns.2.z - rot.columns.0.x - rot.columns.1.y)
+            qw = (rot.columns.0.y - rot.columns.1.x) / s
+            qx = (rot.columns.2.x + rot.columns.0.z) / s
+            qy = (rot.columns.2.y + rot.columns.1.z) / s
+            qz = 0.25 * s
+        }
+        return (qw, qx, qy, qz)
+    }
+}
+
 private final class LiDARDepthStreamRecorder {
     private let depthDirectoryURL: URL
     private let infoURL: URL
@@ -517,11 +772,40 @@ private final class LiDARDepthStreamRecorder {
     func append(depthData: AVDepthData, sensorSec: TimeInterval) {
         let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
         let pixelBuffer = converted.depthDataMap
+        appendFloat32DepthMap(pixelBuffer, calibration: converted.cameraCalibrationData, sensorSec: sensorSec)
+    }
+
+    /// Accept a raw float32 depth map (meters) from ARKit's ARDepthData.
+    func appendARKitDepthMap(_ pixelBuffer: CVPixelBuffer, intrinsics: simd_float3x3, sensorSec: TimeInterval) {
+        appendFloat32DepthMap(pixelBuffer, arkitIntrinsics: intrinsics, sensorSec: sensorSec)
+    }
+
+    private func appendFloat32DepthMap(_ pixelBuffer: CVPixelBuffer, calibration: AVCameraCalibrationData?, sensorSec: TimeInterval) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float)
+        if let calibration = calibration {
+            intrinsics = scaledDepthIntrinsics(calibration: calibration, width: width, height: height)
+        } else {
+            intrinsics = (.nan, .nan, .nan, .nan)
+        }
+        writeDepthFrame(pixelBuffer, width: width, height: height, intrinsics: intrinsics, sensorSec: sensorSec)
+    }
+
+    private func appendFloat32DepthMap(_ pixelBuffer: CVPixelBuffer, arkitIntrinsics: simd_float3x3, sensorSec: TimeInterval) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let fx = arkitIntrinsics.columns.0.x
+        let fy = arkitIntrinsics.columns.1.y
+        let cx = arkitIntrinsics.columns.2.x
+        let cy = arkitIntrinsics.columns.2.y
+        writeDepthFrame(pixelBuffer, width: width, height: height, intrinsics: (fx, fy, cx, cy), sensorSec: sensorSec)
+    }
+
+    private func writeDepthFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int, intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float), sensorSec: TimeInterval) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let bytesPerPixel = MemoryLayout<UInt16>.size
         let depthScale: Float = 1000
@@ -551,11 +835,6 @@ private final class LiDARDepthStreamRecorder {
         let fileURL = depthDirectoryURL.appendingPathComponent(fileName)
         writeDepthPNG(depthMillimeters, width: width, height: height, to: fileURL)
 
-        let intrinsics = scaledDepthIntrinsics(
-            calibration: converted.cameraCalibrationData,
-            width: width,
-            height: height
-        )
         let utcSec = sensorSec + utcMinusSensorOffsetSec
         writeInfoLine([
             "\(frameIndex)",
@@ -1384,7 +1663,7 @@ private final class GeoLocationStreamRecorder {
     }
 }
 
-class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate, CLLocationManagerDelegate {
+class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate, CLLocationManagerDelegate, ARSessionDelegate {
     private enum RecordingCamera {
         case wide
         case ultraWide
@@ -1396,6 +1675,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         case wideOnly = "wide only"
         case ultraWideOnly = "ultrawide only"
         case dual = "dual preview"
+    }
+
+    private enum CaptureMode: String, Codable {
+        case standard
+        case arkit
     }
 
     private struct CameraCaptureSettings: Codable, Equatable {
@@ -1418,10 +1702,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private struct RecorderSettings: Codable {
+        var captureMode: CaptureMode
         var wide: CameraCaptureSettings
         var ultraWide: CameraCaptureSettings
         var telephoto: CameraCaptureSettings
         var front: CameraCaptureSettings
+        var arkitCamera: CameraCaptureSettings
         var imuEnabled: Bool
         var magnetometerEnabled: Bool
         var barometerEnabled: Bool
@@ -1431,10 +1717,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var lidarDepthEnabled: Bool
 
         private enum CodingKeys: String, CodingKey {
+            case captureMode
             case wide
             case ultraWide
             case telephoto
             case front
+            case arkitCamera
             case imuEnabled
             case magnetometerEnabled
             case barometerEnabled
@@ -1445,10 +1733,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         init(
+            captureMode: CaptureMode = .standard,
             wide: CameraCaptureSettings,
             ultraWide: CameraCaptureSettings,
             telephoto: CameraCaptureSettings,
             front: CameraCaptureSettings,
+            arkitCamera: CameraCaptureSettings,
             imuEnabled: Bool,
             magnetometerEnabled: Bool,
             barometerEnabled: Bool,
@@ -1457,10 +1747,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             audioEnabled: Bool,
             lidarDepthEnabled: Bool
         ) {
+            self.captureMode = captureMode
             self.wide = wide
             self.ultraWide = ultraWide
             self.telephoto = telephoto
             self.front = front
+            self.arkitCamera = arkitCamera
             self.imuEnabled = imuEnabled
             self.magnetometerEnabled = magnetometerEnabled
             self.barometerEnabled = barometerEnabled
@@ -1473,10 +1765,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let defaults = Self.defaults
+            captureMode = try container.decodeIfPresent(CaptureMode.self, forKey: .captureMode) ?? defaults.captureMode
             wide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .wide) ?? defaults.wide
             ultraWide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .ultraWide) ?? defaults.ultraWide
             telephoto = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .telephoto) ?? defaults.telephoto
             front = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .front) ?? defaults.front
+            arkitCamera = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .arkitCamera) ?? defaults.arkitCamera
             imuEnabled = try container.decodeIfPresent(Bool.self, forKey: .imuEnabled) ?? defaults.imuEnabled
             magnetometerEnabled = try container.decodeIfPresent(Bool.self, forKey: .magnetometerEnabled) ?? defaults.magnetometerEnabled
             barometerEnabled = try container.decodeIfPresent(Bool.self, forKey: .barometerEnabled) ?? defaults.barometerEnabled
@@ -1487,6 +1781,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         static let defaults = RecorderSettings(
+            captureMode: .standard,
             wide: CameraCaptureSettings(
                 enabled: true,
                 resolution: "1920x1440",
@@ -1516,6 +1811,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             ),
             front: CameraCaptureSettings(
                 enabled: false,
+                resolution: "1920x1440",
+                frameRate: "30",
+                autoFocus: true,
+                autoExposure: true,
+                maxExposureDurationMS: "10",
+                fixedFocusLensPosition: 0.6
+            ),
+            arkitCamera: CameraCaptureSettings(
+                enabled: true,
                 resolution: "1920x1440",
                 frameRate: "30",
                 autoFocus: true,
@@ -1625,6 +1929,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var settingsSliders: [String: UISlider] = [:]
     private var settingsSliderValueLabels: [String: UILabel] = [:]
     private var cameraSettingsGroups: [String: UIView] = [:]
+    private var settingsCameraContainer: UIStackView?
     private weak var settingsRailButton: UIButton?
     private weak var filesRailButton: UIButton?
     private var cameraStatusRows: [String: UILabel] = [:]
@@ -1632,6 +1937,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var captureStatusRows: [String: UILabel] = [:]
     private var cameraStatusBadges: [String: UIView] = [:]
     private var captureStatusBadges: [String: UIView] = [:]
+    private var modeBadge: UIView?
+    private var modeBadgeLabel: UILabel?
+    private var arkitTrackingState: ARCamera.TrackingState = .notAvailable
     private var freeCountdownLabel: UILabel?
     private var rightControlRail: UIView?
     private var sensorMonitorBar: UIView?
@@ -1676,6 +1984,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var lidarDepthRecorder: LiDARDepthStreamRecorder?
     private var audioRecorder: AudioStreamRecorder?
     private var sensorRecorder: SensorStreamRecorder?
+    private var arSession: ARSession?
+    private var arkitRecorder: ARKitFrameRecorder?
+    private var arkitDisplayLayer: AVSampleBufferDisplayLayer?
+    private var arkitFrameCount = 0
+    private var arkitPreviewEnqueuePending = false
+    private var arkitLastRecordSlot: Int64?
+    private var arkitConfiguration: ARWorldTrackingConfiguration?
+    private var arkitCaptureDevice: AVCaptureDevice?
+    private var arkitDeviceConfigured = false
+    private var arkitAudioSession: AVCaptureSession?
     private let locationManager = CLLocationManager()
     private var locationRecorder: GeoLocationStreamRecorder?
     private var wideDisplayLayer: AVSampleBufferDisplayLayer?
@@ -1712,6 +2030,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private let defaultUltraWideFixedFocusLensPosition = 0.8
     private let defaultTelephotoFixedFocusLensPosition = 0.6
     private let defaultFrontFixedFocusLensPosition = 0.6
+    private let defaultARKitFixedFocusLensPosition = 0.6
     private let depthEnabledCameraFrameRateLimit = 10.0
     private let freeRecordingLimitSeconds: TimeInterval = 120
     private let freeCountdownVisibleThresholdSeconds: TimeInterval = 20
@@ -1731,6 +2050,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         enabledCameraCount(in: recorderSettings) > 0
     }
 
+    private var isARKitMode: Bool {
+        recorderSettings.captureMode == .arkit && ARWorldTrackingConfiguration.isSupported
+    }
+
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         .landscapeRight
     }
@@ -1744,7 +2067,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private var needsRunningCaptureSession: Bool {
-        hasEnabledCamera || recorderSettings.lidarDepthEnabled || recorderSettings.audioEnabled
+        if isARKitMode { return false }
+        return hasEnabledCamera || recorderSettings.lidarDepthEnabled || recorderSettings.audioEnabled
     }
 
     private func makeCaptureSession(for settings: RecorderSettings) -> AVCaptureSession {
@@ -1798,6 +2122,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             updated.front,
             defaultLensPosition: defaultFrontFixedFocusLensPosition
         )
+        updated.arkitCamera = sanitizedCameraCaptureSettings(
+            updated.arkitCamera,
+            defaultLensPosition: defaultARKitFixedFocusLensPosition
+        )
+
+        if updated.captureMode == .arkit && !ARWorldTrackingConfiguration.isSupported {
+            updated.captureMode = .standard
+        }
 
         if updated.wide.enabled && !capabilities.hasWide {
             updated.wide.enabled = false
@@ -1830,10 +2162,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             updated.wide.enabled = true
         }
 
-        if updated.wide != recorderSettings.wide ||
+        if updated.captureMode != recorderSettings.captureMode ||
+            updated.wide != recorderSettings.wide ||
             updated.ultraWide != recorderSettings.ultraWide ||
             updated.telephoto != recorderSettings.telephoto ||
             updated.front != recorderSettings.front ||
+            updated.arkitCamera != recorderSettings.arkitCamera ||
             updated.lidarDepthEnabled != recorderSettings.lidarDepthEnabled {
             recorderSettings = updated
             recorderSettings.save()
@@ -2189,6 +2523,33 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard !isConfigured else { return }
         sanitizeRecorderSettingsForCurrentDevice()
         setStatus("Preview")
+
+        if isARKitMode {
+            requestCameraAccess { granted in
+                guard granted else { return }
+                if self.recorderSettings.audioEnabled {
+                    self.requestAudioAccess { _ in
+                        self.sessionQueue.async {
+                            self.configureARKitPreview()
+                            DispatchQueue.main.async {
+                                self.startStopButton.isEnabled = self.arSession != nil
+                            }
+                            self.setStatus(self.arSession != nil ? "ARKit Ready" : "ARKit failed")
+                        }
+                    }
+                } else {
+                    self.sessionQueue.async {
+                        self.configureARKitPreview()
+                        DispatchQueue.main.async {
+                            self.startStopButton.isEnabled = self.arSession != nil
+                        }
+                        self.setStatus(self.arSession != nil ? "ARKit Ready" : "ARKit failed")
+                    }
+                }
+            }
+            return
+        }
+
         let cameraEnabled = enabledCameraCount(in: recorderSettings) > 0 || recorderSettings.lidarDepthEnabled
 
         let configureAfterCameraPermission: () -> Void = {
@@ -2301,6 +2662,328 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.setStatus(previewSession.isRunning ? "Ready" : "Not running")
             self.isConfigured = true
         }
+    }
+
+    // MARK: - ARKit Session Management
+
+    private func configureARKitPreview() {
+        guard !isConfigured else { return }
+        guard ARWorldTrackingConfiguration.isSupported else {
+            os_log("ARKit world tracking is not supported on this device.", type: .error)
+            showError(msg: "ARKit is not supported on this device.")
+            return
+        }
+
+        let arSession = ARSession()
+        let config = ARWorldTrackingConfiguration()
+        config.worldAlignment = .gravity
+        config.providesAudioData = false
+        config.isLightEstimationEnabled = false
+        config.planeDetection = []
+
+        let settings = recorderSettings.arkitCamera
+        let selectedFormat = pickARKitVideoFormat(for: config, resolution: settings.resolution, frameRate: settings.frameRate)
+        if let format = selectedFormat {
+            config.videoFormat = format
+        }
+
+        if recorderSettings.lidarDepthEnabled, ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
+
+        // Configure device BEFORE running the session so focus/exposure are set from the start
+        if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
+            self.arkitCaptureDevice = device
+            do {
+                try configureARKitDeviceForPreview(device, settings: settings)
+                self.arkitDeviceConfigured = true
+            } catch {
+                os_log("Failed to pre-configure ARKit capture device: %@", type: .error, error.localizedDescription)
+                self.arkitDeviceConfigured = false
+            }
+        }
+
+        arSession.delegate = self
+        arSession.run(config)
+
+        self.arSession = arSession
+        self.arkitConfiguration = config
+        self.isConfigured = true
+
+        // Set up audio capture on a dedicated session for ARKit mode
+        if recorderSettings.audioEnabled {
+            configureARKitAudioCapture()
+        }
+
+        DispatchQueue.main.async {
+            let displayLayer = self.makeDisplayLayer(for: "arkit")
+            self.sceneView.layer.insertSublayer(displayLayer, at: 0)
+            self.arkitDisplayLayer = displayLayer
+            self.layoutPreviewLayers()
+            self.view.bringSubviewToFront(self.startStopButton.superview ?? self.startStopButton)
+        }
+
+        let activeDimensions = selectedFormat.map {
+            CGSize(width: $0.imageResolution.width, height: $0.imageResolution.height)
+        } ?? CGSize(width: 1920, height: 1440)
+        os_log(
+            "Configured ARKit camera active %dx%d requested %@",
+            Int(activeDimensions.width),
+            Int(activeDimensions.height),
+            settings.resolution
+        )
+    }
+
+    /// Set up a dedicated AVCaptureSession for audio capture in ARKit mode.
+    /// ARKit uses ARSession (not AVCaptureSession), so audio needs its own session.
+    private func configureARKitAudioCapture() {
+        guard arkitAudioSession == nil else { return }
+        let audioSession = AVCaptureSession()
+        guard let device = AVCaptureDevice.default(for: .audio) else {
+            os_log("Audio input unavailable for ARKit mode.", type: .error)
+            return
+        }
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard audioSession.canAddInput(input) else {
+                os_log("Cannot add audio input to ARKit audio session.", type: .error)
+                return
+            }
+            audioSession.addInput(input)
+
+            let output = AVCaptureAudioDataOutput()
+            output.setSampleBufferDelegate(self, queue: sessionQueue)
+            guard audioSession.canAddOutput(output) else {
+                os_log("Cannot add audio output to ARKit audio session.", type: .error)
+                return
+            }
+            audioSession.addOutput(output)
+            self.audioOutput = output
+
+            configureAudioSessionForCapture()
+            self.arkitAudioSession = audioSession
+            audioSession.startRunning()
+            os_log("ARKit audio session started.", type: .info)
+        } catch {
+            os_log("Failed to configure ARKit audio capture: %@", type: .error, error.localizedDescription)
+        }
+    }
+
+    private func pickARKitVideoFormat(
+        for config: ARWorldTrackingConfiguration,
+        resolution: String,
+        frameRate: String
+    ) -> ARConfiguration.VideoFormat? {
+        let target = resolutionSize(from: resolution) ?? CGSize(width: 1920, height: 1440)
+        let targetWidth = Int(target.width)
+        let targetHeight = Int(target.height)
+        let formats: [ARConfiguration.VideoFormat] = ARWorldTrackingConfiguration.supportedVideoFormats
+
+        // Prefer exact resolution match; break ties by larger area
+        let exactMatch = formats.first { fmt in
+            Int(fmt.imageResolution.width) == targetWidth && Int(fmt.imageResolution.height) == targetHeight
+        }
+        if let exactMatch = exactMatch { return exactMatch }
+
+        // Otherwise pick the format closest to the target resolution by area
+        return formats.min { lhs, rhs in
+            let lhsArea = Int(lhs.imageResolution.width) * Int(lhs.imageResolution.height)
+            let rhsArea = Int(rhs.imageResolution.width) * Int(rhs.imageResolution.height)
+            let lhsDist = abs(lhsArea - targetWidth * targetHeight)
+            let rhsDist = abs(rhsArea - targetWidth * targetHeight)
+            return lhsDist < rhsDist
+        }
+    }
+
+    private func configureARKitDeviceForPreview(_ device: AVCaptureDevice, settings: CameraCaptureSettings) throws {
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+
+        applyAutoExposurePolicy(to: device, settings: settings)
+
+        if settings.autoFocus {
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
+            }
+        } else if device.isFocusModeSupported(.locked) {
+            if device.isLockingFocusWithCustomLensPositionSupported {
+                device.setFocusModeLocked(
+                    lensPosition: Float(clampedLensPosition(settings.fixedFocusLensPosition, fallback: defaultARKitFixedFocusLensPosition)),
+                    completionHandler: nil
+                )
+            } else {
+                device.focusMode = .locked
+            }
+        }
+    }
+
+    private func arkitActiveResolution() -> CGSize {
+        let settings = recorderSettings.arkitCamera
+        if let format = arkitConfiguration?.videoFormat {
+            return format.imageResolution
+        }
+        return resolutionSize(from: settings.resolution) ?? CGSize(width: 1920, height: 1440)
+    }
+
+    private func arkitActiveFrameRate() -> Double {
+        return clampedFrameRate(from: recorderSettings.arkitCamera.frameRate)
+    }
+
+    private func tearDownARKitSession() {
+        arSession?.pause()
+        arSession?.delegate = nil
+        arSession = nil
+        arkitConfiguration = nil
+        arkitRecorder = nil
+        arkitDisplayLayer?.removeFromSuperlayer()
+        arkitDisplayLayer = nil
+        arkitFrameCount = 0
+        arkitPreviewEnqueuePending = false
+        arkitLastRecordSlot = nil
+        arkitDeviceConfigured = false
+        arkitCaptureDevice = nil
+        arkitTrackingState = .notAvailable
+        arkitAudioSession?.stopRunning()
+        arkitAudioSession = nil
+        audioOutput = nil
+        isConfigured = false
+    }
+
+    // MARK: - ARSessionDelegate
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        arkitFrameCount += 1
+        arkitTrackingState = frame.camera.trackingState
+
+        // Ensure we have a reference to the capture device
+        if arkitCaptureDevice == nil {
+            arkitCaptureDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        }
+
+        // Re-apply focus/exposure if ARKit has overridden them
+        if let device = arkitCaptureDevice {
+            let settings = recorderSettings.arkitCamera
+            let needsFocusLock = !settings.autoFocus && device.focusMode != .locked
+            let needsExposureLock = !isAutoExposureEnabled(for: settings) && device.exposureMode != .locked
+            if needsFocusLock || needsExposureLock {
+                try? configureARKitDeviceForPreview(device, settings: settings)
+            }
+        }
+
+        let pts = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000)
+
+        if isRecording {
+            let pixelBuffer = frame.capturedImage
+            let recordSlot = arkitRecordingSlotIfFrameShouldBeWritten(pts)
+
+            if let recordSlot = recordSlot {
+                arkitRecorder?.append(
+                    pixelBuffer: pixelBuffer,
+                    presentationTime: pts,
+                    camera: frame.camera,
+                    recordSlot: recordSlot
+                )
+            }
+
+            // Process ARKit scene depth if available and recording
+            if let sceneDepth = frame.sceneDepth {
+                let sensorSec = CMTimeGetSeconds(pts)
+                lidarDepthRecorder?.appendARKitDepthMap(
+                    sceneDepth.depthMap,
+                    intrinsics: frame.camera.intrinsics,
+                    sensorSec: sensorSec
+                )
+                lidarDepthFrameCount += 1
+                if firstDepthSensorSec == nil {
+                    firstDepthSensorSec = sensorSec
+                }
+                latestDepthSensorSec = sensorSec
+            }
+        }
+
+        enqueueARKitPreview(frame, pts: pts)
+
+        guard arkitFrameCount % 30 == 0 else { return }
+        setStatus("ARKit Frames")
+    }
+
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        os_log("ARSession failed: %@", type: .error, error.localizedDescription)
+        DispatchQueue.main.async {
+            self.showError(msg: "ARKit session error: \(error.localizedDescription)")
+        }
+    }
+
+    func sessionWasInterrupted(_ session: ARSession) {
+        os_log("ARSession interrupted", type: .info)
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession) {
+        os_log("ARSession interruption ended", type: .info)
+    }
+
+    private func enqueueARKitPreview(_ frame: ARFrame, pts: CMTime) {
+        guard let displayLayer = arkitDisplayLayer else { return }
+        guard !arkitPreviewEnqueuePending else { return }
+        arkitPreviewEnqueuePending = true
+
+        DispatchQueue.main.async { [weak self, weak displayLayer] in
+            defer {
+                self?.arkitPreviewEnqueuePending = false
+            }
+            guard let displayLayer else { return }
+            if displayLayer.status == .failed {
+                displayLayer.flush()
+            }
+            guard displayLayer.isReadyForMoreMediaData else { return }
+
+            let pixelBuffer = frame.capturedImage
+            var formatDesc: CMFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescriptionOut: &formatDesc
+            )
+            guard let formatDesc = formatDesc else { return }
+
+            var timingInfo = CMSampleTimingInfo(
+                duration: CMTimeMake(value: 1, timescale: 30),
+                presentationTimeStamp: pts,
+                decodeTimeStamp: .invalid
+            )
+            var sampleBuffer: CMSampleBuffer?
+            CMSampleBufferCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                dataReady: true,
+                makeDataReadyCallback: nil,
+                refcon: nil,
+                formatDescription: formatDesc,
+                sampleTiming: &timingInfo,
+                sampleBufferOut: &sampleBuffer
+            )
+            if let sampleBuffer = sampleBuffer {
+                displayLayer.enqueue(sampleBuffer)
+            }
+        }
+    }
+
+    private func arkitRecordingSlotIfFrameShouldBeWritten(_ presentationTime: CMTime) -> Int64? {
+        let sensorSec = CMTimeGetSeconds(presentationTime)
+        guard sensorSec.isFinite else { return nil }
+
+        if recordingGridOriginSec == nil {
+            recordingGridOriginSec = sensorSec
+        }
+        guard let originSec = recordingGridOriginSec else { return nil }
+
+        let targetFPS = targetRecordingFrameRate(for: recorderSettings.arkitCamera)
+        let slot = Int64((max(sensorSec - originSec, 0) * targetFPS).rounded())
+        guard arkitLastRecordSlot != slot else { return nil }
+        arkitLastRecordSlot = slot
+        return slot
     }
 
     func captureOutput(
@@ -3505,6 +4188,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return labels.isEmpty ? ["3840x2160", "1920x1440", "1920x1080", "1280x960", "1280x720", "640x480"] : labels
     }
 
+    private func arkitResolutionOptions(for preferredResolution: String) -> [String] {
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        let options = formats.compactMap { format -> (label: String, area: Int)? in
+            let width = Int(format.imageResolution.width)
+            let height = Int(format.imageResolution.height)
+            guard width > 0, height > 0 else { return nil }
+            guard CameraStreamRecorder.isRecordableMP4Resolution(width: width, height: height) else { return nil }
+            return ("\(width)x\(height)", width * height)
+        }
+
+        let unique = Dictionary(options.map { ($0.label, $0.area) }, uniquingKeysWith: max)
+        let sorted = unique.sorted { $0.value > $1.value }
+        var labels = sorted.map(\.key)
+        let preferred = preferredResolution
+        if !labels.contains(preferred) && preferred.contains("x") {
+            labels.insert(preferred, at: 0)
+        }
+        return labels.isEmpty ? ["1920x1440", "1280x720"] : labels
+    }
+
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
         if connection.isVideoOrientationSupported {
             connection.videoOrientation = .landscapeRight
@@ -3567,6 +4270,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         diagnosticLayer?.frame = bounds.insetBy(dx: 24, dy: 24)
         singlePreviewView?.frame = bounds
         singlePreviewLayer?.frame = bounds
+
+        if arkitDisplayLayer != nil {
+            layoutSampleBufferDisplayLayer(arkitDisplayLayer, in: bounds)
+            return
+        }
 
         if previewDebugMode != .dual {
             layoutSampleBufferDisplayLayer(wideDisplayLayer, in: bounds)
@@ -3703,6 +4411,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         cameraStatusBadges["front"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["depth"].map { sceneView.bringSubviewToFront($0) }
         captureStatusBadges["summary"].map { view.bringSubviewToFront($0) }
+        if let modeBadge {
+            view.bringSubviewToFront(modeBadge)
+        }
         if let sensorMonitorBar {
             view.bringSubviewToFront(sensorMonitorBar)
         }
@@ -3761,6 +4472,95 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func startRecordingAfterPermissionChecks(startClock: CFTimeInterval) {
+        if isARKitMode {
+            guard isConfigured, arSession != nil else {
+                startStopButton.isEnabled = true
+                showError(msg: "ARKit session is not ready yet.")
+                return
+            }
+
+            guard createFiles() else {
+                startStopButton.isEnabled = true
+                showError(msg: "Failed to create the recording directory.")
+                return
+            }
+            logRecordingStartStep("files", startClock: startClock)
+
+            sessionQueue.async {
+                self.resetRecordingSamplingState()
+                self.arkitLastRecordSlot = nil
+
+                let arSettings = self.recorderSettings.arkitCamera
+                let captureFPS = self.arkitActiveFrameRate()
+                let targetFPS = self.targetRecordingFrameRate(for: arSettings)
+                let resolution = self.arkitActiveResolution()
+
+                if let device = self.arkitCaptureDevice {
+                    do {
+                        try self.configureARKitDeviceForPreview(device, settings: arSettings)
+                    } catch {
+                        os_log("Failed to apply ARKit recording settings: %@", type: .error, error.localizedDescription)
+                    }
+                }
+
+                self.arkitRecorder = ARKitFrameRecorder(
+                    videoURL: self.outDirURL.appendingPathComponent("wide.mp4"),
+                    infoURL: self.outDirURL.appendingPathComponent("arkit_pose.csv"),
+                    targetFrameRate: targetFPS,
+                    captureFrameRate: captureFPS
+                )
+                self.arkitRecorder?.writeDeviceFormat(resolution: resolution)
+                self.logRecordingStartStep("arkit_recorder", startClock: startClock)
+
+                let sensorOptions = SensorStreamRecorder.Options(
+                    imuEnabled: self.recorderSettings.imuEnabled,
+                    deviceMotionEnabled: self.recorderSettings.deviceMotionEnabled,
+                    magnetometerEnabled: self.recorderSettings.magnetometerEnabled,
+                    barometerEnabled: self.recorderSettings.barometerEnabled
+                )
+                if sensorOptions.imuEnabled || sensorOptions.deviceMotionEnabled || sensorOptions.magnetometerEnabled || sensorOptions.barometerEnabled {
+                    let sensorRecorder = SensorStreamRecorder()
+                    sensorRecorder.start(in: self.outDirURL, options: sensorOptions)
+                    self.sensorRecorder = sensorRecorder
+                }
+                self.logRecordingStartStep("sensors", startClock: startClock)
+
+                if self.recorderSettings.audioEnabled {
+                    self.audioRecorder = AudioStreamRecorder(
+                        audioURL: self.outDirURL.appendingPathComponent("audio.m4a"),
+                        infoURL: self.outDirURL.appendingPathComponent("audio_info.csv")
+                    )
+                }
+                self.logRecordingStartStep("audio_recorder", startClock: startClock)
+
+                if self.recorderSettings.lidarDepthEnabled,
+                   ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                    self.lidarDepthRecorder = LiDARDepthStreamRecorder(outputDirectory: self.outDirURL)
+                }
+                self.logRecordingStartStep("lidar_depth_recorder", startClock: startClock)
+
+                DispatchQueue.main.async {
+                    self.startTime = Date()
+                    self.freeRecordingLimitStopRequested = false
+                    self.toggleRecording(val: true)
+                    if self.recorderSettings.geoLocationEnabled {
+                        self.startLocationRecording()
+                    }
+                    self.updateTime()
+                    self.recordingTimer = Timer.scheduledTimer(
+                        timeInterval: 1.0,
+                        target: self,
+                        selector: #selector(self.updateTime),
+                        userInfo: nil,
+                        repeats: true
+                    )
+                    self.startStopButton.isEnabled = true
+                    self.logRecordingStartStep("ui_recording", startClock: startClock)
+                }
+            }
+            return
+        }
+
         let captureSessionReady = needsRunningCaptureSession ? session.isRunning : true
         guard isConfigured && captureSessionReady else {
             startStopButton.isEnabled = true
@@ -3912,6 +4712,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 audioRecorder.finish { group.leave() }
             }
             self.lidarDepthRecorder?.finish()
+            if let arkitRecorder = self.arkitRecorder {
+                group.enter()
+                arkitRecorder.finish { group.leave() }
+            }
             group.notify(queue: self.sessionQueue) {
                 self.writeCaptureMetaJSON(state: "finished")
                 self.wideRecorder = nil
@@ -3920,6 +4724,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.frontRecorder = nil
                 self.audioRecorder = nil
                 self.lidarDepthRecorder = nil
+                self.arkitRecorder = nil
+                self.arkitLastRecordSlot = nil
                 DispatchQueue.main.async {
                     self.updateSize()
                     if showUpgradePromptAfterFinish {
@@ -4031,6 +4837,33 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         cameraStatusRows["front"] = frontBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["depth"] = depthBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+
+        // Mode badge — shows capture mode + tracking state
+        let modeBadgeView = UIView()
+        modeBadgeView.translatesAutoresizingMaskIntoConstraints = false
+        modeBadgeView.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        modeBadgeView.layer.cornerRadius = 14
+        modeBadgeView.layer.cornerCurve = .continuous
+        modeBadgeView.layer.borderWidth = 1
+        modeBadgeView.layer.borderColor = UIColor.white.withAlphaComponent(0.15).cgColor
+        view.addSubview(modeBadgeView)
+        let modeLabel = UILabel()
+        modeLabel.translatesAutoresizingMaskIntoConstraints = false
+        modeLabel.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+        modeLabel.textColor = .white
+        modeLabel.textAlignment = .center
+        modeBadgeView.addSubview(modeLabel)
+        NSLayoutConstraint.activate([
+            modeLabel.leadingAnchor.constraint(equalTo: modeBadgeView.leadingAnchor, constant: 12),
+            modeLabel.trailingAnchor.constraint(equalTo: modeBadgeView.trailingAnchor, constant: -12),
+            modeLabel.topAnchor.constraint(equalTo: modeBadgeView.topAnchor, constant: 4),
+            modeLabel.bottomAnchor.constraint(equalTo: modeBadgeView.bottomAnchor, constant: -4),
+
+            modeBadgeView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            modeBadgeView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
+        ])
+        modeBadge = modeBadgeView
+        modeBadgeLabel = modeLabel
 
         let countdownLabel = UILabel()
         countdownLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -4304,7 +5137,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         title: String,
         items: [String],
         selectedValue: String,
-        compact: Bool = false
+        compact: Bool = false,
+        onChange: ((String) -> Void)? = nil
     ) {
         let row = UIStackView()
         row.axis = .horizontal
@@ -4327,6 +5161,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             UIAction(title: item, state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
                 button?.accessibilityValue = item
                 button?.configuration = self?.settingsMenuConfiguration(title: item, compact: compact)
+                onChange?(item)
             }
         })
         button.showsMenuAsPrimaryAction = true
@@ -4408,12 +5243,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         resolutionItems: [String],
         defaultLensPosition: Double,
         available: Bool,
-        unavailableReason: String? = nil
+        unavailableReason: String? = nil,
+        showEnabledSwitch: Bool = true
     ) {
         addSettingsSubsectionTitle(
             to: stack,
             title: title,
-            switchKey: "\(keyPrefix).enabled",
+            switchKey: showEnabledSwitch ? "\(keyPrefix).enabled" : nil,
             isOn: settings.enabled && available,
             enabled: available,
             detail: unavailableReason
@@ -4839,70 +5675,43 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         addSettingsHeader(to: stack)
         addPurchaseSection(to: stack)
+
+        addSettingsSectionTitle(to: stack, title: "Mode")
+        let arkitAvailable = ARWorldTrackingConfiguration.isSupported
+        let initialMode = recorderSettings.captureMode == .arkit && arkitAvailable ? "ARKit" : "Standard"
+
+        // Camera section container — rebuilt when mode changes
+        let cameraContainer = UIStackView()
+        cameraContainer.axis = .vertical
+        cameraContainer.spacing = 10
+
+        addSettingsMenuRow(
+            to: stack,
+            key: "captureMode",
+            title: "Capture Mode",
+            items: arkitAvailable ? ["Standard", "ARKit"] : ["Standard"],
+            selectedValue: initialMode,
+            compact: false,
+            onChange: { [weak self, weak cameraContainer] newMode in
+                guard let self = self, let cameraContainer = cameraContainer else { return }
+                let isARK = newMode == "ARKit"
+                cameraContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+                self.cameraSettingsGroups.removeAll()
+                self.settingsSwitches = self.settingsSwitches.filter { !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
+                self.settingsSliders = self.settingsSliders.filter { !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
+                self.settingsSliderValueLabels = self.settingsSliderValueLabels.filter { !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
+                self.settingsMenuButtons = self.settingsMenuButtons.filter { $0.key == "captureMode" }
+                self.populateCameraSettings(container: cameraContainer, isARKMode: isARK, arkitAvailable: arkitAvailable)
+            }
+        )
+        if !arkitAvailable {
+            addSettingsFootnote(to: stack, text: "ARKit is not available on this device. Only Standard mode is supported.")
+        }
+
         addSettingsSectionTitle(to: stack, title: "Camera")
-        let capabilities = cameraCapabilities()
-        addSettingsFootnote(to: stack, text: cameraCapabilityText(capabilities))
-        let requiresMultiCamResolutionOptions = enabledCameraCount(in: recorderSettings) > 1 && capabilities.supportsMultiCam
-        addCameraSettingsSection(
-            to: stack,
-            title: "Wide Camera",
-            keyPrefix: "wide",
-            settings: recorderSettings.wide,
-            resolutionItems: cameraResolutionOptions(
-                for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-                requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            ),
-            defaultLensPosition: defaultWideFixedFocusLensPosition,
-            available: capabilities.hasWide,
-            unavailableReason: capabilities.hasWide ? nil : "Not available on this device"
-        )
-        addCameraSettingsSection(
-            to: stack,
-            title: "Ultra-wide Camera",
-            keyPrefix: "ultra",
-            settings: recorderSettings.ultraWide,
-            resolutionItems: cameraResolutionOptions(
-                for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
-                requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            ),
-            defaultLensPosition: defaultUltraWideFixedFocusLensPosition,
-            available: capabilities.hasUltraWide,
-            unavailableReason: capabilities.hasUltraWide ? nil : "Not available on this device"
-        )
-        addCameraSettingsSection(
-            to: stack,
-            title: "Telephoto Camera",
-            keyPrefix: "telephoto",
-            settings: recorderSettings.telephoto,
-            resolutionItems: cameraResolutionOptions(
-                for: telephotoDevice ?? AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back),
-                requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            ),
-            defaultLensPosition: defaultTelephotoFixedFocusLensPosition,
-            available: capabilities.hasTelephoto,
-            unavailableReason: capabilities.hasTelephoto ? nil : "Not available on this device"
-        )
-        addCameraSettingsSection(
-            to: stack,
-            title: "Front Camera",
-            keyPrefix: "front",
-            settings: recorderSettings.front,
-            resolutionItems: cameraResolutionOptions(
-                for: frontDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
-                requiresMultiCamFormat: requiresMultiCamResolutionOptions
-            ),
-            defaultLensPosition: defaultFrontFixedFocusLensPosition,
-            available: capabilities.hasFront,
-            unavailableReason: capabilities.hasFront ? nil : "Not available on this device"
-        )
-        addSettingsRow(
-            to: stack,
-            key: "lidarDepth",
-            title: "LiDAR Depth",
-            detail: "Filtered 16-bit PNG depth in millimeters; camera Hz is capped at 10",
-            isOn: recorderSettings.lidarDepthEnabled && capabilities.hasLiDAR,
-            enabled: capabilities.hasLiDAR
-        )
+        stack.addArrangedSubview(cameraContainer)
+        self.settingsCameraContainer = cameraContainer
+        self.populateCameraSettings(container: cameraContainer, isARKMode: initialMode == "ARKit", arkitAvailable: arkitAvailable)
 
         addSettingsSectionTitle(to: stack, title: "Sensors")
         addSettingsRow(to: stack, key: "imu", title: "IMU", detail: "Raw accel + gyro", isOn: recorderSettings.imuEnabled)
@@ -4915,6 +5724,97 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             scrollView.flashScrollIndicators()
+        }
+    }
+
+    private func populateCameraSettings(container: UIStackView, isARKMode: Bool, arkitAvailable: Bool) {
+        let capabilities = cameraCapabilities()
+
+        if isARKMode {
+            addSettingsFootnote(to: container, text: "ARKit captures a single camera stream with 6-DOF pose tracking. Multi-camera is not available in ARKit mode.")
+            let arkitResolutionItems = arkitResolutionOptions(for: recorderSettings.arkitCamera.resolution)
+            addCameraSettingsSection(
+                to: container,
+                title: "AR Camera",
+                keyPrefix: "arkit",
+                settings: recorderSettings.arkitCamera,
+                resolutionItems: arkitResolutionItems,
+                defaultLensPosition: defaultARKitFixedFocusLensPosition,
+                available: arkitAvailable,
+                unavailableReason: arkitAvailable ? nil : "ARKit not available",
+                showEnabledSwitch: false
+            )
+            addSettingsRow(
+                to: container,
+                key: "lidarDepth",
+                title: "ARKit Depth",
+                detail: "Scene depth from LiDAR; requires LiDAR-equipped device",
+                isOn: recorderSettings.lidarDepthEnabled && capabilities.hasLiDAR,
+                enabled: capabilities.hasLiDAR
+            )
+        } else {
+            addSettingsFootnote(to: container, text: cameraCapabilityText(capabilities))
+            let requiresMultiCamResolutionOptions = enabledCameraCount(in: recorderSettings) > 1 && capabilities.supportsMultiCam
+            addCameraSettingsSection(
+                to: container,
+                title: "Wide Camera",
+                keyPrefix: "wide",
+                settings: recorderSettings.wide,
+                resolutionItems: cameraResolutionOptions(
+                    for: wideDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                    requiresMultiCamFormat: requiresMultiCamResolutionOptions
+                ),
+                defaultLensPosition: defaultWideFixedFocusLensPosition,
+                available: capabilities.hasWide,
+                unavailableReason: capabilities.hasWide ? nil : "Not available on this device"
+            )
+            addCameraSettingsSection(
+                to: container,
+                title: "Ultra-wide Camera",
+                keyPrefix: "ultra",
+                settings: recorderSettings.ultraWide,
+                resolutionItems: cameraResolutionOptions(
+                    for: ultraWideDevice ?? AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back),
+                    requiresMultiCamFormat: requiresMultiCamResolutionOptions
+                ),
+                defaultLensPosition: defaultUltraWideFixedFocusLensPosition,
+                available: capabilities.hasUltraWide,
+                unavailableReason: capabilities.hasUltraWide ? nil : "Not available on this device"
+            )
+            addCameraSettingsSection(
+                to: container,
+                title: "Telephoto Camera",
+                keyPrefix: "telephoto",
+                settings: recorderSettings.telephoto,
+                resolutionItems: cameraResolutionOptions(
+                    for: telephotoDevice ?? AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back),
+                    requiresMultiCamFormat: requiresMultiCamResolutionOptions
+                ),
+                defaultLensPosition: defaultTelephotoFixedFocusLensPosition,
+                available: capabilities.hasTelephoto,
+                unavailableReason: capabilities.hasTelephoto ? nil : "Not available on this device"
+            )
+            addCameraSettingsSection(
+                to: container,
+                title: "Front Camera",
+                keyPrefix: "front",
+                settings: recorderSettings.front,
+                resolutionItems: cameraResolutionOptions(
+                    for: frontDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+                    requiresMultiCamFormat: requiresMultiCamResolutionOptions
+                ),
+                defaultLensPosition: defaultFrontFixedFocusLensPosition,
+                available: capabilities.hasFront,
+                unavailableReason: capabilities.hasFront ? nil : "Not available on this device"
+            )
+            addSettingsRow(
+                to: container,
+                key: "lidarDepth",
+                title: "LiDAR Depth",
+                detail: "Filtered 16-bit PNG depth in millimeters; camera Hz is capped at 10",
+                isOn: recorderSettings.lidarDepthEnabled && capabilities.hasLiDAR,
+                enabled: capabilities.hasLiDAR
+            )
         }
     }
 
@@ -5101,7 +6001,32 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     @objc private func saveSettingsOverlay() {
+        let captureMode: CaptureMode = {
+            let modeValue = settingsMenuButtons["captureMode"]?.accessibilityValue ?? "Standard"
+            return modeValue == "ARKit" ? .arkit : .standard
+        }()
+
+        let arkitCameraSettings = CameraCaptureSettings(
+            enabled: true,
+            resolution: selectedSettingsValue(for: "arkit.resolution", fallback: recorderSettings.arkitCamera.resolution),
+            frameRate: selectedSettingsValue(for: "arkit.frameRate", fallback: recorderSettings.arkitCamera.frameRate),
+            autoFocus: settingsSwitches["arkit.autoFocus"]?.isOn ?? recorderSettings.arkitCamera.autoFocus,
+            autoExposure: settingsSwitches["arkit.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: recorderSettings.arkitCamera),
+            maxExposureDurationMS: selectedSettingsValue(
+                for: "arkit.maxExposure",
+                fallback: maxExposureDurationLabel(for: recorderSettings.arkitCamera)
+            ),
+            fixedFocusLensPosition: selectedSliderValue(
+                for: "arkit.fixedFocus",
+                fallback: clampedLensPosition(
+                    recorderSettings.arkitCamera.fixedFocusLensPosition,
+                    fallback: defaultARKitFixedFocusLensPosition
+                )
+            )
+        )
+
         recorderSettings = RecorderSettings(
+            captureMode: captureMode,
             wide: CameraCaptureSettings(
                 enabled: settingsSwitches["wide.enabled"]?.isOn ?? recorderSettings.wide.enabled,
                 resolution: selectedSettingsValue(for: "wide.resolution", fallback: recorderSettings.wide.resolution),
@@ -5174,6 +6099,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     )
                 )
             ),
+            arkitCamera: arkitCameraSettings,
             imuEnabled: settingsSwitches["imu"]?.isOn ?? recorderSettings.imuEnabled,
             magnetometerEnabled: settingsSwitches["mag"]?.isOn ?? recorderSettings.magnetometerEnabled,
             barometerEnabled: settingsSwitches["baro"]?.isOn ?? recorderSettings.barometerEnabled,
@@ -5192,6 +6118,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func resetPreviewSessionForSettingsChange() {
         startStopButton.isEnabled = false
         sessionQueue.async {
+            self.tearDownARKitSession()
+
             if self.observesSessionRuntimeErrors {
                 NotificationCenter.default.removeObserver(
                     self,
@@ -5262,6 +6190,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc private func hideSettingsOverlay() {
         settingsOverlayView?.removeFromSuperview()
         settingsOverlayView = nil
+        settingsCameraContainer = nil
     }
 
     private func initializeUI() {
@@ -5334,34 +6263,49 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func refreshOverlayStatus() {
-        cameraStatusRows["wide"]?.text = cameraStatusText(
-            frameCount: wideFrameCount,
-            device: wideDevice,
-            fallbackName: "wide.mp4",
-            settings: recorderSettings.wide
-        )
-        updateCameraStatusColor(key: "wide", enabled: recorderSettings.wide.enabled, activeRecorder: wideRecorder != nil)
-        cameraStatusRows["ultra"]?.text = cameraStatusText(
-            frameCount: ultraWideFrameCount,
-            device: ultraWideDevice,
-            fallbackName: "ultrawide.mp4",
-            settings: recorderSettings.ultraWide
-        )
-        updateCameraStatusColor(key: "ultra", enabled: recorderSettings.ultraWide.enabled, activeRecorder: ultraWideRecorder != nil)
-        cameraStatusRows["telephoto"]?.text = cameraStatusText(
-            frameCount: telephotoFrameCount,
-            device: telephotoDevice,
-            fallbackName: "telephoto.mp4",
-            settings: recorderSettings.telephoto
-        )
-        updateCameraStatusColor(key: "telephoto", enabled: recorderSettings.telephoto.enabled, activeRecorder: telephotoRecorder != nil)
-        cameraStatusRows["front"]?.text = cameraStatusText(
-            frameCount: frontFrameCount,
-            device: frontDevice,
-            fallbackName: "front.mp4",
-            settings: recorderSettings.front
-        )
-        updateCameraStatusColor(key: "front", enabled: recorderSettings.front.enabled, activeRecorder: frontRecorder != nil)
+        if isARKitMode {
+            let res = arkitActiveResolution()
+            let hz = arkitFrameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", targetRecordingFrameRate(for: recorderSettings.arkitCamera))
+            let trackingLabel = shortTrackingStateLabel(arkitTrackingState)
+            let recTag = isRecording ? "REC" : "preview"
+            cameraStatusRows["wide"]?.text = "ARKit \(Int(res.width))x\(Int(res.height)) | \(hz) | \(recTag) | \(trackingLabel)"
+            updateCameraStatusColor(key: "wide", enabled: true, activeRecorder: arkitRecorder != nil)
+            cameraStatusRows["ultra"]?.text = "ARKit OFF"
+            updateCameraStatusColor(key: "ultra", enabled: false, activeRecorder: false)
+            cameraStatusRows["telephoto"]?.text = "ARKit OFF"
+            updateCameraStatusColor(key: "telephoto", enabled: false, activeRecorder: false)
+            cameraStatusRows["front"]?.text = "ARKit OFF"
+            updateCameraStatusColor(key: "front", enabled: false, activeRecorder: false)
+        } else {
+            cameraStatusRows["wide"]?.text = cameraStatusText(
+                frameCount: wideFrameCount,
+                device: wideDevice,
+                fallbackName: "wide.mp4",
+                settings: recorderSettings.wide
+            )
+            updateCameraStatusColor(key: "wide", enabled: recorderSettings.wide.enabled, activeRecorder: wideRecorder != nil)
+            cameraStatusRows["ultra"]?.text = cameraStatusText(
+                frameCount: ultraWideFrameCount,
+                device: ultraWideDevice,
+                fallbackName: "ultrawide.mp4",
+                settings: recorderSettings.ultraWide
+            )
+            updateCameraStatusColor(key: "ultra", enabled: recorderSettings.ultraWide.enabled, activeRecorder: ultraWideRecorder != nil)
+            cameraStatusRows["telephoto"]?.text = cameraStatusText(
+                frameCount: telephotoFrameCount,
+                device: telephotoDevice,
+                fallbackName: "telephoto.mp4",
+                settings: recorderSettings.telephoto
+            )
+            updateCameraStatusColor(key: "telephoto", enabled: recorderSettings.telephoto.enabled, activeRecorder: telephotoRecorder != nil)
+            cameraStatusRows["front"]?.text = cameraStatusText(
+                frameCount: frontFrameCount,
+                device: frontDevice,
+                fallbackName: "front.mp4",
+                settings: recorderSettings.front
+            )
+            updateCameraStatusColor(key: "front", enabled: recorderSettings.front.enabled, activeRecorder: frontRecorder != nil)
+        }
         cameraStatusRows["depth"]?.text = depthStatusText()
         updateCameraStatusColor(key: "depth", enabled: recorderSettings.lidarDepthEnabled, activeRecorder: lidarDepthRecorder != nil)
 
@@ -5378,7 +6322,50 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         captureStatusRows["size"]?.text = fileSizeLabel.text ?? "? / ?"
         captureStatusRows["mode"]?.text = isRecording ? "Recording" : "Preview"
         captureStatusRows["write"]?.text = isRecording ? recordingDataStatusText() : "mp4 + csv + m4a"
+        updateModeBadge()
         updateCaptureSummaryLabel()
+    }
+
+    private func shortTrackingStateLabel(_ state: ARCamera.TrackingState) -> String {
+        switch state {
+        case .notAvailable: return "N/A"
+        case .limited: return "Limited"
+        case .normal: return "Normal"
+        }
+    }
+
+    private func updateModeBadge() {
+        guard let label = modeBadgeLabel, let badge = modeBadge else { return }
+        if isARKitMode {
+            let tracking = arkitTrackingState
+            let trackingText: String
+            let trackingColor: UIColor
+            switch tracking {
+            case .normal:
+                trackingText = "Normal"
+                trackingColor = .systemGreen
+            case .limited:
+                trackingText = "Limited"
+                trackingColor = .systemYellow
+            case .notAvailable:
+                trackingText = "Not Available"
+                trackingColor = UIColor.white.withAlphaComponent(0.45)
+            }
+            let modeText = "ARKit"
+            let separator = "  |  "
+            let fullText = "\(modeText)\(separator)\(trackingText)"
+            let attr = NSMutableAttributedString(string: fullText)
+            attr.addAttribute(.foregroundColor, value: UIColor.systemTeal, range: NSRange(location: 0, length: modeText.count))
+            attr.addAttribute(.foregroundColor, value: UIColor.white.withAlphaComponent(0.35), range: NSRange(location: modeText.count, length: separator.count))
+            attr.addAttribute(.foregroundColor, value: trackingColor, range: NSRange(location: modeText.count + separator.count, length: trackingText.count))
+            label.attributedText = attr
+            badge.layer.borderColor = isRecording ? UIColor.systemTeal.withAlphaComponent(0.5).cgColor : UIColor.white.withAlphaComponent(0.15).cgColor
+        } else {
+            label.attributedText = nil
+            label.text = "Standard"
+            label.textColor = UIColor.white.withAlphaComponent(0.6)
+            badge.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+        }
     }
 
     private func cameraStatusText(frameCount: Int, device: AVCaptureDevice?, fallbackName: String, settings: CameraCaptureSettings) -> String {
@@ -5407,6 +6394,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func depthStatusText() -> String {
         guard recorderSettings.lidarDepthEnabled else {
             return "DEPTH OFF"
+        }
+        if isARKitMode {
+            let resolution = recorderSettings.arkitCamera.resolution
+            return "DEPTH \(resolution) | \(depthStatusValue())"
         }
         guard let output = lidarDepthOutput else {
             return "DEPTH --"
@@ -5699,6 +6690,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func currentRecordingSettingsJSON() -> [String: Any] {
         return [
+            "capture_mode": recorderSettings.captureMode.rawValue,
             "wide": cameraSettingsJSON(
                 recorderSettings.wide,
                 defaultLensPosition: defaultWideFixedFocusLensPosition
@@ -5714,6 +6706,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "front": cameraSettingsJSON(
                 recorderSettings.front,
                 defaultLensPosition: defaultFrontFixedFocusLensPosition
+            ),
+            "arkit_camera": cameraSettingsJSON(
+                recorderSettings.arkitCamera,
+                defaultLensPosition: defaultARKitFixedFocusLensPosition
             ),
             "imu_enabled": recorderSettings.imuEnabled,
             "magnetometer_enabled": recorderSettings.magnetometerEnabled,
@@ -5746,26 +6742,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func recordingStartJSON() -> [String: Any] {
-        let wideTargetFPS = targetRecordingFrameRate(for: recorderSettings.wide)
-        let ultraTargetFPS = targetRecordingFrameRate(for: recorderSettings.ultraWide)
-        let telephotoTargetFPS = targetRecordingFrameRate(for: recorderSettings.telephoto)
-        let frontTargetFPS = targetRecordingFrameRate(for: recorderSettings.front)
-        let wideCaptureFPS = activeFrameRate(for: wideDevice, settings: recorderSettings.wide)
-        let ultraCaptureFPS = activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide)
-        let telephotoCaptureFPS = activeFrameRate(for: telephotoDevice, settings: recorderSettings.telephoto)
-        let frontCaptureFPS = activeFrameRate(for: frontDevice, settings: recorderSettings.front)
-        return [
+        var result: [String: Any] = [
             "sampling_rule": "Cameras run at capture_fps; MP4/info rows are downsampled onto a shared host-time record_slot grid at target_fps.",
-            "wide_target_fps": wideTargetFPS,
-            "wide_capture_fps": wideCaptureFPS,
-            "ultrawide_target_fps": ultraTargetFPS,
-            "ultrawide_capture_fps": ultraCaptureFPS,
-            "telephoto_target_fps": telephotoTargetFPS,
-            "telephoto_capture_fps": telephotoCaptureFPS,
-            "front_target_fps": frontTargetFPS,
-            "front_capture_fps": frontCaptureFPS,
             "lidar_depth_enabled": recorderSettings.lidarDepthEnabled
         ]
+        if recorderSettings.captureMode == .arkit {
+            result["arkit_target_fps"] = targetRecordingFrameRate(for: recorderSettings.arkitCamera)
+            result["arkit_capture_fps"] = arkitActiveFrameRate()
+        } else {
+            result["wide_target_fps"] = targetRecordingFrameRate(for: recorderSettings.wide)
+            result["wide_capture_fps"] = activeFrameRate(for: wideDevice, settings: recorderSettings.wide)
+            result["ultrawide_target_fps"] = targetRecordingFrameRate(for: recorderSettings.ultraWide)
+            result["ultrawide_capture_fps"] = activeFrameRate(for: ultraWideDevice, settings: recorderSettings.ultraWide)
+            result["telephoto_target_fps"] = targetRecordingFrameRate(for: recorderSettings.telephoto)
+            result["telephoto_capture_fps"] = activeFrameRate(for: telephotoDevice, settings: recorderSettings.telephoto)
+            result["front_target_fps"] = targetRecordingFrameRate(for: recorderSettings.front)
+            result["front_capture_fps"] = activeFrameRate(for: frontDevice, settings: recorderSettings.front)
+        }
+        return result
     }
 
     private func cameraExtrinsicsJSON() -> [String: Any] {
@@ -5841,6 +6835,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "updated_utc_sec": utcSec,
             "recording_settings": currentRecordingSettingsJSON(),
             "recording_start": recordingStartJSON(),
+            "capture_mode": recorderSettings.captureMode.rawValue,
             "camera_extrinsics": cameraExtrinsicsJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
@@ -5850,23 +6845,45 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             ],
             "streams": [
                 "wide_camera": [
-                    "enabled": recorderSettings.wide.enabled,
+                    "enabled": recorderSettings.wide.enabled || recorderSettings.captureMode == .arkit,
                     "media_file": "wide.mp4",
-                    "index_file": "wide_info.csv",
-                    "codec": videoCodecName(for: recorderSettings.wide),
-                    "target_fps": targetRecordingFrameRate(for: recorderSettings.wide),
-                    "capture_fps": activeFrameRate(for: wideDevice, settings: recorderSettings.wide),
-                    "requested_resolution": recorderSettings.wide.resolution,
-                    "auto_focus": recorderSettings.wide.autoFocus,
-                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.wide),
-                    "fixed_focus_lens_position_requested": clampedLensPosition(
-                        recorderSettings.wide.fixedFocusLensPosition,
-                        fallback: defaultWideFixedFocusLensPosition
-                    ),
-                    "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.wide),
+                    "index_file": recorderSettings.captureMode == .arkit ? "arkit_pose.csv" : "wide_info.csv",
+                    "source": recorderSettings.captureMode == .arkit ? "ARKit" : "AVCaptureMultiCamSession",
+                    "codec": recorderSettings.captureMode == .arkit
+                        ? (arkitRecorder?.codecName ?? "h264")
+                        : videoCodecName(for: recorderSettings.wide),
+                    "target_fps": recorderSettings.captureMode == .arkit
+                        ? targetRecordingFrameRate(for: recorderSettings.arkitCamera)
+                        : targetRecordingFrameRate(for: recorderSettings.wide),
+                    "capture_fps": recorderSettings.captureMode == .arkit
+                        ? arkitActiveFrameRate()
+                        : activeFrameRate(for: wideDevice, settings: recorderSettings.wide),
+                    "requested_resolution": recorderSettings.captureMode == .arkit
+                        ? recorderSettings.arkitCamera.resolution
+                        : recorderSettings.wide.resolution,
+                    "auto_focus": recorderSettings.captureMode == .arkit
+                        ? recorderSettings.arkitCamera.autoFocus
+                        : recorderSettings.wide.autoFocus,
+                    "auto_exposure": recorderSettings.captureMode == .arkit
+                        ? isAutoExposureEnabled(for: recorderSettings.arkitCamera)
+                        : isAutoExposureEnabled(for: recorderSettings.wide),
+                    "fixed_focus_lens_position_requested": recorderSettings.captureMode == .arkit
+                        ? clampedLensPosition(
+                            recorderSettings.arkitCamera.fixedFocusLensPosition,
+                            fallback: defaultARKitFixedFocusLensPosition
+                        )
+                        : clampedLensPosition(
+                            recorderSettings.wide.fixedFocusLensPosition,
+                            fallback: defaultWideFixedFocusLensPosition
+                        ),
+                    "max_exposure_duration_sec": recorderSettings.captureMode == .arkit
+                        ? maxExposureDurationSeconds(for: recorderSettings.arkitCamera)
+                        : maxExposureDurationSeconds(for: recorderSettings.wide),
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                    "schema": recorderSettings.captureMode == .arkit
+                        ? ["frame_index", "record_slot", "sensor_sec", "utc_sec", "tx_m", "ty_m", "tz_m", "qw", "qx", "qy", "qz", "exposure_sec", "tracking_state", "fx_px", "fy_px", "cx_px", "cy_px", "width_px", "height_px"]
+                        : ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "ultrawide_camera": [
                     "enabled": recorderSettings.ultraWide.enabled,
@@ -5907,7 +6924,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "front_camera": [
-                    "enabled": recorderSettings.front.enabled,
+                    "enabled": recorderSettings.front.enabled && recorderSettings.captureMode == .standard,
                     "media_file": "front.mp4",
                     "index_file": "front_info.csv",
                     "codec": videoCodecName(for: recorderSettings.front),
@@ -5924,6 +6941,47 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                ],
+                "arkit_pose": [
+                    "enabled": recorderSettings.captureMode == .arkit,
+                    "media_file": "wide.mp4",
+                    "index_file": "arkit_pose.csv",
+                    "codec": arkitRecorder?.codecName ?? "h264",
+                    "target_fps": targetRecordingFrameRate(for: recorderSettings.arkitCamera),
+                    "capture_fps": arkitActiveFrameRate(),
+                    "requested_resolution": recorderSettings.arkitCamera.resolution,
+                    "auto_focus": recorderSettings.arkitCamera.autoFocus,
+                    "auto_exposure": isAutoExposureEnabled(for: recorderSettings.arkitCamera),
+                    "fixed_focus_lens_position_requested": clampedLensPosition(
+                        recorderSettings.arkitCamera.fixedFocusLensPosition,
+                        fallback: defaultARKitFixedFocusLensPosition
+                    ),
+                    "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.arkitCamera),
+                    "world_alignment": "gravity",
+                    "source": "ARKit ARWorldTrackingConfiguration with builtInWideAngleCamera",
+                    "timestamp_column": "sensor_sec",
+                    "utc_column": "utc_sec",
+                    "schema": [
+                        "frame_index",
+                        "record_slot",
+                        "sensor_sec",
+                        "utc_sec",
+                        "tx_m",
+                        "ty_m",
+                        "tz_m",
+                        "qw",
+                        "qx",
+                        "qy",
+                        "qz",
+                        "exposure_sec",
+                        "tracking_state",
+                        "fx_px",
+                        "fy_px",
+                        "cx_px",
+                        "cy_px",
+                        "width_px",
+                        "height_px"
+                    ]
                 ],
                 "audio": [
                     "enabled": recorderSettings.audioEnabled,
