@@ -168,6 +168,8 @@ private final class PurchaseManager {
 }
 
 private final class CameraStreamRecorder {
+    fileprivate static let videoMediaTimeScale: CMTimeScale = 1_000_000
+
     private let videoURL: URL
     private let infoURL: URL
     private let cameraName: String
@@ -274,6 +276,7 @@ private final class CameraStreamRecorder {
         let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
         writeInfoLine("# active_format,\(dimensions.width)x\(dimensions.height),capture_fps,\(String(format: "%.3f", captureFrameRate))")
         writeInfoLine("# recording,target_fps,\(String(format: "%.3f", targetFrameRate)),sampling,host_time_grid")
+        writeInfoLine("# video_media_time_scale,\(Self.videoMediaTimeScale),units_per_second")
         writeInfoLine("# exposure,mode,\(exposureModeLabel(device.exposureMode)),active_max_duration_sec,\(String(format: "%.9f", CMTimeGetSeconds(device.activeMaxExposureDuration)))")
         writeInfoLine("# focus,mode,\(focusModeLabel(device.focusMode)),lens_position,\(String(format: "%.6f", device.lensPosition))")
     }
@@ -318,6 +321,7 @@ private final class CameraStreamRecorder {
             videoCodec = codec
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
+            input.mediaTimeScale = Self.videoMediaTimeScale
             guard writer.canApply(outputSettings: settings, forMediaType: .video),
                   writer.canAdd(input) else {
                 writeInfoLine("# writer_input_failed")
@@ -594,6 +598,7 @@ private final class ARKitFrameRecorder {
     func writeDeviceFormat(resolution: CGSize) {
         writeInfoLine("# active_format,\(Int(resolution.width))x\(Int(resolution.height)),capture_fps,\(String(format: "%.3f", captureFrameRate))")
         writeInfoLine("# recording,target_fps,\(String(format: "%.3f", targetFrameRate)),sampling,host_time_grid")
+        writeInfoLine("# video_media_time_scale,\(CameraStreamRecorder.videoMediaTimeScale),units_per_second")
     }
 
     var codecName: String {
@@ -644,6 +649,7 @@ private final class ARKitFrameRecorder {
             videoCodec = codec
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
+            input.mediaTimeScale = CameraStreamRecorder.videoMediaTimeScale
             guard writer.canApply(outputSettings: settings, forMediaType: .video),
                   writer.canAdd(input) else {
                 writeInfoLine("# writer_input_failed")

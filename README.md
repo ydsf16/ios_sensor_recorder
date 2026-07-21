@@ -59,6 +59,8 @@ ARKit recordings keep `capturedImage` in ARKit's native landscape pixel layout w
 
 RGB pixels and intrinsics stay in the same ARKit-native layout; depth pixels and scaled depth intrinsics use that same layout. Camera pose uses OpenCV RDF axes. This convention matches OpenCV, Rerun pinhole cameras, and the camera model used by Kalibr/maplab. A complete maplab VIO configuration still requires calibrated camera-to-IMU extrinsics and time offset.
 
+Video tracks request a `1,000,000` units-per-second media time scale. Each successfully encoded ARKit frame and its pose row share the same source presentation timestamp; the final MP4 time base should still be verified on the target device.
+
 ### Build and run
 
 1. Open `SensorRecorder.xcodeproj` in Xcode.
@@ -155,6 +157,8 @@ App 锁定为 Landscape Right；ARKit 录制保留 `capturedImage` 的原生横�
 - 四元数顺序：`qw,qx,qy,qz`。
 
 RGB 像素与 RGB 内参保持 ARKit 原生对应；深度像素及缩放后的深度内参使用相同布局；相机 Pose 使用 OpenCV RDF 坐标。可直接对应 OpenCV、Rerun pinhole 和 Kalibr/maplab 相机模型。完整接入 maplab VIO 仍需标定 camera-to-IMU 外参和时间偏移。
+
+视频轨道请求使用每秒 `1,000,000` 单位的媒体时间基。每个成功编码的 ARKit 图像帧与对应 Pose 行复用同一个源 PTS；最终 MP4 时间基仍需在目标真机上复测。
 
 ### 编译运行
 
