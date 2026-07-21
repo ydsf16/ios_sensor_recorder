@@ -6841,6 +6841,25 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return result
     }
 
+    private func coordinateConventionsJSON() -> [String: String] {
+        if recorderSettings.captureMode == .arkit {
+            return [
+                "arkit_world": "right-handed gravity-aligned world; y is up",
+                "recorded_camera": "OpenCV/Rerun RDF: x right, y down, z forward",
+                "pose": "T_world_camera (parent_from_child): p_world = R * p_camera + t",
+                "pixel_coordinates": "origin top-left; x right, y down",
+                "pixel_orientation": "ARKit native landscape pixels; device locked to Landscape Right",
+                "quaternion_order": "qw,qx,qy,qz"
+            ]
+        }
+        return [
+            "recorded_camera": "AVFoundation camera intrinsics aligned to each encoded image; no per-frame world pose",
+            "pixel_coordinates": "origin top-left; x right, y down",
+            "pixel_orientation": "Landscape Right",
+            "camera_extrinsics": "T_reference_from_camera when supplied; see camera_extrinsics"
+        ]
+    }
+
     private func cameraExtrinsicsJSON() -> [String: Any] {
         return [
             "reference": "wide_camera",
@@ -6915,15 +6934,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "recording_settings": currentRecordingSettingsJSON(),
             "recording_start": recordingStartJSON(),
             "capture_mode": recorderSettings.captureMode.rawValue,
-            "coordinate_conventions": [
-                "arkit_world": "right-handed gravity-aligned world; y is up",
-                "recorded_camera": "OpenCV/Rerun RDF: x right, y down, z forward",
-                "pose": "T_world_camera (parent_from_child): p_world = R * p_camera + t",
-                "pixel_orientation": recorderSettings.captureMode == .arkit
-                    ? "ARKit native landscape pixels; device locked to Landscape Right"
-                    : "Landscape Right",
-                "quaternion_order": "qw,qx,qy,qz"
-            ],
+            "coordinate_conventions": coordinateConventionsJSON(),
             "camera_extrinsics": cameraExtrinsicsJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",

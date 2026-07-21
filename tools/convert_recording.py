@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import subprocess
 import sys
@@ -97,8 +98,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video-fps",
         type=float,
-        default=5.0,
-        help="Maximum video image rate written to Rerun. Use 0 to write every frame.",
+        default=0.0,
+        help="Maximum video image rate written to Rerun. Defaults to 0, which writes every frame.",
     )
     parser.add_argument(
         "--depth-pixel-stride",
@@ -157,6 +158,28 @@ def default_output_path(capture_dir: Path) -> Path:
     return capture_dir.with_suffix(".rrd")
 
 
+def detect_capture_mode(capture_dir: Path) -> str:
+    meta_mode: str | None = None
+    meta_path = capture_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            value = meta.get("capture_mode") or meta.get("recording_settings", {}).get("capture_mode")
+            if value in {"standard", "arkit"}:
+                meta_mode = value
+        except (OSError, ValueError, TypeError):
+            print("warning: could not parse capture mode from meta.json", file=sys.stderr)
+
+    has_arkit_pose = (capture_dir / ARKIT_POSE_FILE).exists()
+    detected_mode = "arkit" if has_arkit_pose else "standard"
+    if meta_mode is not None and meta_mode != detected_mode:
+        print(
+            f"warning: meta.json says {meta_mode}, but files indicate {detected_mode}; using file evidence",
+            file=sys.stderr,
+        )
+    return detected_mode
+
+
 def convert_to_rerun(
     capture_dir: Path,
     output_path: Path,
@@ -177,8 +200,10 @@ def convert_to_rerun(
     rr.init(app_id)
     rr.save(str(output_path))
     arkit_pose_path = capture_dir / ARKIT_POSE_FILE
-    is_arkit_mode = arkit_pose_path.exists()
-    send_default_blueprint(rr, is_arkit_mode=is_arkit_mode)
+    capture_mode = detect_capture_mode(capture_dir)
+    is_arkit_mode = capture_mode == "arkit"
+    print(f"info: detected capture mode: {capture_mode}")
+    send_default_blueprint(rr, capture_dir=capture_dir, is_arkit_mode=is_arkit_mode)
     recording_window = recording_sensor_window(capture_dir)
 
     meta_path = capture_dir / "meta.json"
@@ -270,20 +295,22 @@ def convert_to_rerun(
     log_audio_waveform(rr=rr, np=np, capture_dir=capture_dir)
 
 
-def send_default_blueprint(rr: Any, is_arkit_mode: bool) -> None:
+def send_default_blueprint(rr: Any, capture_dir: Path, is_arkit_mode: bool) -> None:
     try:
         import rerun.blueprint as rrb
     except ImportError:
         return
 
+    has_depth = (capture_dir / "lidar_depth_info.csv").exists()
+    spatial_view_items: list[Any] = []
     if is_arkit_mode:
-        spatial_views = rrb.Horizontal(
-            rrb.Spatial2DView(
+        if (capture_dir / "wide.mp4").exists():
+            spatial_view_items.append(rrb.Spatial2DView(
                 name="ARKit Camera",
                 origin="/world/arkit_camera",
                 contents=["/world/arkit_camera/image"],
-            ),
-            rrb.Spatial3DView(
+            ))
+        spatial_view_items.append(rrb.Spatial3DView(
                 name="ARKit 3D Trajectory",
                 origin="/world",
                 contents=[
@@ -292,90 +319,113 @@ def send_default_blueprint(rr: Any, is_arkit_mode: bool) -> None:
                     "/world/trajectory/**",
                 ],
                 background=[28, 31, 36],
-            ),
-            rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
-            column_shares=[2, 3, 2],
-        )
+            ))
     else:
-        spatial_views = rrb.Vertical(
-            rrb.Horizontal(
-                rrb.Spatial2DView(name="Ultra Wide", origin="/camera/ultrawide"),
-                rrb.Spatial2DView(name="Wide", origin="/camera/wide"),
-                rrb.Spatial2DView(name="Telephoto", origin="/camera/telephoto"),
-                rrb.Spatial2DView(name="Front", origin="/camera/front"),
-                rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
-                column_shares=[1, 1, 1, 1, 1],
-            ),
-            rrb.Spatial3DView(name="LiDAR Point Cloud", origin="/lidar/depth/points"),
-            row_shares=[1, 1],
+        view_names = {
+            "ultrawide": "Ultra Wide",
+            "wide": "Wide",
+            "telephoto": "Telephoto",
+            "front": "Front",
+        }
+        for camera_name, (video_name, info_name) in CAMERA_STREAMS.items():
+            if (capture_dir / video_name).exists() and (capture_dir / info_name).exists():
+                spatial_view_items.append(
+                    rrb.Spatial2DView(name=view_names[camera_name], origin=f"/camera/{camera_name}")
+                )
+
+    if has_depth:
+        spatial_view_items.append(rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"))
+
+    if not spatial_view_items:
+        spatial_views = rrb.Spatial2DView(name="Capture", origin="/")
+    elif len(spatial_view_items) == 1:
+        spatial_views = spatial_view_items[0]
+    else:
+        spatial_views = rrb.Horizontal(
+            *spatial_view_items,
+            column_shares=[1] * len(spatial_view_items),
         )
+
+    time_views: list[Any] = []
+    if (capture_dir / "imu.csv").exists():
+        time_views.extend([
+            rrb.TimeSeriesView(
+                name="IMU accel XYZ",
+                origin="/sensors/imu",
+                contents=[
+                    "/sensors/imu/ax_m_s2",
+                    "/sensors/imu/ay_m_s2",
+                    "/sensors/imu/az_m_s2",
+                ],
+            ),
+            rrb.TimeSeriesView(
+                name="IMU gyro XYZ",
+                origin="/sensors/imu",
+                contents=[
+                    "/sensors/imu/gx_rad_s",
+                    "/sensors/imu/gy_rad_s",
+                    "/sensors/imu/gz_rad_s",
+                ],
+            ),
+        ])
+    if (capture_dir / "audio.m4a").exists():
+        time_views.append(rrb.TimeSeriesView(
+            name="audio.m4a waveform",
+            origin="/audio_m4a",
+            contents="/audio_m4a/waveform",
+        ))
+    if (capture_dir / "device_motion.csv").exists():
+        time_views.append(rrb.TimeSeriesView(
+            name="Attitude RPY",
+            origin="/sensors/device_motion",
+            contents=[
+                "/sensors/device_motion/roll",
+                "/sensors/device_motion/pitch",
+                "/sensors/device_motion/yaw",
+            ],
+        ))
+    if (capture_dir / "geo_location.csv").exists():
+        time_views.append(rrb.TimeSeriesView(
+            name="Geo ENU",
+            origin="/sensors/geo_relative",
+            contents=[
+                "/sensors/geo_relative/east_m",
+                "/sensors/geo_relative/north_m",
+                "/sensors/geo_relative/up_m",
+                "/sensors/geo_relative/horizontal_accuracy_m",
+            ],
+        ))
+    if is_arkit_mode:
+        time_views.append(rrb.TimeSeriesView(
+            name="ARKit Pose XYZ",
+            origin="/sensors/arkit_pose",
+            contents=[
+                "/sensors/arkit_pose/tx_m",
+                "/sensors/arkit_pose/ty_m",
+                "/sensors/arkit_pose/tz_m",
+            ],
+        ))
+
+    if not time_views:
+        time_layout = None
+    elif len(time_views) == 1:
+        time_layout = time_views[0]
+    else:
+        split = (len(time_views) + 1) // 2
+        left = rrb.Vertical(*time_views[:split], row_shares=[1] * split)
+        right_count = len(time_views) - split
+        right = rrb.Vertical(*time_views[split:], row_shares=[1] * right_count)
+        time_layout = rrb.Horizontal(left, right, column_shares=[1, 1])
+
+    root_layout = (
+        rrb.Vertical(spatial_views, time_layout, row_shares=[5, 4])
+        if time_layout is not None
+        else spatial_views
+    )
 
     rr.send_blueprint(
         rrb.Blueprint(
-            rrb.Vertical(
-                spatial_views,
-                rrb.Horizontal(
-                    rrb.Vertical(
-                        rrb.TimeSeriesView(
-                            name="IMU accel XYZ",
-                            origin="/sensors/imu",
-                            contents=[
-                                "/sensors/imu/ax_m_s2",
-                                "/sensors/imu/ay_m_s2",
-                                "/sensors/imu/az_m_s2",
-                            ],
-                        ),
-                        rrb.TimeSeriesView(
-                            name="IMU gyro XYZ",
-                            origin="/sensors/imu",
-                            contents=[
-                                "/sensors/imu/gx_rad_s",
-                                "/sensors/imu/gy_rad_s",
-                                "/sensors/imu/gz_rad_s",
-                            ],
-                        ),
-                        rrb.TimeSeriesView(
-                            name="audio.m4a waveform",
-                            origin="/audio_m4a",
-                            contents="/audio_m4a/waveform",
-                        ),
-                        row_shares=[1, 1, 1],
-                    ),
-                    rrb.Vertical(
-                        rrb.TimeSeriesView(
-                            name="Attitude RPY",
-                            origin="/sensors/device_motion",
-                            contents=[
-                                "/sensors/device_motion/roll",
-                                "/sensors/device_motion/pitch",
-                                "/sensors/device_motion/yaw",
-                            ],
-                        ),
-                        rrb.TimeSeriesView(
-                            name="Geo ENU",
-                            origin="/sensors/geo_relative",
-                            contents=[
-                                "/sensors/geo_relative/east_m",
-                                "/sensors/geo_relative/north_m",
-                                "/sensors/geo_relative/up_m",
-                                "/sensors/geo_relative/horizontal_accuracy_m",
-                            ],
-                        ),
-                        rrb.TimeSeriesView(
-                            name="ARKit Pose XYZ",
-                            origin="/sensors/arkit_pose",
-                            contents=[
-                                "/sensors/arkit_pose/tx_m",
-                                "/sensors/arkit_pose/ty_m",
-                                "/sensors/arkit_pose/tz_m",
-                            ],
-                        ),
-                        row_shares=[1, 1, 1],
-                    ),
-                    column_shares=[1, 1],
-                ),
-                row_shares=[5, 4],
-            ),
+            root_layout,
             collapse_panels=True,
         )
     )
