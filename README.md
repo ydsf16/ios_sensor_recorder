@@ -15,6 +15,7 @@ The app records synchronized real-world signals from iPhone hardware:
 
 - Up to three selected camera streams from wide, ultra-wide, telephoto, and front cameras. Unsupported MultiCam combinations are automatically trimmed.
 - Per-frame camera metadata: timestamp, exposure, ISO, resolution, and intrinsics.
+- Optional ARKit mode with a Landscape Right video, synchronized 6-DoF camera pose, and scene depth.
 - Audio from `audio.m4a`.
 - Raw accelerometer and gyroscope data.
 - Gyro-keyed IMU rows.
@@ -46,6 +47,17 @@ Every stream carries two timestamps when available:
 - `utc_sec`: Unix UTC time for wall-clock correlation, Geo data, external logs, and experiment notes.
 
 Use `sensor_sec` for sensor alignment. Use `utc_sec` when correlating with the outside world.
+
+### ARKit camera convention
+
+ARKit recordings keep `capturedImage` in ARKit's native landscape pixel layout while the app is locked to Landscape Right. `arkit_pose.csv` stores `T_world_camera` in parent-from-child form:
+
+- Camera axes: OpenCV/Rerun `RDF` (`x` right, `y` down, `z` forward).
+- World axes: ARKit's right-handed, gravity-aligned world (`y` up).
+- Projection: `u = fx * x / z + cx`, `v = fy * y / z + cy`.
+- Quaternion order: `qw,qx,qy,qz`.
+
+RGB pixels and intrinsics stay in the same ARKit-native layout; depth pixels and scaled depth intrinsics use that same layout. Camera pose uses OpenCV RDF axes. This convention matches OpenCV, Rerun pinhole cameras, and the camera model used by Kalibr/maplab. A complete maplab VIO configuration still requires calibrated camera-to-IMU extrinsics and time offset.
 
 ### Build and run
 
@@ -100,6 +112,7 @@ Sensor Recorder Pro 把 iPhone 变成一个低成本、可复现、多模态的�
 
 - 从 wide、ultra-wide、telephoto、front 中任选最多三路相机视频。不支持的 MultiCam 组合会自动裁剪。
 - 每帧相机信息：时间戳、曝光、ISO、分辨率、相机内参。
+- 可选 ARKit 模式：同步保存 Landscape Right 视频、6-DoF 相机 Pose 和 scene depth。
 - `audio.m4a` 音频。
 - 原始加速度计和陀螺仪。
 - gyro 对齐的 IMU 数据。
@@ -131,6 +144,17 @@ lidar_depth_info.csv
 - `utc_sec`：Unix UTC 时间，用于和真实世界时间、Geo、外部日志、实验记录关联。
 
 传感器融合和对齐优先使用 `sensor_sec`。需要和外部世界关联时使用 `utc_sec`。
+
+### ARKit 相机坐标约定
+
+App 锁定为 Landscape Right；ARKit 录制保留 `capturedImage` 的原生横屏像素，不再手工旋转。`arkit_pose.csv` 保存 parent-from-child 形式的 `T_world_camera`：
+
+- 相机坐标：OpenCV/Rerun `RDF`，即 `x` 向右、`y` 向下、`z` 向前。
+- 世界坐标：ARKit 右手、重力对齐世界，`y` 向上。
+- 投影：`u = fx * x / z + cx`，`v = fy * y / z + cy`。
+- 四元数顺序：`qw,qx,qy,qz`。
+
+RGB 像素与 RGB 内参保持 ARKit 原生对应；深度像素及缩放后的深度内参使用相同布局；相机 Pose 使用 OpenCV RDF 坐标。可直接对应 OpenCV、Rerun pinhole 和 Kalibr/maplab 相机模型。完整接入 maplab VIO 仍需标定 camera-to-IMU 外参和时间偏移。
 
 ### 编译运行
 

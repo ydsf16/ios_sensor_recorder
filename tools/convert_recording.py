@@ -176,7 +176,9 @@ def convert_to_rerun(
 
     rr.init(app_id)
     rr.save(str(output_path))
-    send_default_blueprint(rr)
+    arkit_pose_path = capture_dir / ARKIT_POSE_FILE
+    is_arkit_mode = arkit_pose_path.exists()
+    send_default_blueprint(rr, is_arkit_mode=is_arkit_mode)
     recording_window = recording_sensor_window(capture_dir)
 
     meta_path = capture_dir / "meta.json"
@@ -196,8 +198,8 @@ def convert_to_rerun(
     log_lidar_depth_metadata(rr=rr, capture_dir=capture_dir)
 
     # Detect ARKit mode: if arkit_pose.csv exists, use it for wide camera timing
-    arkit_pose_path = capture_dir / ARKIT_POSE_FILE
-    is_arkit_mode = arkit_pose_path.exists()
+    if is_arkit_mode:
+        log_arkit_camera_model(rr=rr, capture_dir=capture_dir)
 
     for camera_name, (video_name, info_name) in CAMERA_STREAMS.items():
         video_path = capture_dir / video_name
@@ -211,7 +213,7 @@ def convert_to_rerun(
         if not video_path.exists() or not rows:
             continue
 
-        entity = f"camera/{camera_name}"
+        entity = "world/arkit_camera/image" if is_arkit_mode and camera_name == "wide" else f"camera/{camera_name}"
         logged_rows = log_video_frames(
             rr=rr,
             np=np,
@@ -232,7 +234,7 @@ def convert_to_rerun(
         )
 
     log_lidar_depth(rr=rr, np=np, capture_dir=capture_dir, pixel_stride=depth_pixel_stride)
-    log_arkit_pose(rr=rr, np=np, capture_dir=capture_dir, video_fps=video_fps)
+    log_arkit_pose(rr=rr, np=np, capture_dir=capture_dir)
 
     for file_name, fields in SENSOR_FILES.items():
         rows = read_csv_rows(capture_dir / file_name)
@@ -268,24 +270,50 @@ def convert_to_rerun(
     log_audio_waveform(rr=rr, np=np, capture_dir=capture_dir)
 
 
-def send_default_blueprint(rr: Any) -> None:
+def send_default_blueprint(rr: Any, is_arkit_mode: bool) -> None:
     try:
         import rerun.blueprint as rrb
     except ImportError:
         return
 
+    if is_arkit_mode:
+        spatial_views = rrb.Horizontal(
+            rrb.Spatial2DView(
+                name="ARKit Camera",
+                origin="/world/arkit_camera",
+                contents=["/world/arkit_camera/image"],
+            ),
+            rrb.Spatial3DView(
+                name="ARKit 3D Trajectory",
+                origin="/world",
+                contents=[
+                    "/world",
+                    "/world/arkit_camera",
+                    "/world/trajectory/**",
+                ],
+                background=[28, 31, 36],
+            ),
+            rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
+            column_shares=[2, 3, 2],
+        )
+    else:
+        spatial_views = rrb.Vertical(
+            rrb.Horizontal(
+                rrb.Spatial2DView(name="Ultra Wide", origin="/camera/ultrawide"),
+                rrb.Spatial2DView(name="Wide", origin="/camera/wide"),
+                rrb.Spatial2DView(name="Telephoto", origin="/camera/telephoto"),
+                rrb.Spatial2DView(name="Front", origin="/camera/front"),
+                rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
+                column_shares=[1, 1, 1, 1, 1],
+            ),
+            rrb.Spatial3DView(name="LiDAR Point Cloud", origin="/lidar/depth/points"),
+            row_shares=[1, 1],
+        )
+
     rr.send_blueprint(
         rrb.Blueprint(
             rrb.Vertical(
-                rrb.Horizontal(
-                    rrb.Spatial2DView(name="Ultra Wide", origin="/camera/ultrawide"),
-                    rrb.Spatial2DView(name="Wide", origin="/camera/wide"),
-                    rrb.Spatial2DView(name="Telephoto", origin="/camera/telephoto"),
-                    rrb.Spatial2DView(name="Front", origin="/camera/front"),
-                    rrb.Spatial2DView(name="Depth", origin="/lidar/depth/image"),
-                    column_shares=[1, 1, 1, 1, 1],
-                ),
-                rrb.Spatial3DView(name="LiDAR Point Cloud", origin="/lidar/depth/points"),
+                spatial_views,
                 rrb.Horizontal(
                     rrb.Vertical(
                         rrb.TimeSeriesView(
@@ -346,7 +374,7 @@ def send_default_blueprint(rr: Any) -> None:
                     ),
                     column_shares=[1, 1],
                 ),
-                row_shares=[3, 3, 5],
+                row_shares=[5, 4],
             ),
             collapse_panels=True,
         )
@@ -436,6 +464,7 @@ def recording_sensor_window(capture_dir: Path) -> tuple[float, float] | None:
         "device_motion.csv",
         "accelerometer.csv",
         "gyroscope.csv",
+        ARKIT_POSE_FILE,
     ]:
         rows = read_csv_rows(capture_dir / file_name)
         values = [value for value in (parse_float(row.get("sensor_sec")) for row in rows) if value is not None]
@@ -560,7 +589,37 @@ def depth_colormap(np: Any, depth_m: Any, valid: Any) -> Any:
     return rgb
 
 
-def log_arkit_pose(rr: Any, np: Any, capture_dir: Path, video_fps: float) -> None:
+def log_arkit_camera_model(rr: Any, capture_dir: Path) -> None:
+    """Declare the ARKit gravity world and the OpenCV RDF pinhole camera."""
+    rows = read_csv_rows(capture_dir / ARKIT_POSE_FILE)
+    if not rows:
+        return
+    row = rows[0]
+    fx = parse_float(row.get("fx_px"))
+    fy = parse_float(row.get("fy_px"))
+    cx = parse_float(row.get("cx_px"))
+    cy = parse_float(row.get("cy_px"))
+    width = parse_float(row.get("width_px"))
+    height = parse_float(row.get("height_px"))
+    if None in (fx, fy, cx, cy, width, height):
+        return
+
+    rr.log("world", rr.ViewCoordinates.RUB, static=True)
+    rr.log(
+        "world/arkit_camera",
+        rr.Pinhole(
+            image_from_camera=[[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            resolution=[width, height],
+            camera_xyz=rr.ViewCoordinates.RDF,
+            image_plane_distance=0.08,
+            color=[245, 245, 245],
+            line_width=0.0015,
+        ),
+        static=True,
+    )
+
+
+def log_arkit_pose(rr: Any, np: Any, capture_dir: Path) -> None:
     """Log ARKit 6-DOF poses and camera intrinsics from arkit_pose.csv."""
     pose_path = capture_dir / ARKIT_POSE_FILE
     if not pose_path.exists():
@@ -586,34 +645,68 @@ def log_arkit_pose(rr: Any, np: Any, capture_dir: Path, video_fps: float) -> Non
         drop_nonfinite=False,
     )
 
-    # Log camera poses as 3D transforms (Rerun Instances3D)
-    fps = video_fps if video_fps > 0 else 999
-    last_logged_time = -float("inf")
+    positions = []
+    for row in rows:
+        tx = parse_float(row.get("tx_m"))
+        ty = parse_float(row.get("ty_m"))
+        tz = parse_float(row.get("tz_m"))
+        if None not in (tx, ty, tz):
+            positions.append([tx, ty, tz])
+
+    if len(positions) >= 2:
+        rr.log(
+            "world/trajectory/path",
+            rr.LineStrips3D(
+                [positions],
+                radii=rr.Radius.ui_points(1.5),
+                colors=[60, 180, 255],
+            ),
+            static=True,
+        )
+        rr.log(
+            "world/trajectory/endpoints",
+            rr.Points3D(
+                [positions[0], positions[-1]],
+                radii=rr.Radius.ui_points(4.0),
+                colors=[[40, 220, 90], [255, 70, 70]],
+                labels=["start", "end"],
+                show_labels=True,
+            ),
+            static=True,
+        )
+
+    # The camera frustum inherits every pose transform and therefore moves
+    # continuously when either the sensor or UTC timeline is scrubbed.
     for row in rows:
         sensor_sec = parse_float(row.get("sensor_sec"))
         if sensor_sec is None:
             continue
-        if fps < 999:
-            interval = 1.0 / fps
-            if sensor_sec - last_logged_time < interval:
-                continue
-        last_logged_time = sensor_sec
 
-        tx = parse_float(row.get("tx_m")) or 0.0
-        ty = parse_float(row.get("ty_m")) or 0.0
-        tz = parse_float(row.get("tz_m")) or 0.0
-        qw = parse_float(row.get("qw")) or 1.0
-        qx = parse_float(row.get("qx")) or 0.0
-        qy = parse_float(row.get("qy")) or 0.0
-        qz = parse_float(row.get("qz")) or 0.0
+        tx_value = parse_float(row.get("tx_m"))
+        ty_value = parse_float(row.get("ty_m"))
+        tz_value = parse_float(row.get("tz_m"))
+        qw_value = parse_float(row.get("qw"))
+        qx_value = parse_float(row.get("qx"))
+        qy_value = parse_float(row.get("qy"))
+        qz_value = parse_float(row.get("qz"))
+        tx = 0.0 if tx_value is None else tx_value
+        ty = 0.0 if ty_value is None else ty_value
+        tz = 0.0 if tz_value is None else tz_value
+        qw = 1.0 if qw_value is None else qw_value
+        qx = 0.0 if qx_value is None else qx_value
+        qy = 0.0 if qy_value is None else qy_value
+        qz = 0.0 if qz_value is None else qz_value
 
-        rr.set_time_seconds("sensor_time", sensor_sec)
+        rr.set_time("sensor_time", duration=sensor_sec)
+        utc_sec = parse_float(row.get("utc_sec"))
+        if utc_sec is not None:
+            rr.set_time("utc_time", timestamp=utc_sec)
         rr.log(
             "world/arkit_camera",
             rr.Transform3D(
                 translation=[tx, ty, tz],
                 rotation=rr.Quaternion(xyzw=[qx, qy, qz, qw]),
-                from_parent=True,
+                relation=rr.TransformRelation.ParentFromChild,
             ),
         )
 

@@ -510,6 +510,7 @@ private final class ARKitFrameRecorder {
     private var frameIndex = 0
     private var isFinishing = false
     private var didWriteCSVHeader = false
+    private var previousQuaternionXYZW: SIMD4<Float>?
 
     init(videoURL: URL, infoURL: URL, targetFrameRate: Double, captureFrameRate: Double) {
         self.videoURL = videoURL
@@ -522,17 +523,20 @@ private final class ARKitFrameRecorder {
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
         writeInfoLine("# camera,arkit")
+        writeInfoLine("# pixel_orientation,arkit_native_landscape,device_orientation,landscape_right")
+        writeInfoLine("# camera_coordinates,opencv_rdf,x_right,y_down,z_forward")
+        writeInfoLine("# pose_convention,T_world_camera,parent_from_child,world_coordinates,arkit_gravity")
     }
 
     func append(
-        pixelBuffer: CVPixelBuffer,
+        pixelBuffer sourcePixelBuffer: CVPixelBuffer,
         presentationTime: CMTime,
         camera: ARCamera,
         recordSlot: Int64
     ) {
         guard !isFinishing else { return }
         if writer == nil {
-            configureWriter(pixelBuffer: pixelBuffer)
+            configureWriter(pixelBuffer: sourcePixelBuffer)
         }
         guard let writer = writer, let input = input else { return }
 
@@ -549,7 +553,7 @@ private final class ARKitFrameRecorder {
             return
         }
 
-        let sampleBuffer = makeSampleBuffer(pixelBuffer: pixelBuffer, presentationTime: presentationTime)
+        let sampleBuffer = makeSampleBuffer(pixelBuffer: sourcePixelBuffer, presentationTime: presentationTime)
         guard let sampleBuffer = sampleBuffer else {
             writeInfoLine("# sample_buffer_failed \(frameIndex)")
             return
@@ -563,7 +567,7 @@ private final class ARKitFrameRecorder {
         writeInfo(
             presentationTime: presentationTime,
             camera: camera,
-            pixelBuffer: pixelBuffer,
+            pixelBuffer: sourcePixelBuffer,
             recordSlot: recordSlot
         )
         frameIndex += 1
@@ -606,8 +610,9 @@ private final class ARKitFrameRecorder {
             return nil
         }
 
+        let durationTimescale = CMTimeScale(max(captureFrameRate.rounded(), 1))
         var timingInfo = CMSampleTimingInfo(
-            duration: CMTimeMake(value: 1, timescale: Int32(captureFrameRate * 600)),
+            duration: CMTime(value: 1, timescale: durationTimescale),
             presentationTimeStamp: presentationTime,
             decodeTimeStamp: .invalid
         )
@@ -665,22 +670,37 @@ private final class ARKitFrameRecorder {
         let sensorSec = CMTimeGetSeconds(sensorTime)
         let utcSec = sensorSec + utcMinusSensorOffsetSec
 
-        let transform = camera.transform
+        // Keep capturedImage and camera.intrinsics in ARKit's native pixel layout.
+        // Only convert camera axes from ARKit (x right, y up, z back) to OpenCV RDF.
+        var arkitToOpenCV = matrix_identity_float4x4
+        arkitToOpenCV.columns.0.x = 1
+        arkitToOpenCV.columns.1.y = -1
+        arkitToOpenCV.columns.2.z = -1
+        let transform = simd_mul(camera.transform, arkitToOpenCV)
         let tx = transform.columns.3.x
         let ty = transform.columns.3.y
         let tz = transform.columns.3.z
-        let (qw, qx, qy, qz) = quaternionFromRotationMatrix(transform)
+        var (qw, qx, qy, qz) = quaternionFromRotationMatrix(transform)
+        var quaternionXYZW = SIMD4<Float>(qx, qy, qz, qw)
+        if let previousQuaternionXYZW,
+           simd_dot(previousQuaternionXYZW, quaternionXYZW) < 0 {
+            quaternionXYZW = -quaternionXYZW
+            qx = quaternionXYZW.x
+            qy = quaternionXYZW.y
+            qz = quaternionXYZW.z
+            qw = quaternionXYZW.w
+        }
+        previousQuaternionXYZW = quaternionXYZW
 
         let intrinsics = camera.intrinsics
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
         let fx = intrinsics.columns.0.x
         let fy = intrinsics.columns.1.y
         let cx = intrinsics.columns.2.x
         let cy = intrinsics.columns.2.y
 
         let exposureSec = camera.exposureDuration
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-
         let trackingLabel = trackingStateLabel(camera.trackingState)
 
         writeInfoLine(String(
@@ -776,8 +796,18 @@ private final class LiDARDepthStreamRecorder {
     }
 
     /// Accept a raw float32 depth map (meters) from ARKit's ARDepthData.
-    func appendARKitDepthMap(_ pixelBuffer: CVPixelBuffer, intrinsics: simd_float3x3, sensorSec: TimeInterval) {
-        appendFloat32DepthMap(pixelBuffer, arkitIntrinsics: intrinsics, sensorSec: sensorSec)
+    func appendARKitDepthMap(
+        _ pixelBuffer: CVPixelBuffer,
+        intrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        sensorSec: TimeInterval
+    ) {
+        appendFloat32DepthMap(
+            pixelBuffer,
+            arkitIntrinsics: intrinsics,
+            imageResolution: imageResolution,
+            sensorSec: sensorSec
+        )
     }
 
     private func appendFloat32DepthMap(_ pixelBuffer: CVPixelBuffer, calibration: AVCameraCalibrationData?, sensorSec: TimeInterval) {
@@ -792,17 +822,36 @@ private final class LiDARDepthStreamRecorder {
         writeDepthFrame(pixelBuffer, width: width, height: height, intrinsics: intrinsics, sensorSec: sensorSec)
     }
 
-    private func appendFloat32DepthMap(_ pixelBuffer: CVPixelBuffer, arkitIntrinsics: simd_float3x3, sensorSec: TimeInterval) {
+    private func appendFloat32DepthMap(
+        _ pixelBuffer: CVPixelBuffer,
+        arkitIntrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        sensorSec: TimeInterval
+    ) {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        let fx = arkitIntrinsics.columns.0.x
-        let fy = arkitIntrinsics.columns.1.y
-        let cx = arkitIntrinsics.columns.2.x
-        let cy = arkitIntrinsics.columns.2.y
-        writeDepthFrame(pixelBuffer, width: width, height: height, intrinsics: (fx, fy, cx, cy), sensorSec: sensorSec)
+        let scaleX = Float(width) / Float(max(imageResolution.width, 1))
+        let scaleY = Float(height) / Float(max(imageResolution.height, 1))
+        let fx = arkitIntrinsics.columns.0.x * scaleX
+        let fy = arkitIntrinsics.columns.1.y * scaleY
+        let cx = arkitIntrinsics.columns.2.x * scaleX
+        let cy = arkitIntrinsics.columns.2.y * scaleY
+        writeDepthFrame(
+            pixelBuffer,
+            width: width,
+            height: height,
+            intrinsics: (fx, fy, cx, cy),
+            sensorSec: sensorSec
+        )
     }
 
-    private func writeDepthFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int, intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float), sensorSec: TimeInterval) {
+    private func writeDepthFrame(
+        _ pixelBuffer: CVPixelBuffer,
+        width: Int,
+        height: Int,
+        intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float),
+        sensorSec: TimeInterval
+    ) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
@@ -1960,6 +2009,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
     private let sessionQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.capture")
+    private let arkitFrameQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.frames", qos: .userInitiated)
+    private let arkitDepthQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.depth", qos: .utility)
+    private let arkitDepthBackpressure = DispatchSemaphore(value: 2)
 
     private var wideVideoPort: AVCaptureInput.Port?
     private var ultraWideVideoPort: AVCaptureInput.Port?
@@ -2704,6 +2756,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         arSession.delegate = self
+        arSession.delegateQueue = arkitFrameQueue
         arSession.run(config)
 
         self.arSession = arSession
@@ -2779,19 +2832,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let targetHeight = Int(target.height)
         let formats: [ARConfiguration.VideoFormat] = ARWorldTrackingConfiguration.supportedVideoFormats
 
-        // Prefer exact resolution match; break ties by larger area
-        let exactMatch = formats.first { fmt in
+        let targetFPS = Int(clampedFrameRate(from: frameRate).rounded())
+        let exactMatches = formats.filter { fmt in
             Int(fmt.imageResolution.width) == targetWidth && Int(fmt.imageResolution.height) == targetHeight
         }
-        if let exactMatch = exactMatch { return exactMatch }
+        if let exactMatch = exactMatches.min(by: {
+            abs($0.framesPerSecond - targetFPS) < abs($1.framesPerSecond - targetFPS)
+        }) {
+            return exactMatch
+        }
 
-        // Otherwise pick the format closest to the target resolution by area
+        // Otherwise pick the closest resolution, then the closest actual frame rate.
         return formats.min { lhs, rhs in
             let lhsArea = Int(lhs.imageResolution.width) * Int(lhs.imageResolution.height)
             let rhsArea = Int(rhs.imageResolution.width) * Int(rhs.imageResolution.height)
             let lhsDist = abs(lhsArea - targetWidth * targetHeight)
             let rhsDist = abs(rhsArea - targetWidth * targetHeight)
-            return lhsDist < rhsDist
+            if lhsDist != rhsDist { return lhsDist < rhsDist }
+            return abs(lhs.framesPerSecond - targetFPS) < abs(rhs.framesPerSecond - targetFPS)
         }
     }
 
@@ -2828,6 +2886,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func arkitActiveFrameRate() -> Double {
+        if let format = arkitConfiguration?.videoFormat {
+            return Double(format.framesPerSecond)
+        }
         return clampedFrameRate(from: recorderSettings.arkitCamera.frameRate)
     }
 
@@ -2888,22 +2949,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
 
             // Process ARKit scene depth if available and recording
-            if let sceneDepth = frame.sceneDepth {
+            if let sceneDepth = frame.sceneDepth,
+               let depthRecorder = lidarDepthRecorder,
+               arkitDepthBackpressure.wait(timeout: .now()) == .success {
                 let sensorSec = CMTimeGetSeconds(pts)
-                lidarDepthRecorder?.appendARKitDepthMap(
-                    sceneDepth.depthMap,
-                    intrinsics: frame.camera.intrinsics,
-                    sensorSec: sensorSec
-                )
-                lidarDepthFrameCount += 1
-                if firstDepthSensorSec == nil {
-                    firstDepthSensorSec = sensorSec
+                let depthMap = sceneDepth.depthMap
+                let intrinsics = frame.camera.intrinsics
+                let imageResolution = frame.camera.imageResolution
+                arkitDepthQueue.async { [weak self] in
+                    defer { self?.arkitDepthBackpressure.signal() }
+                    depthRecorder.appendARKitDepthMap(
+                        depthMap,
+                        intrinsics: intrinsics,
+                        imageResolution: imageResolution,
+                        sensorSec: sensorSec
+                    )
+                    self?.lidarDepthFrameCount += 1
+                    if self?.firstDepthSensorSec == nil {
+                        self?.firstDepthSensorSec = sensorSec
+                    }
+                    self?.latestDepthSensorSec = sensorSec
                 }
-                latestDepthSensorSec = sensorSec
             }
         }
 
-        enqueueARKitPreview(frame, pts: pts)
+        enqueueARKitPreview(frame.capturedImage, pts: pts)
 
         guard arkitFrameCount % 30 == 0 else { return }
         setStatus("ARKit Frames")
@@ -2924,7 +2994,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         os_log("ARSession interruption ended", type: .info)
     }
 
-    private func enqueueARKitPreview(_ frame: ARFrame, pts: CMTime) {
+    private func enqueueARKitPreview(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         guard let displayLayer = arkitDisplayLayer else { return }
         guard !arkitPreviewEnqueuePending else { return }
         arkitPreviewEnqueuePending = true
@@ -2939,7 +3009,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             guard displayLayer.isReadyForMoreMediaData else { return }
 
-            let pixelBuffer = frame.capturedImage
             var formatDesc: CMFormatDescription?
             CMVideoFormatDescriptionCreateForImageBuffer(
                 allocator: kCFAllocatorDefault,
@@ -4711,10 +4780,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 group.enter()
                 audioRecorder.finish { group.leave() }
             }
-            self.lidarDepthRecorder?.finish()
-            if let arkitRecorder = self.arkitRecorder {
-                group.enter()
-                arkitRecorder.finish { group.leave() }
+            self.arkitFrameQueue.sync {
+                if let arkitRecorder = self.arkitRecorder {
+                    group.enter()
+                    arkitRecorder.finish { group.leave() }
+                }
+            }
+            self.arkitDepthQueue.sync {
+                self.lidarDepthRecorder?.finish()
             }
             group.notify(queue: self.sessionQueue) {
                 self.writeCaptureMetaJSON(state: "finished")
@@ -6836,6 +6909,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "recording_settings": currentRecordingSettingsJSON(),
             "recording_start": recordingStartJSON(),
             "capture_mode": recorderSettings.captureMode.rawValue,
+            "coordinate_conventions": [
+                "arkit_world": "right-handed gravity-aligned world; y is up",
+                "recorded_camera": "OpenCV/Rerun RDF: x right, y down, z forward",
+                "pose": "T_world_camera (parent_from_child): p_world = R * p_camera + t",
+                "pixel_orientation": recorderSettings.captureMode == .arkit
+                    ? "ARKit native landscape pixels; device locked to Landscape Right"
+                    : "Landscape Right",
+                "quaternion_order": "qw,qx,qy,qz"
+            ],
             "camera_extrinsics": cameraExtrinsicsJSON(),
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
@@ -6886,7 +6968,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         : ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "ultrawide_camera": [
-                    "enabled": recorderSettings.ultraWide.enabled,
+                    "enabled": recorderSettings.ultraWide.enabled && recorderSettings.captureMode == .standard,
                     "media_file": "ultrawide.mp4",
                     "index_file": "ultra_info.csv",
                     "codec": videoCodecName(for: recorderSettings.ultraWide),
@@ -6905,7 +6987,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
                 ],
                 "telephoto_camera": [
-                    "enabled": recorderSettings.telephoto.enabled,
+                    "enabled": recorderSettings.telephoto.enabled && recorderSettings.captureMode == .standard,
                     "media_file": "telephoto.mp4",
                     "index_file": "tele_info.csv",
                     "codec": videoCodecName(for: recorderSettings.telephoto),
@@ -6958,6 +7040,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     ),
                     "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.arkitCamera),
                     "world_alignment": "gravity",
+                    "world_coordinates": "ARKit gravity-aligned right-handed world",
+                    "camera_coordinates": "OpenCV/Rerun RDF (x right, y down, z forward)",
+                    "pose_convention": "T_world_camera (parent_from_child)",
+                    "pixel_orientation": "ARKit native landscape pixels; device locked to Landscape Right",
                     "source": "ARKit ARWorldTrackingConfiguration with builtInWideAngleCamera",
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
@@ -6987,7 +7073,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "enabled": recorderSettings.audioEnabled,
                     "media_file": "audio.m4a",
                     "index_file": "audio_info.csv",
-                    "embedded_in": embedAudioInCameraMP4 ? ["wide.mp4", "ultrawide.mp4", "telephoto.mp4", "front.mp4"] : [],
+                    "embedded_in": embedAudioInCameraMP4 && recorderSettings.captureMode == .standard
+                        ? ["wide.mp4", "ultrawide.mp4", "telephoto.mp4", "front.mp4"]
+                        : [],
                     "codec": "aac",
                     "container": "m4a",
                     "requested_channels": 2,
@@ -7007,6 +7095,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "timestamp_column": "sensor_sec",
                     "utc_column": "utc_sec",
                     "raw_layout": "16-bit grayscale PNG depth map; value 0 means invalid, value / depth_scale gives meters",
+                    "pixel_orientation": recorderSettings.captureMode == .arkit
+                        ? "ARKit native landscape; aligned with wide.mp4"
+                        : "Landscape Right",
+                    "intrinsics": recorderSettings.captureMode == .arkit
+                        ? "scaled to the depth-map resolution in the native pixel layout"
+                        : "scaled to the depth-map resolution",
                     "schema": [
                         "frame_index",
                         "sensor_sec",
