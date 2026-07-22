@@ -1757,6 +1757,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private struct RecorderSettings: Codable {
+        var settingsVersion: Int
         var captureMode: CaptureMode
         var wide: CameraCaptureSettings
         var ultraWide: CameraCaptureSettings
@@ -1772,6 +1773,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var lidarDepthEnabled: Bool
 
         private enum CodingKeys: String, CodingKey {
+            case settingsVersion
             case captureMode
             case wide
             case ultraWide
@@ -1788,6 +1790,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         init(
+            settingsVersion: Int = 1,
             captureMode: CaptureMode = .standard,
             wide: CameraCaptureSettings,
             ultraWide: CameraCaptureSettings,
@@ -1802,6 +1805,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             audioEnabled: Bool,
             lidarDepthEnabled: Bool
         ) {
+            self.settingsVersion = settingsVersion
             self.captureMode = captureMode
             self.wide = wide
             self.ultraWide = ultraWide
@@ -1820,6 +1824,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let defaults = Self.defaults
+            settingsVersion = try container.decodeIfPresent(Int.self, forKey: .settingsVersion) ?? 0
             captureMode = try container.decodeIfPresent(CaptureMode.self, forKey: .captureMode) ?? defaults.captureMode
             wide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .wide) ?? defaults.wide
             ultraWide = try container.decodeIfPresent(CameraCaptureSettings.self, forKey: .ultraWide) ?? defaults.ultraWide
@@ -1877,9 +1882,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 enabled: true,
                 resolution: "1920x1440",
                 frameRate: "30",
-                autoFocus: true,
+                autoFocus: false,
                 autoExposure: true,
-                maxExposureDurationMS: "10",
+                maxExposureDurationMS: "5",
                 fixedFocusLensPosition: 0.6
             ),
             imuEnabled: true,
@@ -1897,13 +1902,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         static func load() -> RecorderSettings {
             if let data = try? Data(contentsOf: configFileURL),
                let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) {
-                return settings
+                return migratedSettingsIfNeeded(settings)
             }
             guard let data = UserDefaults.standard.data(forKey: storageKey),
                   let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) else {
                 return defaults
             }
-            return settings
+            return migratedSettingsIfNeeded(settings)
+        }
+
+        private static func migratedSettingsIfNeeded(_ loadedSettings: RecorderSettings) -> RecorderSettings {
+            guard loadedSettings.settingsVersion < defaults.settingsVersion else {
+                return loadedSettings
+            }
+
+            var migrated = loadedSettings
+            migrated.arkitCamera.autoFocus = defaults.arkitCamera.autoFocus
+            migrated.arkitCamera.maxExposureDurationMS = defaults.arkitCamera.maxExposureDurationMS
+            migrated.settingsVersion = defaults.settingsVersion
+            migrated.save()
+            return migrated
         }
 
         func save() {
