@@ -4303,6 +4303,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
+        connection.preferredVideoStabilizationMode = .off
         if connection.isVideoOrientationSupported {
             connection.videoOrientation = .landscapeRight
         }
