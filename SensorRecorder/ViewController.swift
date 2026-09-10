@@ -3299,7 +3299,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func captureSessionClock() -> CMClock? {
-        (session as? AVCaptureMultiCamSession)?.synchronizationClock
+        // Single-camera outputs also use the session clock, which may differ from host time.
+        session.synchronizationClock
     }
 
     private func sensorSeconds(for sampleBuffer: CMSampleBuffer) -> TimeInterval {
