@@ -11,11 +11,11 @@ Sensor Recorder Pro turns an iPhone into a low-cost, reproducible, multi-sensor 
 - App Store: [Sensor Recorder Pro](https://apps.apple.com/search?term=Sensor%20Recorder%20Pro)
 - Open data: [Baidu Netdisk](https://pan.baidu.com/s/1AkZOUvUq2zS3ihPHkEMs9g), password: `inv0`
 
-The app records synchronized real-world signals from iPhone hardware:
+The app records timestamped real-world signals from iPhone hardware:
 
 - Up to three selected camera streams from wide, ultra-wide, telephoto, and front cameras. Unsupported MultiCam combinations are automatically trimmed.
 - Per-frame camera metadata: timestamp, exposure, ISO, resolution, and intrinsics.
-- Optional ARKit mode with a Landscape Right video, synchronized 6-DoF camera pose, and scene depth.
+- Optional ARKit mode with Landscape Right RGB video and per-frame 6-DoF camera pose; scene depth is available on supported devices when enabled.
 - Audio from `audio.m4a`.
 - Raw accelerometer and gyroscope data.
 - Gyro-keyed IMU rows.
@@ -26,6 +26,26 @@ The app records synchronized real-world signals from iPhone hardware:
 - A `meta.json` manifest with device metadata, capture settings, schemas, codecs, and timestamp semantics.
 
 Each session is saved as a folder named `SR_yyyy-MM-dd_HH-mm-ss/`. The phone keeps recording simple and robust: videos stay as MP4, audio stays as M4A, sensor streams stay as CSV, and offline tools convert the session for visualization and analysis.
+
+### Capture modes
+
+This README describes the `release` branch's on-device recording workflow. USB Stream mode and desktop live-preview tools are developed separately on `feature/stream_mode` and are not part of this release.
+
+| Mode | Camera capture | Pose and depth |
+| --- | --- | --- |
+| Standard | Up to three supported RGB cameras using AVFoundation; each camera has its own video and frame metadata. | No ARKit world-camera pose. Optional LiDAR depth on supported devices. |
+| ARKit | One ARKit RGB stream using `ARWorldTrackingConfiguration`; the Standard mode's extra camera streams are not recorded in this mode. | Per-frame 6-DoF pose, tracking state and intrinsics; optional ARKit `sceneDepth` when supported. |
+
+To record with ARKit:
+
+1. Open Settings and select **Capture Mode → ARKit**. Devices without world-tracking support only offer Standard mode.
+2. Configure the ARKit camera's resolution, frame rate, focus and exposure. The app selects from the device's supported ARKit video formats; requested and actual settings can differ.
+3. Enable the required sensor channels and, if supported, **LiDAR Depth**. RGB + pose recording does not require scene-depth support.
+4. Return to the Landscape Right preview, start recording, then stop and export the session folder.
+
+ARKit recordings use `wide.mp4` for RGB and `arkit_pose.csv` for frame timestamps, position, quaternion, tracking state, exposure and camera intrinsics. Depth, when available, uses `lidar_depth/` and `lidar_depth_info.csv`; enabled audio/sensor streams retain their normal files. `meta.json` records the capture mode and settings.
+
+ARKit pose is an estimated trajectory, not ground truth. Check `tracking_state` before using it for evaluation or sensor fusion. Equal camera frame rates and comparable timestamps do not guarantee simultaneous exposure. See the coordinate convention below before consuming pose data.
 
 LiDAR depth output, when enabled, is stored as raw frame files:
 
@@ -65,7 +85,7 @@ Video tracks request a `1,000,000` units-per-second media time scale. Each succe
 
 1. Open `SensorRecorder.xcodeproj` in Xcode.
 2. Set your signing team in `Project -> Signing & Capabilities`.
-3. Connect an iPhone that supports MultiCam capture.
+3. Connect an iPhone; multi-camera recording requires MultiCam support, and ARKit mode requires ARKit world-tracking support.
 4. Build and run on device.
 
 The current capture pipeline targets iOS 15.4+.
@@ -80,19 +100,27 @@ python3 tools/convert_recording.py /path/to/SR_yyyy-MM-dd_HH-mm-ss -o recording.
 rerun recording.rrd
 ```
 
-The converter uses `wide_info.csv`, `ultra_info.csv`, optional `tele_info.csv`, and optional `front_info.csv` as the source of truth for camera frame time. It decodes MP4 frames with local `ffmpeg`, logs images into Rerun, and restores every logged frame onto the recorded `sensor_time` timeline from `sensor_sec`. It also logs `utc_time` when available.
+In Standard mode, the converter uses `wide_info.csv`, `ultra_info.csv`, optional `tele_info.csv`, and optional `front_info.csv` as the source of truth for camera frame time. In ARKit mode, `wide.mp4` uses `arkit_pose.csv` when a standard camera index is absent. The converter identifies ARKit sessions by the presence of `arkit_pose.csv` and warns if that file evidence disagrees with `meta.json`. It decodes MP4 frames with local `ffmpeg`, logs images into Rerun, and restores every logged frame onto the recorded `sensor_time` timeline from `sensor_sec`. It also logs `utc_time` when available.
 
 By default video is written to Rerun at up to 5fps to keep long recordings manageable. Use `--video-fps 0` to write every frame.
 
 LiDAR depth PNGs are logged into Rerun as depth images, and every depth frame is reconstructed into a point cloud from `fx/fy/cx/cy` in `lidar_depth_info.csv`. Use `--depth-pixel-stride 1` for full-resolution point clouds; the default stride is 2 to keep `.rrd` files manageable.
 
-The saved Rerun layout shows:
+The Standard-mode Rerun layout shows the available streams:
 
 - Top: ultra-wide, wide, optional telephoto, and optional front image streams.
 - Lower left: IMU acceleration, gyro, and raw `audio.m4a` waveform.
 - Lower right: attitude roll/pitch/yaw and Geo ENU curves in meters.
 
+For ARKit sessions, the converter configures an ARKit camera view, a 3D trajectory view and pose XYZ curves, plus available depth and sensor views. The same conversion command applies to both modes.
+
 ![Rerun visualization](docs/images/sensor-recorder-rerun-view.png)
+
+### License
+
+The source code is released under [GPLv3](http://www.gnu.org/licenses/) license.
+
+For commercial inquiries, please contact WeChat: YDSF16 or email: ydsf16@163.com.
 
 ### Articles
 
@@ -110,11 +138,11 @@ Sensor Recorder Pro 把 iPhone 变成一个低成本、可复现、多模态的�
 - App Store 下载：[Sensor Recorder Pro](https://apps.apple.com/search?term=Sensor%20Recorder%20Pro)
 - 开放数据：[百度网盘](https://pan.baidu.com/s/1AkZOUvUq2zS3ihPHkEMs9g)，密码：`inv0`
 
-这个 App 可以同步记录 iPhone 硬件中的多源传感器数据：
+这个 App 可以记录带时间戳的 iPhone 多源传感器数据：
 
 - 从 wide、ultra-wide、telephoto、front 中任选最多三路相机视频。不支持的 MultiCam 组合会自动裁剪。
 - 每帧相机信息：时间戳、曝光、ISO、分辨率、相机内参。
-- 可选 ARKit 模式：同步保存 Landscape Right 视频、6-DoF 相机 Pose 和 scene depth。
+- 可选 ARKit 模式：保存 Landscape Right RGB 视频和逐帧 6-DoF 相机 Pose；在支持的设备上开启后可记录 scene depth。
 - `audio.m4a` 音频。
 - 原始加速度计和陀螺仪。
 - gyro 对齐的 IMU 数据。
@@ -125,6 +153,26 @@ Sensor Recorder Pro 把 iPhone 变成一个低成本、可复现、多模态的�
 - `meta.json`，记录设备信息、采集设置、schema、codec 和时间模型。
 
 每次录制会保存为一个 `SR_yyyy-MM-dd_HH-mm-ss/` 文件夹。手机端只负责稳定记录原始数据：视频保存为 MP4，音频保存为 M4A，传感器保存为 CSV，后处理工具再把 session 转换成适合可视化和分析的格式。
+
+### 采集模式
+
+本 README 描述 `release` 分支的手机本地录制流程。USB Stream 模式和电脑实时预览工具在 `feature/stream_mode` 分支独立开发，尚不属于当前 release。
+
+| 模式 | 相机采集 | Pose 与深度 |
+| --- | --- | --- |
+| Standard | 使用 AVFoundation 采集最多三路受设备支持的 RGB 相机，各自保存视频与逐帧元数据。 | 不输出 ARKit 世界坐标相机 Pose；支持的设备可选录制 LiDAR 深度。 |
+| ARKit | 使用 `ARWorldTrackingConfiguration` 采集一路 ARKit RGB；此模式不录制 Standard 模式的其他相机流。 | 逐帧 6-DoF Pose、跟踪状态和内参；支持时可选录制 ARKit `sceneDepth`。 |
+
+ARKit 录制步骤：
+
+1. 打开设置，选择 **Capture Mode → ARKit**。不支持世界跟踪的设备只提供 Standard 模式。
+2. 配置 ARKit 相机的分辨率、帧率、对焦和曝光。App 从设备支持的 ARKit 视频格式中选择，实际参数可能与请求参数不同。
+3. 开启需要的传感器；支持时可开启 **LiDAR Depth**。仅录制 RGB＋Pose 不要求设备支持 scene depth。
+4. 回到 Landscape Right 横屏预览，开始录制，结束后导出 session 文件夹。
+
+ARKit 模式使用 `wide.mp4` 保存 RGB，使用 `arkit_pose.csv` 保存逐帧时间戳、位置、四元数、跟踪状态、曝光及相机内参。可用的深度保存到 `lidar_depth/` 和 `lidar_depth_info.csv`；已开启的音频、传感器仍使用各自常规文件。`meta.json` 记录采集模式和设置。
+
+ARKit Pose 是估计轨迹，不是真值。用于评估或传感器融合前应检查 `tracking_state`。相同相机帧率和可比较的时间戳不代表同时曝光；使用 Pose 前请核对下方坐标约定。
 
 LiDAR depth 开启时会固定输出：
 
@@ -164,7 +212,7 @@ RGB 像素与 RGB 内参保持 ARKit 原生对应；深度像素及缩放后的�
 
 1. 用 Xcode 打开 `SensorRecorder.xcodeproj`。
 2. 在 `Project -> Signing & Capabilities` 设置自己的签名团队。
-3. 连接支持 MultiCam 的 iPhone。
+3. 连接 iPhone；多摄录制要求设备支持 MultiCam，ARKit 模式要求支持 ARKit 世界跟踪。
 4. 在真机上编译运行。
 
 当前采集链路目标版本是 iOS 15.4+。
@@ -179,17 +227,25 @@ python3 tools/convert_recording.py /path/to/SR_yyyy-MM-dd_HH-mm-ss -o recording.
 rerun recording.rrd
 ```
 
-转换器以 `wide_info.csv`、`ultra_info.csv`、可选的 `tele_info.csv` 和可选的 `front_info.csv` 作为相机帧时间戳的真值来源。它用本地 `ffmpeg` 解码 MP4，把图像写入 Rerun，并把每一帧恢复到原始 `sensor_sec` 对应的 `sensor_time` 时间轴；可用时也会写入 `utc_time`。
+Standard 模式下，转换器以 `wide_info.csv`、`ultra_info.csv`、可选的 `tele_info.csv` 和可选的 `front_info.csv` 作为相机帧时间戳的来源。ARKit 模式下，`wide.mp4` 在没有标准相机索引时使用 `arkit_pose.csv`。转换器根据 `arkit_pose.csv` 是否存在识别 ARKit session，若与 `meta.json` 的模式不一致则发出警告。它用本地 `ffmpeg` 解码 MP4，把图像写入 Rerun，并把每一帧恢复到原始 `sensor_sec` 对应的 `sensor_time` 时间轴；可用时也会写入 `utc_time`。
 
 默认视频最多按 5fps 写入 Rerun，避免长时间录制生成过大的 `.rrd` 文件。使用 `--video-fps 0` 可以写入每一帧。
 
 LiDAR depth PNG 会作为 depth image 写入 Rerun，并根据 `lidar_depth_info.csv` 里的 `fx/fy/cx/cy` 为每一帧恢复点云。默认点云像素 stride 为 2，避免 `.rrd` 文件过大；使用 `--depth-pixel-stride 1` 可输出全分辨率点云。
 
-Rerun 默认布局包括：
+Standard 模式的 Rerun 布局按实际可用数据展示：
 
 - 上方：ultra-wide、wide、可选 telephoto 和可选 front 图像。
 - 左下：IMU acceleration、gyro、从 `audio.m4a` 解码的原始音频波形。
 - 右下：attitude roll/pitch/yaw 和 Geo ENU 米制曲线。
+
+ARKit session 会配置 ARKit 相机视图、3D 轨迹视图和 Pose XYZ 曲线，并展示可用的深度与传感器视图。两种模式使用相同的转换命令。
+
+### 许可证
+
+源码采用 [GPLv3](http://www.gnu.org/licenses/) 许可证发布。
+
+商业合作请联系微信：YDSF16，或邮箱：ydsf16@163.com。
 
 ### 文章
 
