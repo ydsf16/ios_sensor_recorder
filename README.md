@@ -243,9 +243,7 @@ ARKit session 会配置 ARKit 相机视图、3D 轨迹视图和 Pose XYZ 曲线�
 
 ### 许可证
 
-源码采用 [GPLv3](http://www.gnu.org/licenses/) 许可证发布。
-
-商业合作请联系微信：YDSF16，或邮箱：ydsf16@163.com。
+源码采用 [GPLv3](http://www.gnu.org/licenses/) 许可证发布。商业应用请联系邮箱：ydsf16@163.com。
 
 ### 文章
 
