@@ -11,6 +11,17 @@ import UniformTypeIdentifiers
 import ARKit
 import VideoToolbox
 
+private let srLocalizationBundle: Bundle = {
+    let language = Locale.preferredLanguages.first?.lowercased().hasPrefix("zh") == true ? "zh-Hans" : "en"
+    return Bundle.main.path(forResource: language, ofType: "lproj").flatMap(Bundle.init(path:)) ?? .main
+}()
+
+private func SRText(_ key: String) -> String {
+    if key.contains(" + ") { return key.components(separatedBy: " + ").map(SRText).joined(separator: " + ") }
+    if key.hasPrefix("Hardware sync: ") { return SRText("Hardware sync") + ": " + SRText(String(key.dropFirst(15))) }
+    return srLocalizationBundle.localizedString(forKey: key, value: key, table: nil)
+}
+
 private final class CameraPreviewView: UIView {
     override class var layerClass: AnyClass {
         AVCaptureVideoPreviewLayer.self
@@ -173,7 +184,7 @@ private final class PortraitSettingsViewController: UIViewController {
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .portrait }
     override var shouldAutorotate: Bool { true }
     override var prefersStatusBarHidden: Bool { false }
-    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+    override var preferredStatusBarStyle: UIStatusBarStyle { .darkContent }
 }
 
 private final class CameraStreamRecorder {
@@ -2653,12 +2664,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         PurchaseManager.shared.start()
         recorderSettings = RecorderSettings.load()
         sanitizeRecorderSettingsForCurrentDevice()
-        view.backgroundColor = .black
+        view.backgroundColor = .systemGroupedBackground
         updateDiskCapacity()
         installLandscapeOverlay()
         initializeUI()
         startStopButton.isEnabled = false
-        sceneView.backgroundColor = .black
+        sceneView.backgroundColor = .systemGroupedBackground
         sceneView.layer.borderWidth = 0
         configureLocationManager()
         NotificationCenter.default.addObserver(self, selector: #selector(recordingAppDidEnterBackground), name: UIScene.didEnterBackgroundNotification, object: nil)
@@ -5558,7 +5569,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let frame = frames[key] ?? .zero
             cameraStatusBadges[key]?.isHidden = frame.isEmpty
             if !frame.isEmpty {
-                let width: CGFloat = key == "ultra" ? 348 : 300
+                let width = min(key == "ultra" ? CGFloat(348) : CGFloat(300), max(0, frame.width - 8))
                 cameraStatusBadges[key]?.frame = CGRect(x: frame.midX - width / 2, y: frame.minY + 2, width: width, height: 30)
             }
         }
@@ -6069,7 +6080,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         legacyControlPanel = startStopButton.superview
         legacyControlPanel?.isHidden = true
 
-        sceneView.backgroundColor = .black
+        sceneView.backgroundColor = .systemGroupedBackground
 
         let wideBadge = makeHUDLabelBadge()
         let ultraBadge = makeHUDLabelBadge()
@@ -6100,16 +6111,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Mode badge — shows capture mode + tracking state
         let modeBadgeView = UIView()
         modeBadgeView.translatesAutoresizingMaskIntoConstraints = false
-        modeBadgeView.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        modeBadgeView.backgroundColor = .secondarySystemGroupedBackground
         modeBadgeView.layer.cornerRadius = 14
         modeBadgeView.layer.cornerCurve = .continuous
         modeBadgeView.layer.borderWidth = 1
-        modeBadgeView.layer.borderColor = UIColor.white.withAlphaComponent(0.15).cgColor
+        modeBadgeView.layer.borderColor = UIColor.separator.cgColor
         view.addSubview(modeBadgeView)
         let modeLabel = UILabel()
         modeLabel.translatesAutoresizingMaskIntoConstraints = false
         modeLabel.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .bold)
-        modeLabel.textColor = .white
+        modeLabel.textColor = .label
         modeLabel.textAlignment = .center
         modeBadgeView.addSubview(modeLabel)
         NSLayoutConstraint.activate([
@@ -6129,13 +6140,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         countdownLabel.isHidden = true
         countdownLabel.textAlignment = .center
         countdownLabel.font = UIFont.monospacedSystemFont(ofSize: 20, weight: .bold)
-        countdownLabel.textColor = .white
-        countdownLabel.backgroundColor = UIColor.black.withAlphaComponent(0.48)
+        countdownLabel.textColor = .label
+        countdownLabel.backgroundColor = .secondarySystemGroupedBackground
         countdownLabel.layer.cornerRadius = 16
         countdownLabel.layer.cornerCurve = .continuous
         countdownLabel.layer.masksToBounds = true
         countdownLabel.layer.borderWidth = 1
-        countdownLabel.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        countdownLabel.layer.borderColor = UIColor.separator.cgColor
         view.addSubview(countdownLabel)
         freeCountdownLabel = countdownLabel
         NSLayoutConstraint.activate([
@@ -6162,7 +6173,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let monitorTitle = UILabel()
         monitorTitle.text = ""
         monitorTitle.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
-        monitorTitle.textColor = UIColor.white.withAlphaComponent(0.74)
+        monitorTitle.textColor = .secondaryLabel
         monitorTitle.textAlignment = .center
         sensorBar.addSubview(monitorTitle)
 
@@ -6239,16 +6250,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func makeHUDLabelBadge() -> UIView {
         let badge = UIView()
-        badge.backgroundColor = .clear
+        badge.backgroundColor = UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.92)
+        badge.layer.cornerRadius = 8
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
-        label.textColor = .white
+        label.textColor = .label
         label.textAlignment = .center
         label.adjustsFontSizeToFitWidth = true
         label.minimumScaleFactor = 0.72
         label.layer.shadowColor = UIColor.black.cgColor
-        label.layer.shadowOpacity = 0.85
+        label.layer.shadowOpacity = 0
         label.layer.shadowRadius = 3
         label.layer.shadowOffset = CGSize(width: 0, height: 1)
         badge.addSubview(label)
@@ -6284,8 +6296,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func addSensorPill(to stack: UIStackView, key: String, title: String) {
         let label = UILabel()
         label.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
-        label.textColor = UIColor.white.withAlphaComponent(0.44)
-        label.text = "\(title) 0Hz"
+        label.textColor = .secondaryLabel
+        label.text = "\(SRText(title)) 0Hz"
         label.adjustsFontSizeToFitWidth = true
         label.minimumScaleFactor = 0.76
         label.textAlignment = .center
@@ -6298,7 +6310,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.image = UIImage(systemName: icon)
         config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)
         config.baseForegroundColor = tint
-        config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.18)
+        config.baseBackgroundColor = .secondarySystemGroupedBackground
         config.cornerStyle = .capsule
         config.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12)
 
@@ -6307,7 +6319,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         button.layer.cornerRadius = 34
         button.layer.cornerCurve = .continuous
         button.layer.shadowColor = UIColor.black.cgColor
-        button.layer.shadowOpacity = 0.35
+        button.layer.shadowOpacity = 0.08
         button.layer.shadowRadius = 8
         button.layer.shadowOffset = CGSize(width: 0, height: 4)
         NSLayoutConstraint.activate([
@@ -6322,30 +6334,34 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
 
+    private func settingsFont(_ size: CGFloat, weight: UIFont.Weight = .regular) -> UIFont {
+        UIFontMetrics(forTextStyle: .body).scaledFont(for: .systemFont(ofSize: size, weight: weight))
+    }
+
     private func addSettingsCard(to stack: UIStackView, title: String, icon: String, identifier: String) -> UIStackView {
         let card = UIStackView()
         card.axis = .vertical
-        card.spacing = 14
+        card.spacing = 10
         card.isLayoutMarginsRelativeArrangement = true
-        card.layoutMargins = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
-        card.backgroundColor = UIColor(white: 0.105, alpha: 1)
+        card.layoutMargins = UIEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        card.backgroundColor = .secondarySystemGroupedBackground
         card.layer.cornerRadius = 16
-        card.layer.borderWidth = 1
-        card.layer.borderColor = UIColor.white.withAlphaComponent(0.10).cgColor
+        card.layer.borderWidth = 0
+        card.layer.borderColor = UIColor.separator.cgColor
         card.accessibilityIdentifier = "settings.card.\(identifier)"
         let heading = UIStackView()
         heading.axis = .horizontal
         heading.spacing = 9
         heading.alignment = .center
         let image = UIImageView(image: UIImage(systemName: icon))
-        image.tintColor = UIColor.white.withAlphaComponent(0.65)
+        image.tintColor = .systemBlue
         image.contentMode = .scaleAspectFit
         image.widthAnchor.constraint(equalToConstant: 18).isActive = true
         image.heightAnchor.constraint(equalToConstant: 18).isActive = true
         let label = UILabel()
-        label.text = title
-        label.font = .systemFont(ofSize: 17, weight: .semibold)
-        label.textColor = .white
+        label.text = SRText(title)
+        label.font = settingsFont(17, weight: .semibold)
+        label.textColor = .label
         enableSettingsTextWrapping(label)
         heading.addArrangedSubview(image)
         heading.addArrangedSubview(label)
@@ -6359,12 +6375,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         state.isOn = automatic
         state.accessibilityIdentifier = "\(keyPrefix).autoFocus"
         settingsSwitches["\(keyPrefix).autoFocus"] = state
-        let control = UISegmentedControl(items: ["Auto", manualTitle])
+        let control = UISegmentedControl(items: [SRText("Auto"), SRText(manualTitle)])
         control.accessibilityIdentifier = "settings.focusMode.\(keyPrefix)"
         control.selectedSegmentIndex = automatic ? 0 : 1
-        control.selectedSegmentTintColor = UIColor.white.withAlphaComponent(0.17)
-        control.backgroundColor = UIColor.black.withAlphaComponent(0.3)
-        control.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: UIColor.white], for: .normal)
+        control.selectedSegmentTintColor = .secondarySystemGroupedBackground
+        control.backgroundColor = .tertiarySystemFill
+        control.setTitleTextAttributes([.font: settingsFont(15, weight: .medium), .foregroundColor: UIColor.label], for: .normal)
         control.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
         control.addTarget(self, action: #selector(focusModeSelectionChanged(_:)), for: .valueChanged)
         stack.addArrangedSubview(control)
@@ -6379,15 +6395,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func addSettingsHeader(to stack: UIStackView) {
         let titleLabel = UILabel()
-        titleLabel.text = "Settings"
-        titleLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
-        titleLabel.textColor = .white
+        titleLabel.text = SRText("Settings")
+        titleLabel.font = settingsFont(17, weight: .semibold)
+        titleLabel.textColor = .label
         enableSettingsTextWrapping(titleLabel)
 
         stack.addArrangedSubview(titleLabel)
         let cancel = UIButton(type: .system)
-        cancel.setTitle("Cancel", for: .normal)
-        cancel.setTitleColor(UIColor.white.withAlphaComponent(0.7), for: .normal)
+        cancel.setTitle(SRText("Cancel"), for: .normal)
+        cancel.setTitleColor(.systemBlue, for: .normal)
         cancel.titleLabel?.font = .systemFont(ofSize: 16)
         cancel.accessibilityIdentifier = "settings.close"
         cancel.addTarget(self, action: #selector(hideSettingsOverlay), for: .touchUpInside)
@@ -6398,14 +6414,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func addSettingsFootnote(to stack: UIStackView, text: String) {
         let label = UILabel()
-        label.text = text
-        label.font = UIFont.systemFont(ofSize: 13)
-        label.textColor = UIColor.white.withAlphaComponent(0.65)
+        label.text = SRText(text)
+        label.font = settingsFont(14)
+        label.textColor = UIColor.secondaryLabel
         enableSettingsTextWrapping(label)
         stack.addArrangedSubview(label)
     }
 
     private func enableSettingsTextWrapping(_ label: UILabel) {
+        label.adjustsFontForContentSizeCategory = true
         label.numberOfLines = 0
         label.lineBreakMode = .byWordWrapping
         label.setContentCompressionResistancePriority(.required, for: .vertical)
@@ -6413,6 +6430,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func enableSettingsButtonTextWrapping(_ button: UIButton) {
+        button.titleLabel?.adjustsFontForContentSizeCategory = true
         button.titleLabel?.numberOfLines = 0
         button.titleLabel?.lineBreakMode = .byWordWrapping
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -6435,9 +6453,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         row.spacing = vertical ? 7 : 12
 
         let titleLabel = UILabel()
-        titleLabel.text = title
-        titleLabel.font = UIFont.systemFont(ofSize: vertical ? 14 : 16, weight: vertical ? .regular : .medium)
-        titleLabel.textColor = vertical ? UIColor.white.withAlphaComponent(0.65) : .white
+        titleLabel.text = SRText(title)
+        titleLabel.isHidden = title.isEmpty
+        titleLabel.font = settingsFont(14, weight: vertical ? .regular : .medium)
+        titleLabel.textColor = vertical ? UIColor.secondaryLabel : .label
         enableSettingsTextWrapping(titleLabel)
         if !vertical { titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true }
 
@@ -6448,7 +6467,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         button.accessibilityIdentifier = "settings.menu.\(key)"
         button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue, compact: compact)
         button.menu = UIMenu(children: items.map { item in
-            UIAction(title: item, state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
+            UIAction(title: SRText(item), state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
                 button?.accessibilityValue = item
                 button?.configuration = self?.settingsMenuConfiguration(title: item, compact: compact)
                 onChange?(item)
@@ -6477,9 +6496,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         row.spacing = compact ? 10 : 16
 
         let titleLabel = UILabel()
-        titleLabel.text = title
+        titleLabel.text = SRText(title)
         titleLabel.font = UIFont.systemFont(ofSize: compact ? 15 : 17, weight: .semibold)
-        titleLabel.textColor = .white
+        titleLabel.textColor = .label
         enableSettingsTextWrapping(titleLabel)
         titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true
 
@@ -6487,15 +6506,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         slider.minimumValue = 0.0
         slider.maximumValue = 1.0
         slider.value = Float(clampedLensPosition(value))
-        slider.minimumTrackTintColor = .systemTeal
-        slider.maximumTrackTintColor = UIColor.white.withAlphaComponent(0.22)
+        slider.minimumTrackTintColor = .systemBlue
+        slider.maximumTrackTintColor = UIColor.secondaryLabel
         slider.accessibilityIdentifier = key
         slider.addTarget(self, action: #selector(settingsSliderChanged(_:)), for: .valueChanged)
 
         let valueLabel = UILabel()
         valueLabel.text = String(format: "%.2f", slider.value)
         valueLabel.font = UIFont.monospacedSystemFont(ofSize: compact ? 13 : 14, weight: .semibold)
-        valueLabel.textColor = .white
+        valueLabel.textColor = .label
         valueLabel.textAlignment = .right
         enableSettingsTextWrapping(valueLabel)
         valueLabel.widthAnchor.constraint(equalToConstant: 48).isActive = true
@@ -6616,17 +6635,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         textStack.spacing = 1
 
         let label = UILabel()
-        label.text = title
+        label.text = SRText(title)
         label.font = UIFont.systemFont(ofSize: 18, weight: .bold)
-        label.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
+        label.textColor = enabled ? .label : UIColor.secondaryLabel
         enableSettingsTextWrapping(label)
         textStack.addArrangedSubview(label)
 
         if let detail, !detail.isEmpty {
             let detailLabel = UILabel()
-            detailLabel.text = detail
+            detailLabel.text = SRText(detail)
             detailLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .medium)
-            detailLabel.textColor = UIColor.white.withAlphaComponent(0.46)
+            detailLabel.textColor = UIColor.secondaryLabel
             enableSettingsTextWrapping(detailLabel)
             textStack.addArrangedSubview(detailLabel)
         }
@@ -6727,12 +6746,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     completion(groups.keys.sorted().map { count in
                         let title = [1: "Single camera", 2: "Dual cameras", 3: "Triple cameras"][count] ?? "\(count) cameras"
                         let actions = (groups[count] ?? []).map { name, candidate in
-                            UIAction(title: name, state: name == self.combinationTitle(draft) ? .on : .off) { [weak self] _ in
+                            UIAction(title: SRText(name), state: name == self.combinationTitle(draft) ? .on : .off) { [weak self] _ in
                                 guard let self, self.settingsCapabilityGeneration == generation else { return }
                                 self.confirmCameraCombination(candidate)
                             }
                         }
-                        return UIMenu(title: title, options: .displayInline, children: actions)
+                        return UIMenu(title: SRText(title), options: .displayInline, children: actions)
                     })
                 }
             }
@@ -6755,9 +6774,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let message = synchronizationDescription(candidate) + "\n\n" + (rear.count > 1
             ? "Only the rear camera views are hardware synchronized. Front records independently; matching timestamps do not guarantee the same exposure instant."
             : "These camera views are not hardware synchronized. Each records original frames independently; alignment uses their capture timestamps.")
-        let alert = UIAlertController(title: "Camera Synchronization", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Use This Combination", style: .default) { [weak self] _ in self?.rebuildCameraSettings(candidate) })
+        let alert = UIAlertController(title: SRText("Camera Synchronization"), message: SRText(message), preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: SRText("Cancel"), style: .cancel))
+        alert.addAction(UIAlertAction(title: SRText("Use This Combination"), style: .default) { [weak self] _ in self?.rebuildCameraSettings(candidate) })
         (settingsController ?? self).present(alert, animated: true)
     }
 
@@ -6779,7 +6798,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let generation = settingsCapabilityGeneration
         let draft = settingsDraft()
         settingsSaveButton?.isEnabled = false
-        settingsValidationLabel?.text = "Checking configuration…"
+        settingsValidationLabel?.text = SRText("Checking configuration…")
         settingsValidationLabel?.isHidden = false
         settingsRetryButton?.isHidden = true
         let valueKeys = ["shared.resolution", "shared.frameRate"]
@@ -6790,8 +6809,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { return }
                 self.settingsSaveButton?.isEnabled = valid
                 self.settingsValidationLabel?.isHidden = valid
-                self.settingsValidationLabel?.text = valid ? nil : "Configuration unavailable. Choose supported values or retry."
-                self.settingsValidationLabel?.textColor = .systemOrange
+                self.settingsValidationLabel?.text = valid ? nil : SRText("Configuration unavailable. Choose supported values or retry.")
+                self.settingsValidationLabel?.textColor = .systemRed
                 self.settingsRetryButton?.isHidden = valid
                 for key in valueKeys {
                     let title = self.settingsMenuHasCandidates[key] != true ? "Not available"
@@ -6840,19 +6859,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func settingsMenuConfiguration(title: String, compact: Bool = false) -> UIButton.Configuration {
         var config = UIButton.Configuration.filled()
-        config.title = title
+        config.title = SRText(title)
         config.attributedTitle = AttributedString(
-            title,
+            SRText(title),
             attributes: AttributeContainer([
-                .font: UIFont.systemFont(ofSize: 15, weight: .medium)
+                .font: settingsFont(16, weight: .medium)
             ])
         )
         config.image = UIImage(systemName: "chevron.down")
         config.imagePlacement = .trailing
         config.imagePadding = 8
-        config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.25)
-        config.baseForegroundColor = .white
-        config.baseForegroundColor = .white
+        config.baseBackgroundColor = .tertiarySystemFill
+        config.baseForegroundColor = .label
         config.cornerStyle = .medium
         config.contentInsets = NSDirectionalEdgeInsets(
             top: 10,
@@ -6880,10 +6898,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc private func showSettingsOverlay() {
         guard settingsOverlayView == nil, !isRecording, recordingTransition == .none, presentedViewController == nil else { return }
         let controller = PortraitSettingsViewController()
-        controller.overrideUserInterfaceStyle = .dark
+        controller.overrideUserInterfaceStyle = .light
         controller.modalPresentationStyle = .fullScreen
         controller.loadViewIfNeeded()
-        controller.view.backgroundColor = .black
+        controller.view.backgroundColor = .systemGroupedBackground
         settingsController = controller
         let hostView = controller.view!
         settingsMenuButtons.removeAll()
@@ -6894,11 +6912,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let dimView = UIView()
         dimView.translatesAutoresizingMaskIntoConstraints = false
-        dimView.backgroundColor = UIColor.black
+        dimView.backgroundColor = .systemGroupedBackground
         hostView.addSubview(dimView)
         settingsOverlayView = dimView
 
         let configPanel = makeOverlayPanel()
+        configPanel.effect = nil
+        configPanel.contentView.backgroundColor = .systemGroupedBackground
         dimView.addSubview(configPanel)
         NSLayoutConstraint.activate([
             dimView.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
@@ -6916,7 +6936,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let scrollView = UIScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.showsVerticalScrollIndicator = true
-        scrollView.indicatorStyle = .white
+        scrollView.indicatorStyle = .black
         scrollView.verticalScrollIndicatorInsets = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
         configPanel.contentView.addSubview(scrollView)
 
@@ -6939,7 +6959,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let stack = UIStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
-        stack.spacing = 16
+        stack.spacing = 12
         scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 18),
@@ -6953,7 +6973,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             actionBar.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 24),
             actionBar.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
             actionBar.bottomAnchor.constraint(equalTo: configPanel.contentView.bottomAnchor, constant: -18),
-            actionBar.heightAnchor.constraint(equalToConstant: 48),
+            actionBar.heightAnchor.constraint(greaterThanOrEqualToConstant: 54),
 
             stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 6),
             stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -6),
@@ -6965,18 +6985,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let arkitAvailable = ARWorldTrackingConfiguration.isSupported
         let initialMode = recorderSettings.captureMode == .arkit && arkitAvailable ? "ARKit" : "Standard"
 
+        let account = addSettingsCard(to: stack, title: "Account", icon: "person.crop.circle", identifier: "account")
+        addPurchaseSection(to: account)
+        let modeCard = addSettingsCard(to: stack, title: "Mode", icon: "square.stack.3d.up", identifier: "mode")
+
         // Camera section container — rebuilt when mode changes
         let cameraContainer = UIStackView()
         cameraContainer.axis = .vertical
         cameraContainer.spacing = 10
 
         addSettingsMenuRow(
-            to: stack,
+            to: modeCard,
             key: "captureMode",
-            title: "Mode",
+            title: "",
             items: arkitAvailable ? ["Standard", "ARKit"] : ["Standard"],
             selectedValue: initialMode,
             compact: false,
+            vertical: true,
             onChange: { [weak self, weak cameraContainer] newMode in
                 guard let self = self, let cameraContainer = cameraContainer else { return }
                 let isARK = newMode == "ARKit"
@@ -6993,7 +7018,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         )
         if !arkitAvailable {
-            addSettingsFootnote(to: stack, text: "ARKit is not available on this device. Only Standard mode is supported.")
+            addSettingsFootnote(to: modeCard, text: "ARKit is not available on this device. Only Standard mode is supported.")
         }
 
         stack.addArrangedSubview(cameraContainer)
@@ -7004,21 +7029,29 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let sensorRows = [("imu", "IMU", recorderSettings.imuEnabled), ("motion", "Motion", recorderSettings.deviceMotionEnabled),
                           ("mag", "Magnetometer", recorderSettings.magnetometerEnabled), ("baro", "Barometer", recorderSettings.barometerEnabled),
                           ("geo", "Location", recorderSettings.geoLocationEnabled), ("audio", "Audio", recorderSettings.audioEnabled)]
-        for index in stride(from: 0, to: sensorRows.count, by: 2) {
-            let row = UIStackView()
-            row.axis = .horizontal
-            row.distribution = .fillEqually
-            row.spacing = 16
-            for (key, title, value) in sensorRows[index..<min(index + 2, sensorRows.count)] {
-                let column = UIStackView()
-                column.axis = .vertical
-                addSettingsRow(to: column, key: key, title: title, detail: "", isOn: value, compact: true)
-                row.addArrangedSubview(column)
-            }
-            sensors.addArrangedSubview(row)
+        for (key, title, value) in sensorRows {
+            addSettingsRow(to: sensors, key: key, title: title, detail: "", isOn: value)
         }
-        let account = addSettingsCard(to: stack, title: "Account", icon: "person.crop.circle", identifier: "account")
-        addPurchaseSection(to: account)
+        let developer = addSettingsCard(to: stack, title: "Developer", icon: "person.crop.square", identifier: "developer")
+        var brandConfiguration = UIButton.Configuration.plain()
+        brandConfiguration.title = "TinyGrapeLab"
+        brandConfiguration.subtitle = SRText("More Information") + " · tinygrapelab.com"
+        brandConfiguration.image = UIImage(named: "TinyGrapeLab")?.preparingThumbnail(of: CGSize(width: 56, height: 56))
+        brandConfiguration.imagePadding = 14
+        brandConfiguration.baseForegroundColor = .label
+        brandConfiguration.titleAlignment = .leading
+        brandConfiguration.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0)
+        let info = UIButton(configuration: brandConfiguration)
+        info.contentHorizontalAlignment = .leading
+        info.accessibilityLabel = "TinyGrapeLab"
+        info.accessibilityHint = SRText("Open developer website")
+        info.accessibilityIdentifier = "settings.developer.moreInfo"
+        info.heightAnchor.constraint(greaterThanOrEqualToConstant: 68).isActive = true
+        info.addAction(UIAction { _ in
+            guard let url = URL(string: "https://tinygrapelab.com/") else { return }
+            UIApplication.shared.open(url)
+        }, for: .touchUpInside)
+        developer.addArrangedSubview(info)
         addSettingsActionButtons(to: actionBar)
         present(controller, animated: true)
 
@@ -7053,7 +7086,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let cameraCard = addSettingsCard(to: container, title: "Camera", icon: "camera", identifier: "camera")
             let validation = UILabel()
             validation.font = .systemFont(ofSize: 13)
-            validation.textColor = UIColor.white.withAlphaComponent(0.6)
+            validation.textColor = UIColor.secondaryLabel
             enableSettingsTextWrapping(validation)
             settingsValidationLabel = validation
             addSettingsMenuRow(to: cameraCard, key: "cameraCombination", title: "Camera combination", items: [],
@@ -7072,14 +7105,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             let reference = enabled.first?.2 ?? config.wide
             let synchronizationLabel = UILabel()
-            synchronizationLabel.text = synchronizationDescription(config)
+            synchronizationLabel.text = SRText(synchronizationDescription(config))
             synchronizationLabel.accessibilityIdentifier = "settings.syncSummary"
             synchronizationLabel.font = .systemFont(ofSize: 13)
-            synchronizationLabel.textColor = config.front.enabled && enabled.count > 1 ? .systemOrange : UIColor.white.withAlphaComponent(0.6)
+            synchronizationLabel.textColor = config.front.enabled && enabled.count > 1 ? .systemBrown : UIColor.secondaryLabel
             enableSettingsTextWrapping(synchronizationLabel)
             cameraCard.addArrangedSubview(synchronizationLabel)
             cameraCard.addArrangedSubview(validation)
-            let retry = makePurchaseButton(title: "Retry", backgroundColor: UIColor.white.withAlphaComponent(0.1), foregroundColor: .white)
+            let retry = makePurchaseButton(title: "Retry", backgroundColor: .tertiarySystemFill, foregroundColor: .systemBlue)
             retry.accessibilityIdentifier = "settings.retry"
             retry.isHidden = true
             retry.addTarget(self, action: #selector(recheckCaptureCapabilities), for: .touchUpInside)
@@ -7087,7 +7120,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             settingsRetryButton = retry
             let captureCard = addSettingsCard(to: container, title: "Capture", icon: "slider.horizontal.3", identifier: "capture")
             let dimensions = UIStackView()
-            dimensions.axis = .horizontal
+            dimensions.axis = .vertical
             dimensions.distribution = .fillEqually
             dimensions.spacing = 12
             for (key, title, value) in [("shared.resolution", "Resolution", reference.resolution), ("shared.frameRate", "Frame rate", reference.frameRate)] {
@@ -7124,8 +7157,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         statusLabel.accessibilityIdentifier = "purchase.status"
         settingsPurchaseStatusLabel = statusLabel
         statusLabel.text = purchaseStatusText()
-        statusLabel.font = UIFont.systemFont(ofSize: 14)
-        statusLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+        statusLabel.font = settingsFont(14)
+        statusLabel.textColor = UIColor.secondaryLabel
         enableSettingsTextWrapping(statusLabel)
         stack.addArrangedSubview(statusLabel)
 
@@ -7137,8 +7170,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let upgradeButton = makePurchaseButton(
             title: upgradeButtonTitle(),
-            backgroundColor: .systemTeal,
-            foregroundColor: .black
+            backgroundColor: .systemBlue,
+            foregroundColor: .white
         )
         upgradeButton.accessibilityIdentifier = "purchase.upgrade"
         upgradeButton.isEnabled = !PurchaseManager.shared.isPremiumUnlocked
@@ -7147,8 +7180,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let restoreButton = makePurchaseButton(
             title: "Restore Purchase",
-            backgroundColor: UIColor.white.withAlphaComponent(0.14),
-            foregroundColor: .white
+            backgroundColor: .tertiarySystemFill,
+            foregroundColor: .systemBlue
         )
         restoreButton.accessibilityIdentifier = "purchase.restore"
         restoreButton.addTarget(self, action: #selector(restorePurchaseButtonTapped), for: .touchUpInside)
@@ -7165,11 +7198,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) -> UIButton {
         let button = UIButton(type: .system)
         var config = UIButton.Configuration.filled()
-        config.title = title
+        config.title = SRText(title)
         config.attributedTitle = AttributedString(
-            title,
+            SRText(title),
             attributes: AttributeContainer([
-                .font: UIFont.systemFont(ofSize: 14, weight: .medium)
+                .font: settingsFont(15, weight: .medium)
             ])
         )
         config.baseBackgroundColor = backgroundColor
@@ -7183,24 +7216,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func purchaseStatusText() -> String {
         if PurchaseManager.shared.isPremiumUnlocked {
-            return "Premium unlocked · Unlimited recordings"
+            return SRText("Premium unlocked · Unlimited recordings")
         }
-        return "Free version · \(freeRecordingLimitMinutesText()) per recording"
+        return String(format: SRText("Free version · %@ per recording"), freeRecordingLimitMinutesText())
     }
 
     private func upgradeButtonTitle() -> String {
         if let price = PurchaseManager.shared.premiumDisplayPrice {
-            return "Upgrade \(price)"
+            return SRText("Upgrade") + " " + price
         }
-        return "Upgrade"
+        return SRText("Upgrade")
     }
 
     private func freeRecordingLimitMinutesText() -> String {
         if freeRecordingLimitSeconds < 60 {
-            return "\(Int(freeRecordingLimitSeconds)) seconds"
+            return String(format: SRText("%d seconds"), Int(freeRecordingLimitSeconds))
         }
         let minutes = Int(freeRecordingLimitSeconds / 60)
-        return "\(minutes) minutes"
+        return String(format: SRText("%d minutes"), minutes)
     }
 
     private func addSettingsRow(
@@ -7224,9 +7257,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let titleLabel = UILabel()
-        titleLabel.text = title
-        titleLabel.font = UIFont.systemFont(ofSize: compact ? 14 : 16, weight: .medium)
-        titleLabel.textColor = enabled ? .white : UIColor.white.withAlphaComponent(0.34)
+        titleLabel.text = SRText(title)
+        titleLabel.font = settingsFont(15, weight: .medium)
+        titleLabel.textColor = enabled ? .label : UIColor.secondaryLabel
         enableSettingsTextWrapping(titleLabel)
         if compact {
             titleLabel.numberOfLines = 1
@@ -7235,9 +7268,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         let detailLabel = UILabel()
-        detailLabel.text = detail
-        detailLabel.font = UIFont.systemFont(ofSize: 13)
-        detailLabel.textColor = UIColor.white.withAlphaComponent(enabled ? 0.56 : 0.28)
+        detailLabel.text = SRText(detail)
+        detailLabel.font = settingsFont(14)
+        detailLabel.textColor = UIColor.secondaryLabel
         detailLabel.isHidden = detail.isEmpty
         enableSettingsTextWrapping(detailLabel)
 
@@ -7267,7 +7300,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let sensorSwitch = UISwitch()
         sensorSwitch.isOn = isOn
         sensorSwitch.isEnabled = enabled
-        sensorSwitch.onTintColor = .systemTeal
+        sensorSwitch.onTintColor = .systemBlue
         sensorSwitch.accessibilityIdentifier = key
         sensorSwitch.setContentCompressionResistancePriority(.required, for: .horizontal)
         if key.hasSuffix(".autoFocus") {
@@ -7340,9 +7373,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         settingsSaveButton = saveButton
         saveButton.accessibilityIdentifier = "settings.save"
         var config = UIButton.Configuration.filled()
-        config.title = "Save Settings"
-        config.baseBackgroundColor = .systemTeal
-        config.baseForegroundColor = .black
+        config.title = SRText("Save Settings")
+        config.baseBackgroundColor = .systemBlue
+        config.baseForegroundColor = .white
         config.cornerStyle = .large
         config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
         saveButton.configuration = config
@@ -7666,29 +7699,29 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let trackingColor: UIColor
             switch tracking {
             case .normal:
-                trackingText = "Normal"
+                trackingText = SRText("Normal")
                 trackingColor = .systemGreen
             case .limited:
-                trackingText = "Limited"
+                trackingText = SRText("Limited")
                 trackingColor = .systemYellow
             case .notAvailable:
-                trackingText = "Not Available"
-                trackingColor = UIColor.white.withAlphaComponent(0.45)
+                trackingText = SRText("Not Available")
+                trackingColor = .secondaryLabel
             }
             let modeText = "ARKit"
             let separator = "  |  "
             let fullText = "\(modeText)\(separator)\(trackingText)"
             let attr = NSMutableAttributedString(string: fullText)
             attr.addAttribute(.foregroundColor, value: UIColor.systemTeal, range: NSRange(location: 0, length: modeText.count))
-            attr.addAttribute(.foregroundColor, value: UIColor.white.withAlphaComponent(0.35), range: NSRange(location: modeText.count, length: separator.count))
+            attr.addAttribute(.foregroundColor, value: UIColor.secondaryLabel, range: NSRange(location: modeText.count, length: separator.count))
             attr.addAttribute(.foregroundColor, value: trackingColor, range: NSRange(location: modeText.count + separator.count, length: trackingText.count))
             label.attributedText = attr
             badge.layer.borderColor = isRecording ? UIColor.systemTeal.withAlphaComponent(0.5).cgColor : UIColor.white.withAlphaComponent(0.15).cgColor
         } else {
             label.attributedText = nil
-            label.text = "Standard"
-            label.textColor = UIColor.white.withAlphaComponent(0.6)
-            badge.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+            label.text = SRText("Standard")
+            label.textColor = .secondaryLabel
+            badge.layer.borderColor = UIColor.separator.cgColor
         }
     }
 
@@ -7706,13 +7739,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let cameraName: String
         if fallbackName.hasPrefix("wide") {
-            cameraName = "WIDE"
+            cameraName = SRText("WIDE")
         } else if fallbackName.hasPrefix("telephoto") {
-            cameraName = "TELE"
+            cameraName = SRText("TELE")
         } else if fallbackName.hasPrefix("front") {
-            cameraName = "FRONT"
+            cameraName = SRText("FRONT")
         } else {
-            cameraName = "ULTRAWIDE"
+            cameraName = SRText("ULTRAWIDE")
         }
         let hz = String(format: "%.1f Hz", measuredCameraFPS[camera] ?? 0)
         return "\(cameraName) \(aspectLabel(for: resolution)) | \(resolution) | \(hz)"
@@ -7720,7 +7753,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func depthStatusText() -> String {
         guard recorderSettings.lidarDepthEnabled else {
-            return "DEPTH OFF"
+            return SRText("DEPTH OFF")
         }
         if isARKitMode {
             let resolution = recorderSettings.arkitCamera.resolution
@@ -7769,14 +7802,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func updateCameraStatusColor(key: String, enabled: Bool, activeRecorder: Bool) {
         guard let label = cameraStatusRows[key] else { return }
-        label.textColor = isRecording && enabled && activeRecorder ? .systemGreen : UIColor.white.withAlphaComponent(0.42)
+        label.textColor = isRecording && enabled && activeRecorder ? .systemGreen : .secondaryLabel
     }
 
     private func updateSensorPill(key: String, title: String, value: String) {
         guard let label = sensorStatusRows[key] else { return }
         let active = isRecording && !value.hasPrefix("0Hz") && value != "--"
-        label.text = "\(title) \(value)"
-        label.textColor = active ? UIColor.systemGreen : UIColor.white.withAlphaComponent(0.42)
+        label.text = "\(SRText(title)) \(value)"
+        label.textColor = active ? UIColor.systemGreen : .secondaryLabel
     }
 
     private func captureSummaryText() -> String {
@@ -7882,9 +7915,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             let presenter: UIViewController = self.settingsController ?? self
             guard presenter.presentedViewController == nil else { return }
-            let fileAlert = UIAlertController(title: "Error", message: msg, preferredStyle: .alert)
+            let fileAlert = UIAlertController(title: SRText("Error"), message: SRText(msg), preferredStyle: .alert)
             fileAlert.view.accessibilityIdentifier = "capture.error"
-            fileAlert.addAction(UIAlertAction(title: "OK", style: .cancel, handler: nil))
+            fileAlert.addAction(UIAlertAction(title: SRText("OK"), style: .cancel, handler: nil))
             presenter.present(fileAlert, animated: true, completion: nil)
         }
     }
@@ -7893,8 +7926,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         DispatchQueue.main.async {
             let presenter: UIViewController = self.settingsController ?? self
             guard presenter.presentedViewController == nil else { return }
-            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .cancel, handler: nil))
+            let alert = UIAlertController(title: SRText(title), message: SRText(message), preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: SRText("OK"), style: .cancel, handler: nil))
             presenter.present(alert, animated: true, completion: nil)
         }
     }
@@ -7903,17 +7936,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         DispatchQueue.main.async {
             guard self.presentedViewController == nil else { return }
             let alert = UIAlertController(
-                title: "Free Recording Limit Reached",
-                message: "Free users can record up to \(self.freeRecordingLimitMinutesText()) per session. Upgrade once to unlock unlimited recording length.",
+                title: SRText("Free Recording Limit Reached"),
+                message: String(format: SRText("Free users can record up to %@ per session. Upgrade once to unlock unlimited recording length."), self.freeRecordingLimitMinutesText()),
                 preferredStyle: .alert
             )
-            alert.addAction(UIAlertAction(title: "Upgrade", style: .default) { _ in
+            alert.addAction(UIAlertAction(title: SRText("Upgrade"), style: .default) { _ in
                 self.purchasePremium()
             })
-            alert.addAction(UIAlertAction(title: "Restore Purchase", style: .default) { _ in
+            alert.addAction(UIAlertAction(title: SRText("Restore Purchase"), style: .default) { _ in
                 self.restorePurchases()
             })
-            alert.addAction(UIAlertAction(title: "Later", style: .cancel, handler: nil))
+            alert.addAction(UIAlertAction(title: SRText("Later"), style: .cancel, handler: nil))
             self.present(alert, animated: true, completion: nil)
         }
     }
@@ -7992,9 +8025,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         DispatchQueue.main.async {
             let presenter: UIViewController = self.settingsController ?? self
             guard presenter.presentedViewController == nil else { return }
-            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-            alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { _ in
+            let alert = UIAlertController(title: SRText(title), message: SRText(message), preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: SRText("Cancel"), style: .cancel, handler: nil))
+            alert.addAction(UIAlertAction(title: SRText("Open Settings"), style: .default) { _ in
                 guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
                 UIApplication.shared.open(url)
             })

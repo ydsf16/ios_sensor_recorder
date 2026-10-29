@@ -6,7 +6,7 @@ final class StandardCaptureUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .landscapeRight
-        app.launchArguments = []
+        app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launch()
         XCTAssertTrue(app.buttons["main.settings"].waitForExistence(timeout: 30))
         dismissConfigurationAlerts()
@@ -320,13 +320,52 @@ final class StandardCaptureUITests: XCTestCase {
     func testPurchaseControlsRemainAccessible() throws {
         app.buttons["main.settings"].tap()
         orientation(portrait: true)
+        let account = app.otherElements["settings.card.account"]
+        let mode = app.otherElements["settings.card.mode"]
+        let camera = app.otherElements["settings.card.camera"]
+        XCTAssertTrue(account.exists && mode.exists && camera.exists)
+        XCTAssertLessThan(account.frame.minY, mode.frame.minY)
+        XCTAssertLessThan(mode.frame.minY, camera.frame.minY)
         let restore = app.buttons["purchase.restore"]
+        XCTAssertTrue(restore.isHittable, "Account actions must be visible without scrolling")
         reveal(restore)
         XCTAssertTrue(restore.isHittable)
         XCTAssertTrue(app.buttons["purchase.upgrade"].exists)
         XCTAssertTrue(app.staticTexts["purchase.status"].exists)
         screenshot("purchase_controls")
+        let developer = app.buttons["settings.developer.moreInfo"]
+        reveal(developer)
+        XCTAssertTrue(developer.isHittable)
+        XCTAssertEqual(developer.label, "TinyGrapeLab")
+        screenshot("developer_information")
         closeSettings()
+    }
+
+    func testSettingsFollowPreferredLanguage() throws {
+        for (language, locale, title, saveTitle) in [("en", "en_US", "Settings", "Save Settings"),
+                                                    ("zh-Hans", "zh_CN", "设置", "保存设置"),
+                                                    ("zh-Hant", "zh_TW", "设置", "保存设置"),
+                                                    ("fr", "fr_FR", "Settings", "Save Settings")] {
+            app.terminate()
+            app.launchArguments = ["-AppleLanguages", "(\(language))", "-AppleLocale", locale]
+            app.launch()
+            XCTAssertTrue(app.buttons["main.settings"].waitForExistence(timeout: 30))
+            dismissConfigurationAlerts()
+            screenshot("capture_\(language)")
+            app.buttons["main.settings"].tap()
+            XCTAssertTrue(app.buttons["settings.save"].waitForExistence(timeout: 20))
+            XCTAssertEqual(app.buttons["settings.save"].label, saveTitle)
+            XCTAssertTrue(app.staticTexts[title].exists)
+            screenshot("settings_\(language)")
+            let brand = app.buttons["settings.developer.moreInfo"]
+            reveal(brand)
+            XCTAssertTrue(brand.isHittable)
+            screenshot("developer_\(language)")
+            closeSettings()
+        }
+        app.terminate()
+        app.launchArguments = []
+        app.launch()
     }
 
     func testExpandedCardsPreserveSensorDraftAcrossCameraAndModeChanges() throws {
@@ -563,14 +602,14 @@ final class SettingsScreenshotUITests: XCTestCase {
         XCTAssertTrue(app.buttons["settings.close"].waitForExistence(timeout: 20))
         let scroll = app.scrollViews.firstMatch
         for _ in 0..<3 { scroll.swipeDown() }
-        for index in 0..<4 {
+        for index in 0..<6 {
             Thread.sleep(forTimeInterval: 1)
             print("SETTINGS_CAPTURE_\(index): \(app.debugDescription)")
             let attachment = XCTAttachment(screenshot: app.screenshot())
             attachment.name = "settings_long_\(index)"
             attachment.lifetime = .keepAlways
             add(attachment)
-            if index < 3 {
+            if index < 5 {
                 scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.7))
                     .press(forDuration: 0.05, thenDragTo: scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.3)))
             }

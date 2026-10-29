@@ -20,6 +20,7 @@
 		26DED2612636F1DF00FAE501 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 26DED2602636F1DF00FAE501 /* Assets.xcassets */; };
 		26DED2642636F1DF00FAE501 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 26DED2622636F1DF00FAE501 /* LaunchScreen.storyboard */; };
 		8A71C0012C17210000A90001 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 8A71C0022C17210000A90001 /* InfoPlist.strings */; };
+		CB8000000000000000000001 = {isa = PBXBuildFile; fileRef = CB8000000000000000000002; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +40,8 @@
 		26DED2632636F1DF00FAE501 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		26DED2652636F1DF00FAE501 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		8A71C0032C17210000A90001 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/InfoPlist.strings"; sourceTree = "<group>"; };
+		CB8000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
+		CB8000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,6 +89,7 @@
 				26DED2622636F1DF00FAE501 /* LaunchScreen.storyboard */,
 				26DED2652636F1DF00FAE501 /* Info.plist */,
 				8A71C0022C17210000A90001 /* InfoPlist.strings */,
+				CB8000000000000000000002 /* Localizable.strings */,
 			);
 			path = SensorRecorder;
 			sourceTree = "<group>";
@@ -165,6 +169,7 @@
 				26DED2612636F1DF00FAE501 /* Assets.xcassets in Resources */,
 				26DED25F2636F1DC00FAE501 /* Main.storyboard in Resources */,
 				8A71C0012C17210000A90001 /* InfoPlist.strings in Resources */,
+				CB8000000000000000000001,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -214,6 +219,7 @@
 			name = InfoPlist.strings;
 			sourceTree = "<group>";
 		};
+		CB8000000000000000000002 = {isa = PBXVariantGroup; children = (CB8000000000000000000003, CB8000000000000000000004,); name = Localizable.strings; sourceTree = "<group>"; };
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
