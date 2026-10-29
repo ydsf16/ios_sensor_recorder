@@ -7,6 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		CA7500000000000000000001 /* RealtimeVideoEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7500000000000000000002; };
+		CA7400000000000000000001 /* TimestampAlignment.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7400000000000000000002; };
+		CA7300000000000000000001 /* CaptureSampleStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7300000000000000000002; };
+		CA7200000000000000000001 /* MultiCameraCaptureGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7200000000000000000002; };
+		CA7100000000000000000001 = {isa = PBXBuildFile; fileRef = CA7100000000000000000002; };
+		CA7000010000000000000001 /* CaptureRateOptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7000010000000000000002 /* CaptureRateOptions.swift */; };
 		26663A5026385F820000D4C6 /* Utils.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26663A4F26385F820000D4C6 /* Utils.swift */; };
 		26DED2582636F1DC00FAE501 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26DED2572636F1DC00FAE501 /* AppDelegate.swift */; };
 		26DED25C2636F1DC00FAE501 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26DED25B2636F1DC00FAE501 /* ViewController.swift */; };
@@ -17,6 +23,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		CA7500000000000000000002 /* RealtimeVideoEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeVideoEncoder.swift; sourceTree = "<group>"; };
+		CA7400000000000000000002 /* TimestampAlignment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimestampAlignment.swift; sourceTree = "<group>"; };
+		CA7300000000000000000002 /* CaptureSampleStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureSampleStorage.swift; sourceTree = "<group>"; };
+		CA7200000000000000000002 /* MultiCameraCaptureGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiCameraCaptureGraph.swift; sourceTree = "<group>"; };
+		CA7100000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StandardCaptureUITests.swift; sourceTree = "<group>"; };
+		CA7100000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = StandardCaptureUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		CA7000010000000000000002 /* CaptureRateOptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureRateOptions.swift; sourceTree = "<group>"; };
 		26663A4F26385F820000D4C6 /* Utils.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Utils.swift; sourceTree = "<group>"; };
 		26DED2542636F1DC00FAE501 /* SensorRecorder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SensorRecorder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		26DED2572636F1DC00FAE501 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -43,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				26DED2562636F1DC00FAE501 /* SensorRecorder */,
+				CA7100000000000000000004,
 				26DED2552636F1DC00FAE501 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -51,6 +65,7 @@
 			isa = PBXGroup;
 			children = (
 				26DED2542636F1DC00FAE501 /* SensorRecorder.app */,
+				CA7100000000000000000003,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -60,6 +75,11 @@
 			children = (
 				26DED2572636F1DC00FAE501 /* AppDelegate.swift */,
 				26DED25B2636F1DC00FAE501 /* ViewController.swift */,
+				CA7000010000000000000002 /* CaptureRateOptions.swift */,
+				CA7200000000000000000002 /* MultiCameraCaptureGraph.swift */,
+				CA7500000000000000000002 /* RealtimeVideoEncoder.swift */,
+				CA7300000000000000000002 /* CaptureSampleStorage.swift */,
+				CA7400000000000000000002 /* TimestampAlignment.swift */,
 				26663A4F26385F820000D4C6 /* Utils.swift */,
 				26DED25D2636F1DC00FAE501 /* Main.storyboard */,
 				26DED2602636F1DF00FAE501 /* Assets.xcassets */,
@@ -70,9 +90,21 @@
 			path = SensorRecorder;
 			sourceTree = "<group>";
 		};
+		CA7100000000000000000004 = {isa = PBXGroup; children = (CA7100000000000000000002,); path = StandardCaptureUITests; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		CA7100000000000000000005 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CA7100000000000000000006;
+			buildPhases = (CA7100000000000000000007, CA7100000000000000000008,);
+			buildRules = ();
+			dependencies = (CA7100000000000000000009,);
+			name = StandardCaptureUITests;
+			productName = StandardCaptureUITests;
+			productReference = CA7100000000000000000003;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		26DED2532636F1DC00FAE501 /* SensorRecorder */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 26DED2682636F1DF00FAE501 /* Build configuration list for PBXNativeTarget "SensorRecorder" */;
@@ -119,6 +151,7 @@
 			projectRoot = "";
 			targets = (
 				26DED2532636F1DC00FAE501 /* SensorRecorder */,
+				CA7100000000000000000005,
 			);
 		};
 /* End PBXProject section */
@@ -138,11 +171,17 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		CA7100000000000000000007 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (CA7100000000000000000001,); runOnlyForDeploymentPostprocessing = 0; };
 		26DED2502636F1DC00FAE501 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				26DED25C2636F1DC00FAE501 /* ViewController.swift in Sources */,
+				CA7000010000000000000001 /* CaptureRateOptions.swift in Sources */,
+				CA7200000000000000000001 /* MultiCameraCaptureGraph.swift in Sources */,
+				CA7500000000000000000001 /* RealtimeVideoEncoder.swift in Sources */,
+				CA7300000000000000000001 /* CaptureSampleStorage.swift in Sources */,
+				CA7400000000000000000001 /* TimestampAlignment.swift in Sources */,
 				26DED2582636F1DC00FAE501 /* AppDelegate.swift in Sources */,
 				26663A5026385F820000D4C6 /* Utils.swift in Sources */,
 			);
@@ -178,6 +217,8 @@
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
+		CA7100000000000000000011 = {isa = XCBuildConfiguration; name = Debug; buildSettings = { CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = F2LVFHW3ZH; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.4; PRODUCT_BUNDLE_IDENTIFIER = com.grape.SensorRecorder.StandardCaptureUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = SensorRecorder; }; };
+		CA7100000000000000000012 = {isa = XCBuildConfiguration; name = Release; buildSettings = { CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = F2LVFHW3ZH; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.4; PRODUCT_BUNDLE_IDENTIFIER = com.grape.SensorRecorder.StandardCaptureUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = SensorRecorder; }; };
 		26DED2662636F1DF00FAE501 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -342,6 +383,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		CA7100000000000000000006 = {isa = XCConfigurationList; buildConfigurations = (CA7100000000000000000011, CA7100000000000000000012,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
 		26DED24F2636F1DC00FAE501 /* Build configuration list for PBXProject "SensorRecorder" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -361,6 +403,9 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+		CA7100000000000000000008 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CA7100000000000000000009 = {isa = PBXTargetDependency; target = 26DED2532636F1DC00FAE501; targetProxy = CA7100000000000000000010; };
+		CA7100000000000000000010 = {isa = PBXContainerItemProxy; containerPortal = 26DED24C2636F1DC00FAE501; proxyType = 1; remoteGlobalIDString = 26DED2532636F1DC00FAE501; remoteInfo = SensorRecorder; };
 	};
 	rootObject = 26DED24C2636F1DC00FAE501 /* Project object */;
 }
