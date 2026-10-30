@@ -25,3 +25,9 @@ Evidence: `.codex-baseline/bilingual-ui-validation/iphone12.xcresult`, `images/`
 Account is now the first expanded settings card, followed by a dedicated Mode card (with one full-width selector), then Camera/Capture/Focus/LiDAR/Sensors/Developer. Account actions are visible without scrolling. Capture returns to dark styling while settings remain light and compact.
 
 iPhone 12: 3/3 targeted XCTest cases PASS (mode/camera draft preservation; portrait/landscape return; account controls plus explicit account→mode→camera ordering). Build and diff checks PASS. Original saved settings are restored after these tests. Evidence: `.codex-baseline/settings-order-validation/`.
+
+## Denser settings refinement
+
+Section headings now use a 15pt baseline, primary values/row labels about 14pt and supporting text 12pt. Card margins/gaps and header/footer spacing are reduced. Resolution, frame rate and maximum exposure use horizontal label/value rows; accessibility content-size categories switch those rows back to vertical layout. Primary menu and purchase buttons retain their 44pt minimum height.
+
+On iPhone 12, the Capture card measured 232pt high versus 334.3pt in the preceding expanded layout (about 31% less), with all four capture controls visible and part of Focus visible on the first screen. Existing portrait/landscape and account/developer reachability tests pass (2/2); native Chinese screenshots inspected. Original saved settings were restored after testing. Evidence: `.codex-baseline/compact-settings-validation/`. Extremely large accessibility fonts have not been individually traversed.

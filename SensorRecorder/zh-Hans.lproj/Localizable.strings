@@ -103,3 +103,9 @@
 "Microphone permission was denied. Please enable Microphone in Settings or turn Audio off in Sensor Recorder settings." = "麦克风权限已被拒绝。请在系统设置中允许访问，或关闭 App 设置中的音频。";
 "Location permission was denied. Please enable Location in Settings or turn GeoLoc off in Sensor Recorder settings." = "位置权限已被拒绝。请在系统设置中允许位置访问，或关闭 App 设置中的位置。";
 "Motion & Fitness permission was denied. Please enable Motion & Fitness in Settings or turn IMU/Mag/Baro/Motion off in Sensor Recorder settings." = "运动与健身权限已被拒绝。请在系统设置中允许访问，或关闭 IMU、磁力计、气压计和设备运动。";
+"Cap" = "采";
+"Send" = "送";
+"Display" = "显≈";
+
+"ARKit source omitted %d frame slots. The recording and timestamps were preserved. Check meta.json." = "ARKit 源数据缺少 %d 个目标帧。录制文件及原始时间戳已保留，请查看 meta.json。";
+"Recording Quality" = "录制质量";

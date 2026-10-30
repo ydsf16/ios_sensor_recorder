@@ -103,3 +103,9 @@
 "Microphone permission was denied. Please enable Microphone in Settings or turn Audio off in Sensor Recorder settings." = "Microphone permission was denied. Please enable Microphone in Settings or turn Audio off in Sensor Recorder settings.";
 "Location permission was denied. Please enable Location in Settings or turn GeoLoc off in Sensor Recorder settings." = "Location permission was denied. Please enable Location in Settings or turn GeoLoc off in Sensor Recorder settings.";
 "Motion & Fitness permission was denied. Please enable Motion & Fitness in Settings or turn IMU/Mag/Baro/Motion off in Sensor Recorder settings." = "Motion & Fitness permission was denied. Please enable Motion & Fitness in Settings or turn IMU/Mag/Baro/Motion off in Sensor Recorder settings.";
+"Cap" = "Cap";
+"Send" = "Send";
+"Display" = "Disp~";
+
+"ARKit source omitted %d frame slots. The recording and timestamps were preserved. Check meta.json." = "ARKit source omitted %d frame slots. The recording and timestamps were preserved. Check meta.json.";
+"Recording Quality" = "Recording Quality";

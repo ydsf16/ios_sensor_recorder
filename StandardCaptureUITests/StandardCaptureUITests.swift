@@ -242,10 +242,87 @@ final class StandardCaptureUITests: XCTestCase {
         save()
     }
 
+    func testSavedARKitToStandardTransitions() throws {
+        configure(combination: "Wide", resolution: "640x480", rate: "30", sensors: false)
+        save()
+        for _ in 0..<2 {
+            app.buttons["main.settings"].tap()
+            select("captureMode", "ARKit")
+            save()
+            // Canceling a Standard draft must resume the same ARKit preview.
+            app.buttons["main.settings"].tap()
+            select("captureMode", "Standard")
+            closeSettings()
+            XCTAssertFalse(app.otherElements["capture.error"].exists)
+            // Actually save the transition, exercising session teardown rather
+            // than only rebuilding controls inside an uncommitted draft.
+            configure(combination: "Wide", resolution: "640x480", rate: "30", sensors: false)
+            save()
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                XCTAssertFalse(app.otherElements["capture.error"].exists, "A retired ARKit session reported an error in Standard")
+                Thread.sleep(forTimeInterval: 0.3)
+            }
+            record(seconds: 3)
+        }
+    }
+
     func testSustainedTripleCameraRecording() throws {
         configure(combination: "Wide + Ultra Wide + Front", resolution: "1920x1080", rate: "30", sensors: true)
         save()
         record(seconds: 60)
+    }
+
+    func testIndependentSensorChannelsWithAudio() throws {
+        configure(combination: "Wide", resolution: "1920x1080", rate: "30", sensors: true)
+        for key in ["mag", "baro", "geo", "audio"] { setSwitch(key, true); allowSystemPermissions() }
+        save()
+        record(seconds: 25)
+    }
+
+    func testARKitIndependentWriterAndPreview() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "ARKit")
+        setSwitch("arkit.autoFocus", true)
+        setSwitch("arkit.autoExposure", true)
+        select("arkit.resolution", "1920x1440")
+        select("arkit.frameRate", "30")
+        save()
+        record(seconds: 15)
+    }
+
+    func testSustainedARKitIndependentWriterAndPreview() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "ARKit")
+        setSwitch("arkit.autoFocus", true)
+        setSwitch("arkit.autoExposure", true)
+        select("arkit.resolution", "1920x1440")
+        select("arkit.frameRate", "30")
+        for key in ["imu", "motion", "mag", "baro", "geo", "audio"] { setSwitch(key, false) }
+        save()
+        record(seconds: 60)
+    }
+
+    func testLongPreview01Triple1080p60() throws {
+        configure(combination: "Wide + Ultra Wide + Front", resolution: "1920x1080", rate: "60", sensors: true)
+        setSwitch("audio", true); allowSystemPermissions()
+        save(); record(seconds: 90)
+    }
+
+    func testLongPreview02Wide4K60() throws {
+        configure(combination: "Wide", resolution: "3840x2160", rate: "60", sensors: true)
+        save(); record(seconds: 90)
+    }
+
+    func testLongPreview03RearPair4K30() throws {
+        configure(combination: "Wide + Ultra Wide", resolution: "3840x2160", rate: "30", sensors: true)
+        save(); record(seconds: 90)
+    }
+
+    func testTripleCameraPreviewDuring60FPSRecording() throws {
+        configure(combination: "Wide + Ultra Wide + Front", resolution: "1920x1080", rate: "60", sensors: false)
+        save()
+        record(seconds: 15)
     }
 
     func testSingleCameraFocusAndPersistence() throws {
@@ -446,10 +523,28 @@ final class StandardCaptureUITests: XCTestCase {
         XCTAssertFalse(app.alerts.firstMatch.exists, app.alerts.firstMatch.debugDescription)
     }
 
+    @discardableResult
+    private func allowSystemPermissions() -> Bool {
+        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
+        guard alert.exists else { return false }
+        let using = alert.buttons.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "使用", "允许")).firstMatch
+        if using.exists { using.tap(); return true }
+        for title in ["Allow While Using App", "Allow Once", "Allow", "OK", "允许一次", "允许", "好"] {
+            if alert.buttons[title].exists { alert.buttons[title].tap(); return true }
+        }
+        return false
+    }
+
     private func record(seconds: TimeInterval) {
         let toggle = app.buttons["record.toggle"]
         toggle.tap()
-        wait(toggle, "value == 'recording'", timeout: 30)
+        let permissionDeadline = Date().addingTimeInterval(30)
+        while toggle.value as? String != "recording", Date() < permissionDeadline {
+            allowSystemPermissions()
+            if app.otherElements["capture.error"].exists { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        wait(toggle, "value == 'recording'", timeout: 2)
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         for _ in 0..<2 {
             Thread.sleep(forTimeInterval: 0.5)

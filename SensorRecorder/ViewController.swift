@@ -1,4 +1,6 @@
 import UIKit
+import ObjectiveC
+import Darwin
 import AVFoundation
 import CoreLocation
 import CoreMotion
@@ -20,6 +22,177 @@ private func SRText(_ key: String) -> String {
     if key.contains(" + ") { return key.components(separatedBy: " + ").map(SRText).joined(separator: " + ") }
     if key.hasPrefix("Hardware sync: ") { return SRText("Hardware sync") + ": " + SRText(String(key.dropFirst(15))) }
     return srLocalizationBundle.localizedString(forKey: key, value: key, table: nil)
+}
+
+private var livePreviewAssociationKey: UInt8 = 0
+
+/// A bounded, latest-frame preview mailbox. Recording never uses this mailbox.
+private final class LivePreviewRenderer {
+    private struct Frame {
+        let image: CVPixelBuffer
+        let pts: CMTime
+        let format: CMFormatDescription?
+        let admitted: TimeInterval
+    }
+    private weak var layer: AVSampleBufferDisplayLayer?
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var latest: Frame?
+    private var scheduled = false
+    private var submitted = 0, replaced = 0, enqueued = 0, notReady = 0, copyFailures = 0
+    // Producer-queue owned. Never retain the SDK pixel-buffer pool for display.
+    private let storage = CaptureSampleStorage()
+    private var started = ProcessInfo.processInfo.systemUptime
+    private var maximumDelayMS = 0.0
+    private var previousSourcePTS: Double?
+    private var maximumSourceGapMS = 0.0
+    private var enqueueTimes: [TimeInterval] = []
+    private var lastMetricsRequest = 0.0 // Render-queue owned.
+    private var publicMetrics: [String: Any] = [:]
+    private var lastPublicCount: Int?
+    private var lastPublicTime: TimeInterval?
+
+    init(layer: AVSampleBufferDisplayLayer, name: String) {
+        self.layer = layer
+        if #available(iOS 17.0, *) {
+            queue = DispatchQueue(label: "com.sensorrecorder.preview.\(name)", qos: .userInteractive, autoreleaseFrequency: .workItem)
+        } else {
+            // Older display-layer APIs retain their main-thread path, but use
+            // the same bounded mailbox without a capture-queue acknowledgement.
+            queue = .main
+        }
+    }
+
+    func submit(_ sample: CMSampleBuffer) {
+        let admitted = ProcessInfo.processInfo.systemUptime
+        do {
+            let owned = try storage.copy(sample)
+            guard let image = CMSampleBufferGetImageBuffer(owned) else { return }
+            admit(image, pts: CMSampleBufferGetPresentationTimeStamp(owned), format: CMSampleBufferGetFormatDescription(owned), admitted: admitted)
+        } catch {
+            lock.lock(); copyFailures += 1; lock.unlock()
+        }
+    }
+
+    func submit(_ image: CVPixelBuffer, pts: CMTime, format: CMFormatDescription? = nil) {
+        var description = format
+        if description == nil {
+            guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: image, formatDescriptionOut: &description) == noErr else { return }
+        }
+        guard let description else { return }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: image,
+            formatDescription: description, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
+        submit(sample)
+    }
+
+    private func admit(_ image: CVPixelBuffer, pts: CMTime, format: CMFormatDescription?, admitted: TimeInterval) {
+        let frame = Frame(image: image, pts: pts, format: format, admitted: admitted)
+        lock.lock()
+        submitted += 1
+        let sourcePTS = CMTimeGetSeconds(pts)
+        if let previousSourcePTS, sourcePTS > previousSourcePTS { maximumSourceGapMS = max(maximumSourceGapMS, (sourcePTS - previousSourcePTS) * 1000) }
+        if sourcePTS.isFinite { previousSourcePTS = sourcePTS }
+        if latest != nil { replaced += 1 }
+        latest = frame
+        let shouldSchedule = !scheduled
+        scheduled = true
+        lock.unlock()
+        if shouldSchedule { queue.async { [weak self] in self?.drain() } }
+    }
+
+    func resetStatistics() {
+        lock.lock(); defer { lock.unlock() }
+        submitted = 0; replaced = 0; enqueued = 0; notReady = 0; copyFailures = 0
+        maximumDelayMS = 0
+        previousSourcePTS = nil; maximumSourceGapMS = 0
+        enqueueTimes.removeAll(keepingCapacity: true)
+        started = ProcessInfo.processInfo.systemUptime
+    }
+
+    func statistics() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - started)
+        let now = ProcessInfo.processInfo.systemUptime
+        let recent = enqueueTimes.filter { now - $0 < 2 }
+        let recentHz = recent.count > 1 && now - (recent.last ?? 0) < 1
+            ? Double(recent.count - 1) / max(0.001, recent.last! - recent.first!) : 0
+        var result: [String: Any] = ["submitted": submitted, "enqueued": enqueued, "replaced_preview_frames": replaced,
+                "renderer_not_ready": notReady, "copy_failures": copyFailures, "interval_sec": elapsed,
+                "enqueue_hz": Double(enqueued) / elapsed, "max_submit_to_enqueue_ms": maximumDelayMS,
+                "max_source_timestamp_gap_ms": maximumSourceGapMS,
+                "background_renderer": ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 17,
+                "recent_enqueue_hz": recentHz]
+        result.merge(publicMetrics) { _, new in new }
+        if now - (lastPublicTime ?? 0) > 2 { result.removeValue(forKey: "display_hz_estimate") }
+        return result
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard let frame = latest else { scheduled = false; lock.unlock(); return }
+            latest = nil
+            lock.unlock()
+            autoreleasepool { present(frame) }
+        }
+    }
+
+    private func present(_ frame: Frame) {
+        guard let layer else { return }
+        var format = frame.format
+        if format == nil {
+            guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame.image, formatDescriptionOut: &format) == noErr else { return }
+        }
+        guard let format else { return }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: frame.pts, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame.image,
+            formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
+        // A fresh wrapper is essential: never modify the recording sample's attachments or PTS.
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true), CFArrayGetCount(attachments) > 0 {
+            let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        let ready: Bool
+        if #available(iOS 17.0, *) {
+            let renderer = layer.sampleBufferRenderer
+            if renderer.status == .failed { renderer.flush() }
+            ready = renderer.isReadyForMoreMediaData
+            if ready { renderer.enqueue(sample) }
+            if #available(iOS 17.4, *), frame.admitted - lastMetricsRequest >= 1 {
+                lastMetricsRequest = frame.admitted
+                renderer.loadVideoPerformanceMetrics { [weak self] metrics in
+                    guard let self, let metrics, metrics.totalNumberOfFrames > 0 else { return }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let displayed = max(0, metrics.totalNumberOfFrames - metrics.numberOfDroppedFrames - metrics.numberOfCorruptedFrames)
+                    self.lock.lock(); defer { self.lock.unlock() }
+                    if let previous = self.lastPublicCount, let time = self.lastPublicTime, now > time, displayed >= previous {
+                        self.publicMetrics["display_hz_estimate"] = Double(displayed - previous) / (now - time)
+                    }
+                    self.lastPublicCount = displayed; self.lastPublicTime = now
+                    self.publicMetrics["renderer_lifetime_total_frames"] = metrics.totalNumberOfFrames
+                    self.publicMetrics["renderer_lifetime_dropped_frames"] = metrics.numberOfDroppedFrames
+                    self.publicMetrics["renderer_lifetime_corrupted_frames"] = metrics.numberOfCorruptedFrames
+                    self.publicMetrics["renderer_lifetime_accumulated_delay_sec"] = metrics.totalAccumulatedFrameDelay
+                }
+            }
+        } else {
+            if layer.status == .failed { layer.flush() }
+            ready = layer.isReadyForMoreMediaData
+            if ready { layer.enqueue(sample) }
+        }
+        lock.lock(); defer { lock.unlock() }
+        if ready {
+            enqueued += 1
+            let now = ProcessInfo.processInfo.systemUptime
+            enqueueTimes.append(now)
+            enqueueTimes.removeAll { now - $0 > 2 }
+            maximumDelayMS = max(maximumDelayMS, (ProcessInfo.processInfo.systemUptime - frame.admitted) * 1000)
+        } else { notReady += 1 }
+    }
 }
 
 private final class CameraPreviewView: UIView {
@@ -743,6 +916,24 @@ private final class CameraStreamRecorder {
 }
 
 private final class ARKitFrameRecorder {
+    private struct CameraSnapshot {
+        let transform: simd_float4x4
+        let intrinsics: simd_float3x3
+        let exposureDuration: TimeInterval
+        let trackingState: ARCamera.TrackingState
+        init(_ camera: ARCamera) {
+            transform = camera.transform; intrinsics = camera.intrinsics
+            exposureDuration = camera.exposureDuration; trackingState = camera.trackingState
+        }
+    }
+
+    private let channel = IndependentWriteChannel(label: "com.sensorrecorder.arkit.writer", maximumBytes: 128 * 1024 * 1024, maximumItems: 60)
+    private let storage = CaptureSampleStorage()
+    var onFailure: ((String) -> Void)? {
+        get { channel.onFailure }
+        set { channel.onFailure = newValue }
+    }
+
     private let videoURL: URL
     private let infoURL: URL
     private let targetFrameRate: Double
@@ -757,6 +948,20 @@ private final class ARKitFrameRecorder {
     private var isFinishing = false
     private var didWriteCSVHeader = false
     private var previousQuaternionXYZW: SIMD4<Float>?
+    private var previousRecordSlot: Int64?
+    private let integrityLock = NSLock()
+    private var missingTargetSlots = 0
+    private var gapEvents: [[String: Any]] = []
+
+    var frameIntegrity: [String: Any] {
+        integrityLock.lock(); defer { integrityLock.unlock() }
+        return ["missing_target_slots": missingTargetSlots, "first_gap_events": gapEvents,
+                "source_timestamps_preserved": true]
+    }
+
+    var missingFrameCount: Int {
+        integrityLock.lock(); defer { integrityLock.unlock() }; return missingTargetSlots
+    }
 
     init(videoURL: URL, infoURL: URL, targetFrameRate: Double, captureFrameRate: Double) {
         self.videoURL = videoURL
@@ -768,6 +973,7 @@ private final class ARKitFrameRecorder {
         try? FileManager.default.removeItem(at: infoURL)
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
+        if infoHandle == nil { channel.reportFailure("Cannot open ARKit pose index") }
         writeInfoLine("# camera,arkit")
         writeInfoLine("# pixel_orientation,arkit_native_landscape,device_orientation,landscape_right")
         writeInfoLine("# camera_coordinates,opencv_rdf,x_right,y_down,z_forward")
@@ -780,11 +986,36 @@ private final class ARKitFrameRecorder {
         camera: ARCamera,
         recordSlot: Int64
     ) {
+        guard let sample = makeSampleBuffer(pixelBuffer: sourcePixelBuffer, presentationTime: presentationTime) else { channel.reportFailure("Invalid ARKit input"); return }
+        do {
+            let owned = try storage.copy(sample)
+            guard let image = CMSampleBufferGetImageBuffer(owned) else { return }
+            let snapshot = CameraSnapshot(camera)
+            channel.enqueue(bytes: CVPixelBufferGetDataSize(image)) {
+                self.appendOnWriterQueue(pixelBuffer: image, presentationTime: presentationTime, camera: snapshot, recordSlot: recordSlot)
+            }
+        } catch { channel.reportFailure(error.localizedDescription) }
+    }
+
+    private func appendOnWriterQueue(pixelBuffer sourcePixelBuffer: CVPixelBuffer, presentationTime: CMTime, camera: CameraSnapshot, recordSlot: Int64) {
         guard !isFinishing else { return }
+        if let previousRecordSlot {
+            guard recordSlot > previousRecordSlot else { channel.reportFailure("Non-monotonic ARKit target slots"); return }
+            if recordSlot > previousRecordSlot + 1 {
+                integrityLock.lock()
+                missingTargetSlots += Int(recordSlot - previousRecordSlot - 1)
+                if gapEvents.count < 32 {
+                    gapEvents.append(["expected_slot": previousRecordSlot + 1, "received_slot": recordSlot,
+                                      "sensor_sec": CMTimeGetSeconds(presentationTime)])
+                }
+                integrityLock.unlock()
+                writeInfoLine("# source_slot_gap,expected,\(previousRecordSlot + 1),received,\(recordSlot)")
+            }
+        }
         if writer == nil {
             configureWriter(pixelBuffer: sourcePixelBuffer)
         }
-        guard let writer = writer, let input = input else { return }
+        guard let writer = writer, let input = input else { channel.reportFailure("ARKit writer unavailable"); return }
 
         if firstPTS == nil {
             firstPTS = presentationTime
@@ -793,20 +1024,18 @@ private final class ARKitFrameRecorder {
         }
 
         guard writer.status == .writing, input.isReadyForMoreMediaData else {
-            if writer.status == .failed {
-                writeInfoLine("# writer_failed \(writer.error?.localizedDescription ?? "unknown")")
-            }
+            channel.reportFailure(writer.error?.localizedDescription ?? "ARKit encoder could not accept a frame")
             return
         }
 
         let sampleBuffer = makeSampleBuffer(pixelBuffer: sourcePixelBuffer, presentationTime: presentationTime)
         guard let sampleBuffer = sampleBuffer else {
-            writeInfoLine("# sample_buffer_failed \(frameIndex)")
+            channel.reportFailure("ARKit sample creation failed at frame \(frameIndex)")
             return
         }
 
         guard input.append(sampleBuffer) else {
-            writeInfoLine("# append_failed \(frameIndex) \(writer.error?.localizedDescription ?? "unknown")")
+            channel.reportFailure(writer.error?.localizedDescription ?? "ARKit append failed")
             return
         }
 
@@ -816,17 +1045,22 @@ private final class ARKitFrameRecorder {
             pixelBuffer: sourcePixelBuffer,
             recordSlot: recordSlot
         )
+        previousRecordSlot = recordSlot
         frameIndex += 1
     }
 
     func finish(_ completion: @escaping () -> Void) {
+        channel.finish { self.finishOnWriterQueue(completion) }
+    }
+
+    private func finishOnWriterQueue(_ completion: @escaping () -> Void) {
         guard !isFinishing else {
             completion()
             return
         }
         isFinishing = true
-        infoHandle?.synchronizeFile()
-        infoHandle?.closeFile()
+        do { try infoHandle?.synchronize(); try infoHandle?.close() }
+        catch { channel.reportFailure(error.localizedDescription) }
         infoHandle = nil
 
         guard let writer = writer else {
@@ -834,10 +1068,17 @@ private final class ARKitFrameRecorder {
             return
         }
         input?.markAsFinished()
-        writer.finishWriting(completionHandler: completion)
+        writer.finishWriting {
+            if writer.status != .completed { self.channel.reportFailure(writer.error?.localizedDescription ?? "ARKit finalization failed") }
+            completion()
+        }
     }
 
     func writeDeviceFormat(resolution: CGSize) {
+        channel.enqueue { self.writeDeviceFormatOnWriterQueue(resolution: resolution) }
+    }
+
+    private func writeDeviceFormatOnWriterQueue(resolution: CGSize) {
         writeInfoLine("# active_format,\(Int(resolution.width))x\(Int(resolution.height)),capture_fps,\(String(format: "%.3f", captureFrameRate))")
         writeInfoLine("# recording,target_fps,\(String(format: "%.3f", targetFrameRate)),sampling,host_time_grid")
         writeInfoLine("# video_media_time_scale,\(CameraStreamRecorder.videoMediaTimeScale),units_per_second")
@@ -909,7 +1150,7 @@ private final class ARKitFrameRecorder {
 
     private func writeInfo(
         presentationTime: CMTime,
-        camera: ARCamera,
+        camera: CameraSnapshot,
         pixelBuffer: CVPixelBuffer,
         recordSlot: Int64
     ) {
@@ -964,7 +1205,8 @@ private final class ARKitFrameRecorder {
 
     private func writeInfoLine(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }
-        infoHandle?.write(data)
+        do { try infoHandle?.write(contentsOf: data) }
+        catch { channel.reportFailure(error.localizedDescription) }
     }
 
     private func writeCSVHeaderIfNeeded() {
@@ -1019,6 +1261,27 @@ private final class ARKitFrameRecorder {
 }
 
 private final class LiDARDepthStreamRecorder {
+    private let channel = IndependentWriteChannel(label: "com.sensorrecorder.depth.writer", maximumBytes: 16 * 1024 * 1024, maximumItems: 64)
+    var onFailure: ((String) -> Void)? {
+        get { channel.onFailure }
+        set { channel.onFailure = newValue }
+    }
+
+    private func ownedDepth(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        var destination: CVPixelBuffer?
+        let width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source)
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, CVPixelBufferGetPixelFormatType(source), nil, &destination) == kCVReturnSuccess, let destination else { channel.reportFailure("Depth buffer allocation failed"); return nil }
+        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess else { channel.reportFailure("Depth source lock failed"); return nil }
+        defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+        guard CVPixelBufferLockBaseAddress(destination, []) == kCVReturnSuccess else { channel.reportFailure("Depth destination lock failed"); return nil }
+        defer { CVPixelBufferUnlockBaseAddress(destination, []) }
+        guard let input = CVPixelBufferGetBaseAddress(source), let output = CVPixelBufferGetBaseAddress(destination) else { channel.reportFailure("Depth bytes unavailable"); return nil }
+        for row in 0..<height {
+            memcpy(output.advanced(by: row * CVPixelBufferGetBytesPerRow(destination)), input.advanced(by: row * CVPixelBufferGetBytesPerRow(source)), width * MemoryLayout<Float>.size)
+        }
+        return destination
+    }
+
     private let depthDirectoryURL: URL
     private let infoURL: URL
     private var infoHandle: FileHandle?
@@ -1034,13 +1297,17 @@ private final class LiDARDepthStreamRecorder {
         try? FileManager.default.createDirectory(at: depthDirectoryURL, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: infoURL.path, contents: nil)
         infoHandle = try? FileHandle(forWritingTo: infoURL)
+        if infoHandle == nil { channel.reportFailure("Cannot open depth index") }
         writeInfoLine("frame_index,sensor_sec,utc_sec,file_name,width_px,height_px,pixel_format,bytes_per_pixel,depth_unit,depth_scale,min_depth_m,max_depth_m,fx_px,fy_px,cx_px,cy_px")
     }
 
     func append(depthData: AVDepthData, sensorSec: TimeInterval) {
         let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-        let pixelBuffer = converted.depthDataMap
-        appendFloat32DepthMap(pixelBuffer, calibration: converted.cameraCalibrationData, sensorSec: sensorSec)
+        guard let pixelBuffer = ownedDepth(converted.depthDataMap) else { return }
+        let calibration = converted.cameraCalibrationData
+        channel.enqueue(bytes: CVPixelBufferGetDataSize(pixelBuffer)) {
+            self.appendFloat32DepthMap(pixelBuffer, calibration: calibration, sensorSec: sensorSec)
+        }
     }
 
     /// Accept a raw float32 depth map (meters) from ARKit's ARDepthData.
@@ -1050,12 +1317,10 @@ private final class LiDARDepthStreamRecorder {
         imageResolution: CGSize,
         sensorSec: TimeInterval
     ) {
-        appendFloat32DepthMap(
-            pixelBuffer,
-            arkitIntrinsics: intrinsics,
-            imageResolution: imageResolution,
-            sensorSec: sensorSec
-        )
+        guard let owned = ownedDepth(pixelBuffer) else { return }
+        channel.enqueue(bytes: CVPixelBufferGetDataSize(owned)) {
+            self.appendFloat32DepthMap(owned, arkitIntrinsics: intrinsics, imageResolution: imageResolution, sensorSec: sensorSec)
+        }
     }
 
     private func appendFloat32DepthMap(_ pixelBuffer: CVPixelBuffer, calibration: AVCameraCalibrationData?, sensorSec: TimeInterval) {
@@ -1170,10 +1435,11 @@ private final class LiDARDepthStreamRecorder {
                 intent: .defaultIntent
               ),
               let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            channel.reportFailure("Could not create the depth PNG destination")
             return
         }
         CGImageDestinationAddImage(destination, image, nil)
-        CGImageDestinationFinalize(destination)
+        if !CGImageDestinationFinalize(destination) { channel.reportFailure("Depth PNG finalization failed") }
     }
 
     private func scaledDepthIntrinsics(
@@ -1196,23 +1462,28 @@ private final class LiDARDepthStreamRecorder {
         )
     }
 
-    func finish() {
-        infoHandle?.synchronizeFile()
-        infoHandle?.closeFile()
-        infoHandle = nil
+    func finish(_ completion: @escaping () -> Void = {}) {
+        channel.finish {
+            do { try self.infoHandle?.synchronize(); try self.infoHandle?.close() }
+            catch { self.channel.reportFailure(error.localizedDescription) }
+            self.infoHandle = nil
+            completion()
+        }
     }
 
     private func writeInfoLine(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }
-        infoHandle?.write(data)
+        do { try infoHandle?.write(contentsOf: data) }
+        catch { channel.reportFailure(error.localizedDescription) }
     }
 }
 
 private final class AudioStreamRecorder {
+    private let channel = IndependentWriteChannel(label: "com.sensorrecorder.audio", maximumBytes: 8 * 1024 * 1024, maximumItems: 512)
     var onFailure: ((String) -> Void)? {
-        didSet { if let failureMessage { onFailure?(failureMessage) } }
+        get { channel.onFailure }
+        set { channel.onFailure = newValue }
     }
-    private var failureMessage: String?
     private let audioURL: URL
     private let infoURL: URL
     private var writer: AVAssetWriter?
@@ -1239,6 +1510,28 @@ private final class AudioStreamRecorder {
     }
 
     func append(_ sampleBuffer: CMSampleBuffer, sessionClock: CMClock?) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let sensorSec = CMTimeGetSeconds(sessionClock.map { CMSyncConvertTime(pts, from: $0, to: CMClockGetHostTimeClock()) } ?? pts)
+        guard let data = CMSampleBufferGetDataBuffer(sampleBuffer) else { fail("Missing PCM data"); return }
+        var ownedData: CMBlockBuffer?
+        let status = CMBlockBufferCreateContiguous(allocator: kCFAllocatorDefault, sourceBuffer: data,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+            dataLength: CMBlockBufferGetDataLength(data), flags: kCMBlockBufferAlwaysCopyDataFlag, blockBufferOut: &ownedData)
+        guard status == kCMBlockBufferNoErr, let ownedData else { fail("Could not detach PCM input"); return }
+        var timing = CMSampleTimingInfo()
+        guard CMSampleBufferGetSampleTimingInfo(sampleBuffer, at: 0, timingInfoOut: &timing) == noErr else { fail("Invalid PCM timing"); return }
+        var size = CMSampleBufferGetSampleSize(sampleBuffer, at: 0)
+        var owned: CMSampleBuffer?
+        guard CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: ownedData, dataReady: true,
+            makeDataReadyCallback: nil, refcon: nil, formatDescription: CMSampleBufferGetFormatDescription(sampleBuffer),
+            sampleCount: CMSampleBufferGetNumSamples(sampleBuffer), sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &owned) == noErr, let owned else { fail("Could not create owned PCM sample"); return }
+        channel.enqueue(bytes: CMBlockBufferGetDataLength(ownedData)) {
+            self.appendOnWriterQueue(owned, sensorSec: sensorSec)
+        }
+    }
+
+    private func appendOnWriterQueue(_ sampleBuffer: CMSampleBuffer, sensorSec capturedSensorSec: TimeInterval) {
         guard !isFinishing else { return }
         guard infoHandle != nil else { fail("Cannot open the audio index file"); return }
         if writer == nil {
@@ -1257,15 +1550,19 @@ private final class AudioStreamRecorder {
                 fail(writer.error?.localizedDescription ?? "Audio append failed")
                 return
             }
-            let sensorSec = writeInfo(sampleBuffer, sessionClock: sessionClock)
+            let sensorSec = writeInfo(sampleBuffer, sensorSec: capturedSensorSec)
             recordSample(sensorSec)
-            frameIndex += 1
+            statusLock.lock(); frameIndex += 1; statusLock.unlock()
         } else {
             fail(writer.error?.localizedDescription ?? "The audio encoder could not accept a captured sample")
         }
     }
 
     func finish(_ completion: @escaping () -> Void) {
+        channel.finish { self.finishOnWriterQueue(completion) }
+    }
+
+    private func finishOnWriterQueue(_ completion: @escaping () -> Void) {
         guard !isFinishing else {
             completion()
             return
@@ -1323,15 +1620,7 @@ private final class AudioStreamRecorder {
         }
     }
 
-    private func writeInfo(_ sampleBuffer: CMSampleBuffer, sessionClock: CMClock?) -> TimeInterval {
-        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let sensorTime: CMTime
-        if let sessionClock = sessionClock {
-            sensorTime = CMSyncConvertTime(presentationTime, from: sessionClock, to: CMClockGetHostTimeClock())
-        } else {
-            sensorTime = presentationTime
-        }
-        let sensorSec = CMTimeGetSeconds(sensorTime)
+    private func writeInfo(_ sampleBuffer: CMSampleBuffer, sensorSec: TimeInterval) -> TimeInterval {
         let utcSec = sensorSec + utcMinusSensorOffsetSec
         let durationSec = CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer))
         let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
@@ -1385,11 +1674,7 @@ private final class AudioStreamRecorder {
         catch { fail("Could not write the audio index: \(error.localizedDescription)") }
     }
 
-    private func fail(_ reason: String) {
-        guard failureMessage == nil else { return }
-        failureMessage = "audio: \(reason)"
-        onFailure?(failureMessage!)
-    }
+    private func fail(_ reason: String) { channel.reportFailure("audio: " + reason) }
 
     private func recordSample(_ sensorSec: TimeInterval) {
         statusLock.lock()
@@ -1409,27 +1694,38 @@ private final class AudioStreamRecorder {
 
 private final class SensorCSVWriter {
     private var handle: FileHandle?
+    private let channel: IndependentWriteChannel
+    var onFailure: ((String) -> Void)? {
+        get { channel.onFailure }
+        set { channel.onFailure = newValue }
+    }
 
     init(url: URL, header: String) {
+        channel = IndependentWriteChannel(label: "com.sensorrecorder.csv." + url.lastPathComponent)
         try? FileManager.default.removeItem(at: url)
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try? FileHandle(forWritingTo: url)
+        if handle == nil { channel.reportFailure("Cannot open " + url.lastPathComponent) }
         writeLine(header)
     }
 
     func writeLine(_ line: String) {
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        handle?.write(data)
+        let data = Data((line + "\n").utf8)
+        channel.enqueue(bytes: data.count) { try self.handle?.write(contentsOf: data) }
     }
 
-    func close() {
-        handle?.synchronizeFile()
-        handle?.closeFile()
-        handle = nil
+    func close(_ completion: @escaping () -> Void = {}) {
+        channel.finish {
+            do { try self.handle?.synchronize(); try self.handle?.close() }
+            catch { self.channel.reportFailure(error.localizedDescription) }
+            self.handle = nil
+            completion()
+        }
     }
 }
 
 private final class SensorStreamRecorder {
+    var onFailure: ((String) -> Void)?
     struct Options {
         var imuEnabled: Bool
         var deviceMotionEnabled: Bool
@@ -1552,6 +1848,9 @@ private final class SensorStreamRecorder {
             )
             startBarometerUpdates()
         }
+        for writer in [accelerometerWriter, gyroscopeWriter, imuWriter, deviceMotionWriter, magnetometerWriter, barometerWriter] {
+            writer?.onFailure = onFailure
+        }
     }
 
     func statusText() -> String {
@@ -1582,26 +1881,21 @@ private final class SensorStreamRecorder {
         ]
     }
 
-    func stop() {
+    func stop(_ completion: @escaping () -> Void = {}) {
         motionManager.stopAccelerometerUpdates()
         motionManager.stopGyroUpdates()
         motionManager.stopDeviceMotionUpdates()
         motionManager.stopMagnetometerUpdates()
         altimeter.stopRelativeAltitudeUpdates()
-        queue.addOperation {
-            self.accelerometerWriter?.close()
-            self.gyroscopeWriter?.close()
-            self.imuWriter?.close()
-            self.deviceMotionWriter?.close()
-            self.magnetometerWriter?.close()
-            self.barometerWriter?.close()
-            self.accelerometerWriter = nil
-            self.gyroscopeWriter = nil
-            self.imuWriter = nil
-            self.deviceMotionWriter = nil
-            self.magnetometerWriter = nil
-            self.barometerWriter = nil
+        queue.addBarrierBlock {
+            let group = DispatchGroup()
+            for writer in [self.accelerometerWriter, self.gyroscopeWriter, self.imuWriter, self.deviceMotionWriter, self.magnetometerWriter, self.barometerWriter].compactMap({ $0 }) {
+                group.enter(); writer.close { group.leave() }
+            }
+            self.accelerometerWriter = nil; self.gyroscopeWriter = nil; self.imuWriter = nil
+            self.deviceMotionWriter = nil; self.magnetometerWriter = nil; self.barometerWriter = nil
             self.latestAccelerometerSample = nil
+            group.notify(queue: .global(qos: .utility), execute: completion)
         }
     }
 
@@ -1871,6 +2165,10 @@ private final class SensorStreamRecorder {
 }
 
 private final class GeoLocationStreamRecorder {
+    var onFailure: ((String) -> Void)? {
+        get { writer.onFailure }
+        set { writer.onFailure = newValue }
+    }
     private let writer: SensorCSVWriter
     private let utcMinusSensorOffsetSec: TimeInterval
     private var count = 0
@@ -1966,8 +2264,8 @@ private final class GeoLocationStreamRecorder {
         return String(format: "%.1fHz", hz)
     }
 
-    func close() {
-        writer.close()
+    func close(_ completion: @escaping () -> Void = {}) {
+        writer.close(completion)
     }
 
     private func recordSample(_ sensorSec: TimeInterval) {
@@ -2289,6 +2587,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var standardSynchronizer: AVCaptureDataOutputSynchronizer?
     private var configuredCameraFormats: [String: AVCaptureDevice.Format] = [:]
     private var synchronizationWriter: SensorCSVWriter?
+    private var performanceWriter: SensorCSVWriter?
+    private var lastPerformanceSample = 0.0
+    private let storageMonitorQueue = DispatchQueue(label: "com.sensorrecorder.storage.monitor", qos: .utility)
+    private var storageRefreshPending = false
+    private var cachedCaptureBytes: Int64 = 0
+    private var cachedFreeBytes: Int64?
     private var synchronizationGroup: Int64 = 0
     private var synchronizationDroppedGroups = 0
     private var synchronizationMaxSkew = 0.0
@@ -2319,8 +2623,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
     private let sessionQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.capture", qos: .userInitiated, autoreleaseFrequency: .workItem)
-    private let arkitFrameQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.frames", qos: .userInitiated)
-    private let arkitDepthQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.depth", qos: .utility)
+    private let arkitFrameQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.frames", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    private let arkitDepthQueue = DispatchQueue(label: "com.ydsf16.sensorrecorder.arkit.depth", qos: .utility, autoreleaseFrequency: .workItem)
     private let arkitDepthBackpressure = DispatchSemaphore(value: 2)
 
     private var wideVideoPort: AVCaptureInput.Port?
@@ -2347,10 +2651,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var audioRecorder: AudioStreamRecorder?
     private var sensorRecorder: SensorStreamRecorder?
     private var arSession: ARSession?
+    private weak var settingsPausedARSession: ARSession?
     private var arkitRecorder: ARKitFrameRecorder?
     private var arkitDisplayLayer: AVSampleBufferDisplayLayer?
     private var arkitFrameCount = 0
-    private var arkitPreviewEnqueuePending = false
+    private var arkitCaptureTimes: [TimeInterval] = []
     private var arkitLastRecordSlot: Int64?
     private var arkitConfiguration: ARWorldTrackingConfiguration?
     private var arkitCaptureDevice: AVCaptureDevice?
@@ -2362,10 +2667,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var ultraWideDisplayLayer: AVSampleBufferDisplayLayer?
     private var telephotoDisplayLayer: AVSampleBufferDisplayLayer?
     private var frontDisplayLayer: AVSampleBufferDisplayLayer?
-    private var widePreviewEnqueuePending = false
-    private var ultraWidePreviewEnqueuePending = false
-    private var telephotoPreviewEnqueuePending = false
-    private var frontPreviewEnqueuePending = false
     private var wideFrameCount = 0
     private var ultraWideFrameCount = 0
     private var telephotoFrameCount = 0
@@ -2753,8 +3054,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             default: base.front.autoExposure = true; base.front.maxExposureDurationMS = "10"; base.front.autoFocus = true
             }
         }
+        let arkitOnly = ProcessInfo.processInfo.arguments.contains("--matrix-arkit-only")
+        if arkitOnly {
+            base.captureMode = .arkit
+            base.imuEnabled = false; base.deviceMotionEnabled = false
+            if let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: { $0.framesPerSecond == 30 }) {
+                base.arkitCamera.resolution = "\(Int(format.imageResolution.width))x\(Int(format.imageResolution.height))"
+                base.arkitCamera.frameRate = String(format.framesPerSecond)
+                base.arkitCamera.autoFocus = true; base.arkitCamera.autoExposure = true
+            }
+        }
         ensurePermissions(requiredPermissions(for: base)) { granted in
             guard granted else { label.accessibilityValue = "failed"; return }
+            if arkitOnly {
+                self.matrixProfiles = [base]; self.matrixIndex = 0; self.matrixEnd = 1
+                self.runNextMatrixProfile()
+                return
+            }
             self.sessionQueue.async {
                 let profiles: [RecorderSettings] = self.withRestoredCaptureDevices {
                     var profiles: [RecorderSettings] = []
@@ -2808,14 +3124,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return
         }
         let settings = matrixProfiles[matrixIndex]
-        let reference = [(settings.wide), settings.ultraWide, settings.telephoto, settings.front].first { $0.enabled }!
-        matrixStatus?.text = "\(matrixIndex + 1)/\(matrixProfiles.count) \(combinationTitle(settings)) \(reference.resolution) @\(reference.frameRate)"
+        let reference = settings.captureMode == .arkit ? settings.arkitCamera
+            : [(settings.wide), settings.ultraWide, settings.telephoto, settings.front].first { $0.enabled }!
+        matrixStatus?.text = "\(matrixIndex + 1)/\(matrixProfiles.count) \(settings.captureMode == .arkit ? "ARKit" : combinationTitle(settings)) \(reference.resolution) @\(reference.frameRate)"
         matrixStatus?.accessibilityValue = "running:\(matrixIndex)"
         recorderSettings = settings
         resetPreviewSessionForSettingsChange { issue in
             if let issue { self.finishMatrixProfile(error: issue, directory: nil); return }
             // Allow native AE/AF to settle before recording; do not synthesize samples.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (settings.captureMode == .arkit ? 3 : 0.75)) {
                 self.startRecording()
                 self.waitForMatrixRecording(deadline: Date().addingTimeInterval(20), rate: Double(reference.frameRate) ?? 30)
             }
@@ -2825,7 +3142,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func waitForMatrixRecording(deadline: Date, rate: Double) {
         if isRecording {
             let directory = outDirURL?.lastPathComponent
-            DispatchQueue.main.asyncAfter(deadline: .now() + max(3, 8 / rate)) {
+            let args = ProcessInfo.processInfo.arguments
+            let requested = args.firstIndex(of: "--matrix-duration").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil }
+            let duration = requested.map { min(100, max(3, $0)) } ?? max(3, 8 / rate)
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
                 if self.isRecording { self.stopRecording() }
                 self.waitForMatrixFinish(deadline: Date().addingTimeInterval(30), directory: directory)
             }
@@ -3070,15 +3390,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         switch locationManager.authorizationStatus {
         case .authorizedAlways, .authorizedWhenInUse:
             locationRecorder = GeoLocationStreamRecorder(directory: outDirURL)
+            locationRecorder?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
             locationManager.startUpdatingLocation()
         default:
             break
         }
     }
 
-    private func stopLocationRecording() {
+    private func stopLocationRecording(_ completion: @escaping () -> Void = {}) {
         locationManager.stopUpdatingLocation()
-        locationRecorder?.close()
+        if let recorder = locationRecorder { recorder.close(completion) } else { completion() }
         locationRecorder = nil
     }
 
@@ -3185,23 +3506,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if isARKitMode {
             requestCameraAccess { granted in
-                guard granted else { return }
+                guard granted else { self.completePreviewPreparation("Camera permission is required to validate these settings."); return }
                 if self.recorderSettings.audioEnabled {
                     self.requestAudioAccess { _ in
                         self.sessionQueue.async {
                             self.configureARKitPreview()
-                            DispatchQueue.main.async {
-                                self.startStopButton.isEnabled = self.arSession != nil
-                            }
+                            self.completePreviewPreparation(self.arSession == nil ? "ARKit session is not ready yet." : nil)
                             self.setStatus(self.arSession != nil ? "ARKit Ready" : "ARKit failed")
                         }
                     }
                 } else {
                     self.sessionQueue.async {
                         self.configureARKitPreview()
-                        DispatchQueue.main.async {
-                            self.startStopButton.isEnabled = self.arSession != nil
-                        }
+                        self.completePreviewPreparation(self.arSession == nil ? "ARKit session is not ready yet." : nil)
                         self.setStatus(self.arSession != nil ? "ARKit Ready" : "ARKit failed")
                     }
                 }
@@ -3411,12 +3728,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         }
 
+        self.arSession = arSession
+        self.arkitConfiguration = config
         arSession.delegate = self
         arSession.delegateQueue = arkitFrameQueue
         arSession.run(config)
-
-        self.arSession = arSession
-        self.arkitConfiguration = config
         self.isConfigured = true
 
         // Set up audio capture on a dedicated session for ARKit mode
@@ -3425,6 +3741,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         DispatchQueue.main.async {
+            guard self.isARKitMode, self.arSession === arSession else { return }
             let displayLayer = self.makeDisplayLayer(for: "arkit")
             self.sceneView.layer.insertSublayer(displayLayer, at: 0)
             self.arkitDisplayLayer = displayLayer
@@ -3549,15 +3866,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func tearDownARKitSession() {
-        arSession?.pause()
-        arSession?.delegate = nil
+        let previous = arSession
         arSession = nil
+        previous?.delegate = nil
+        previous?.pause()
+        // Drain callbacks already delivered before clearing per-session state.
+        arkitFrameQueue.sync {}
         arkitConfiguration = nil
         arkitRecorder = nil
         arkitDisplayLayer?.removeFromSuperlayer()
         arkitDisplayLayer = nil
         arkitFrameCount = 0
-        arkitPreviewEnqueuePending = false
+        arkitCaptureTimes.removeAll(keepingCapacity: true)
         arkitLastRecordSlot = nil
         arkitDeviceConfigured = false
         arkitCaptureDevice = nil
@@ -3571,7 +3891,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     // MARK: - ARSessionDelegate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        autoreleasepool { processARKitFrame(session, frame: frame) }
+    }
+
+    private func processARKitFrame(_ session: ARSession, frame: ARFrame) {
+        guard session === arSession, isARKitMode else { return }
         arkitFrameCount += 1
+        arkitCaptureTimes.append(frame.timestamp)
+        arkitCaptureTimes.removeAll { frame.timestamp - $0 > 2 }
         arkitTrackingState = frame.camera.trackingState
 
         // Ensure we have a reference to the capture device
@@ -3590,6 +3917,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         let pts = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000)
+        enqueueARKitPreview(frame.capturedImage, pts: pts)
 
         if isRecording {
             let pixelBuffer = frame.capturedImage
@@ -3629,16 +3957,33 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         }
 
-        enqueueARKitPreview(frame.capturedImage, pts: pts)
-
         guard arkitFrameCount % 30 == 0 else { return }
+        let cadence = arkitCaptureTimes.count > 1 ? Double(arkitCaptureTimes.count - 1) / max(0.001, arkitCaptureTimes.last! - arkitCaptureTimes.first!) : 0
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isARKitMode, self.arSession === session else { return }
+            self.measuredCameraFPS[.wide] = cadence
+        }
         setStatus("ARKit Frames")
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         os_log("ARSession failed: %@", type: .error, error.localizedDescription)
-        DispatchQueue.main.async {
-            self.showError(msg: "ARKit session error: \(error.localizedDescription)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isARKitMode, self.arSession === session,
+                  self.settingsPausedARSession !== session else { return }
+            let presenter: UIViewController = self.settingsController ?? self
+            guard presenter.presentedViewController == nil else { return }
+            if self.isRecording {
+                self.sessionQueue.async {
+                    guard self.isARKitMode, self.arSession === session else { return }
+                    self.reportRecordingFailure("ARKit session error: " + error.localizedDescription)
+                }
+                return
+            }
+            let alert = UIAlertController(title: SRText("Error"), message: "ARKit session error: \(error.localizedDescription)", preferredStyle: .alert)
+            alert.view.accessibilityIdentifier = "capture.error"
+            alert.addAction(UIAlertAction(title: SRText("OK"), style: .cancel))
+            presenter.present(alert, animated: true)
         }
     }
 
@@ -3651,48 +3996,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func enqueueARKitPreview(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
-        guard let displayLayer = arkitDisplayLayer else { return }
-        guard !arkitPreviewEnqueuePending else { return }
-        arkitPreviewEnqueuePending = true
-
-        DispatchQueue.main.async { [weak self, weak displayLayer] in
-            defer {
-                self?.arkitPreviewEnqueuePending = false
-            }
-            guard let displayLayer else { return }
-            if displayLayer.status == .failed {
-                displayLayer.flush()
-            }
-            guard displayLayer.isReadyForMoreMediaData else { return }
-
-            var formatDesc: CMFormatDescription?
-            CMVideoFormatDescriptionCreateForImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: pixelBuffer,
-                formatDescriptionOut: &formatDesc
-            )
-            guard let formatDesc = formatDesc else { return }
-
-            var timingInfo = CMSampleTimingInfo(
-                duration: CMTimeMake(value: 1, timescale: 30),
-                presentationTimeStamp: pts,
-                decodeTimeStamp: .invalid
-            )
-            var sampleBuffer: CMSampleBuffer?
-            CMSampleBufferCreateForImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: pixelBuffer,
-                dataReady: true,
-                makeDataReadyCallback: nil,
-                refcon: nil,
-                formatDescription: formatDesc,
-                sampleTiming: &timingInfo,
-                sampleBufferOut: &sampleBuffer
-            )
-            if let sampleBuffer = sampleBuffer {
-                displayLayer.enqueue(sampleBuffer)
-            }
-        }
+        guard let layer = arkitDisplayLayer else { return }
+        (objc_getAssociatedObject(layer, &livePreviewAssociationKey) as? LivePreviewRenderer)?.submit(pixelBuffer, pts: pts)
     }
 
     private func arkitRecordingSlotIfFrameShouldBeWritten(_ presentationTime: CMTime) -> Int64? {
@@ -3841,10 +4146,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if let wideOutput = widePreviewOutput, output === wideOutput {
             wideFrameCount += 1
+            enqueuePreview(sampleBuffer, on: wideDisplayLayer, camera: .wide)
             if captureRecordingActive || (isARKitMode && isRecording) {
                 appendRecordingSample(sampleBuffer, camera: .wide)
             }
-            enqueuePreview(sampleBuffer, on: wideDisplayLayer, camera: .wide)
             guard wideFrameCount % 30 == 0 else { return }
             setStatus("Frames")
             return
@@ -3852,10 +4157,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if let ultraWideOutput = ultraWidePreviewOutput, output === ultraWideOutput {
             ultraWideFrameCount += 1
+            enqueuePreview(sampleBuffer, on: ultraWideDisplayLayer, camera: .ultraWide)
             if captureRecordingActive || (isARKitMode && isRecording) {
                 appendRecordingSample(sampleBuffer, camera: .ultraWide)
             }
-            enqueuePreview(sampleBuffer, on: ultraWideDisplayLayer, camera: .ultraWide)
             guard ultraWideFrameCount % 30 == 0 else { return }
             setStatus("Frames")
             return
@@ -3863,10 +4168,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if let telephotoOutput = telephotoPreviewOutput, output === telephotoOutput {
             telephotoFrameCount += 1
+            enqueuePreview(sampleBuffer, on: telephotoDisplayLayer, camera: .telephoto)
             if captureRecordingActive || (isARKitMode && isRecording) {
                 appendRecordingSample(sampleBuffer, camera: .telephoto)
             }
-            enqueuePreview(sampleBuffer, on: telephotoDisplayLayer, camera: .telephoto)
             guard telephotoFrameCount % 30 == 0 else { return }
             setStatus("Frames")
             return
@@ -3874,10 +4179,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if let frontOutput = frontPreviewOutput, output === frontOutput {
             frontFrameCount += 1
+            enqueuePreview(sampleBuffer, on: frontDisplayLayer, camera: .front)
             if captureRecordingActive || (isARKitMode && isRecording) {
                 appendRecordingSample(sampleBuffer, camera: .front)
             }
-            enqueuePreview(sampleBuffer, on: frontDisplayLayer, camera: .front)
             guard frontFrameCount % 30 == 0 else { return }
             setStatus("Frames")
             return
@@ -4026,49 +4331,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func enqueuePreview(_ sampleBuffer: CMSampleBuffer, on displayLayer: AVSampleBufferDisplayLayer?, camera: RecordingCamera) {
         noteCaptureCadence(sampleBuffer, camera: camera)
-        guard let displayLayer = displayLayer else { return }
-        guard !isPreviewEnqueuePending(camera) else { return }
-        setPreviewEnqueuePending(true, camera: camera)
-
-        DispatchQueue.main.async { [weak self, weak displayLayer] in
-            defer {
-                self?.sessionQueue.async {
-                    self?.setPreviewEnqueuePending(false, camera: camera)
-                }
-            }
-            guard let displayLayer else { return }
-            if displayLayer.status == .failed {
-                displayLayer.flush()
-            }
-            guard displayLayer.isReadyForMoreMediaData else { return }
-            displayLayer.enqueue(sampleBuffer)
-        }
+        guard let layer = displayLayer else { return }
+        (objc_getAssociatedObject(layer, &livePreviewAssociationKey) as? LivePreviewRenderer)?.submit(sampleBuffer)
     }
 
-    private func isPreviewEnqueuePending(_ camera: RecordingCamera) -> Bool {
-        switch camera {
-        case .wide:
-            return widePreviewEnqueuePending
-        case .ultraWide:
-            return ultraWidePreviewEnqueuePending
-        case .telephoto:
-            return telephotoPreviewEnqueuePending
-        case .front:
-            return frontPreviewEnqueuePending
+    private func previewDiagnosticsJSON(reset: Bool = false) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for (name, layer) in [("wide", wideDisplayLayer), ("ultra", ultraWideDisplayLayer), ("telephoto", telephotoDisplayLayer), ("front", frontDisplayLayer), ("arkit", arkitDisplayLayer)] {
+            guard let layer, let renderer = objc_getAssociatedObject(layer, &livePreviewAssociationKey) as? LivePreviewRenderer else { continue }
+            if reset { renderer.resetStatistics() }
+            result[name] = renderer.statistics()
         }
-    }
-
-    private func setPreviewEnqueuePending(_ pending: Bool, camera: RecordingCamera) {
-        switch camera {
-        case .wide:
-            widePreviewEnqueuePending = pending
-        case .ultraWide:
-            ultraWidePreviewEnqueuePending = pending
-        case .telephoto:
-            telephotoPreviewEnqueuePending = pending
-        case .front:
-            frontPreviewEnqueuePending = pending
-        }
+        return result
     }
 
     private func captureSessionClock() -> CMClock? {
@@ -4653,6 +4927,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func makeDisplayLayer(for cameraName: String) -> AVSampleBufferDisplayLayer {
         let displayLayer = AVSampleBufferDisplayLayer()
+        objc_setAssociatedObject(displayLayer, &livePreviewAssociationKey, LivePreviewRenderer(layer: displayLayer, name: cameraName), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         displayLayer.videoGravity = .resizeAspect
         displayLayer.backgroundColor = UIColor.black.cgColor
         return displayLayer
@@ -5449,6 +5724,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         if arkitDisplayLayer != nil {
             layoutSampleBufferDisplayLayer(arkitDisplayLayer, in: bounds)
+            hudContentRect = previewContentRect(in: bounds, tileCount: 1)
+            layoutHUDOverlays(frames: ["wide": hudContentRect])
             return
         }
 
@@ -5565,22 +5842,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func layoutHUDOverlays(frames: [String: CGRect]) {
         guard !cameraStatusRows.isEmpty || !captureStatusRows.isEmpty else { return }
+        let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
+        let summaryY = max(4, hudContentRect.minY - 42)
+        let summaryFrame = CGRect(x: hudContentRect.midX - summaryWidth / 2,
+                                  y: summaryY, width: summaryWidth, height: 36)
+        captureStatusBadges["summary"]?.frame = summaryFrame
+        let summaryInPreview = sceneView.convert(summaryFrame, from: view)
         for key in ["ultra", "wide", "telephoto", "front", "depth"] {
             let frame = frames[key] ?? .zero
             cameraStatusBadges[key]?.isHidden = frame.isEmpty
             if !frame.isEmpty {
                 let width = min(key == "ultra" ? CGFloat(348) : CGFloat(300), max(0, frame.width - 8))
-                cameraStatusBadges[key]?.frame = CGRect(x: frame.midX - width / 2, y: frame.minY + 2, width: width, height: 30)
+                var badge = CGRect(x: frame.midX - width / 2, y: frame.minY + 2, width: width, height: 36)
+                // Single-camera tiles can fill the top of the preview. Reserve
+                // the summary row even while idle so Record does not move FPS.
+                if badge.intersects(summaryInPreview) { badge.origin.y = summaryInPreview.maxY + 4 }
+                cameraStatusBadges[key]?.frame = badge
             }
         }
-        let summaryWidth = min(max(hudContentRect.width * 0.58, 560), max(hudContentRect.width - 220, 320))
-        let summaryY = max(4, hudContentRect.minY - 42)
-        captureStatusBadges["summary"]?.frame = CGRect(
-            x: hudContentRect.midX - summaryWidth / 2,
-            y: summaryY,
-            width: summaryWidth,
-            height: 36
-        )
         cameraStatusBadges["wide"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["ultra"].map { sceneView.bringSubviewToFront($0) }
         cameraStatusBadges["telephoto"].map { sceneView.bringSubviewToFront($0) }
@@ -5662,6 +5941,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func startRecordingAfterPermissionChecks(startClock: CFTimeInterval) {
+        _ = previewDiagnosticsJSON(reset: true)
+        lastPerformanceSample = 0
+        cachedCaptureBytes = 0
         if isARKitMode {
             guard isConfigured, arSession != nil else {
                 startStopButton.isEnabled = true
@@ -5680,6 +5962,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.resetRecordingSamplingState()
                 self.arkitLastRecordSlot = nil
                 self.recordingFailure = nil
+                self.beginPerformanceTrace()
 
                 let arSettings = self.recorderSettings.arkitCamera
                 let captureFPS = self.arkitActiveFrameRate()
@@ -5700,6 +5983,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     targetFrameRate: targetFPS,
                     captureFrameRate: captureFPS
                 )
+                self.arkitRecorder?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
                 self.arkitRecorder?.writeDeviceFormat(resolution: resolution)
                 self.logRecordingStartStep("arkit_recorder", startClock: startClock)
 
@@ -5711,6 +5995,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 )
                 if sensorOptions.imuEnabled || sensorOptions.deviceMotionEnabled || sensorOptions.magnetometerEnabled || sensorOptions.barometerEnabled {
                     let sensorRecorder = SensorStreamRecorder()
+                    sensorRecorder.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
                     sensorRecorder.start(in: self.outDirURL, options: sensorOptions)
                     self.sensorRecorder = sensorRecorder
                 }
@@ -5728,6 +6013,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 if self.recorderSettings.lidarDepthEnabled,
                    ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                     self.lidarDepthRecorder = LiDARDepthStreamRecorder(outputDirectory: self.outDirURL)
+                    self.lidarDepthRecorder?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
                 }
                 self.logRecordingStartStep("lidar_depth_recorder", startClock: startClock)
 
@@ -5785,6 +6071,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             self.resetRecordingSamplingState()
             self.recordingFailure = nil
+            self.beginPerformanceTrace()
             self.synchronizationGroup = 0
             self.synchronizationDroppedGroups = 0
             self.synchronizationMaxSkew = 0
@@ -5794,6 +6081,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.timestampAlignmentSummary = nil
             if self.standardSynchronizer != nil {
                 self.synchronizationWriter = SensorCSVWriter(url: self.outDirURL.appendingPathComponent("synchronization.csv"), header: "group_index,reference_sensor_sec,wide_sensor_sec,ultra_sensor_sec,telephoto_sensor_sec,front_sensor_sec,max_skew_sec")
+                self.synchronizationWriter?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
             }
 
             if self.recorderSettings.wide.enabled {
@@ -5873,6 +6161,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
             if self.recorderSettings.lidarDepthEnabled && self.lidarDepthOutput != nil {
                 self.lidarDepthRecorder = LiDARDepthStreamRecorder(outputDirectory: self.outDirURL)
+                    self.lidarDepthRecorder?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
             }
             self.logRecordingStartStep("lidar_depth_recorder", startClock: startClock)
 
@@ -5884,6 +6173,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             )
             if sensorOptions.imuEnabled || sensorOptions.deviceMotionEnabled || sensorOptions.magnetometerEnabled || sensorOptions.barometerEnabled {
                 let sensorRecorder = SensorStreamRecorder()
+                    sensorRecorder.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
                 sensorRecorder.start(in: self.outDirURL, options: sensorOptions)
                 self.sensorRecorder = sensorRecorder
             }
@@ -5928,15 +6218,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         startStopButton.accessibilityValue = "finishing"
         recordingTimer?.invalidate()
         recordingTimer = nil
-        sensorRecorder?.stop()
+        let group = DispatchGroup()
+        if let recorder = sensorRecorder { group.enter(); recorder.stop { group.leave() } }
         sensorRecorder = nil
-        stopLocationRecording()
+        group.enter(); stopLocationRecording { group.leave() }
         timeWriteLabel.text = "mp4,csv"
 
         sessionQueue.async {
             self.captureRecordingActive = false
             self.resetRecordingSamplingState()
-            let group = DispatchGroup()
             if let wideRecorder = self.wideRecorder {
                 group.enter()
                 wideRecorder.finish { group.leave() }
@@ -5964,11 +6254,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 }
             }
             self.arkitDepthQueue.sync {
-                self.lidarDepthRecorder?.finish()
+                if let recorder = self.lidarDepthRecorder { group.enter(); recorder.finish { group.leave() } }
             }
+            if let writer = self.performanceWriter { group.enter(); writer.close { group.leave() } }
+            self.performanceWriter = nil
+            if let writer = self.synchronizationWriter { group.enter(); writer.close { group.leave() } }
+            self.synchronizationWriter = nil
             group.notify(queue: self.sessionQueue) {
-                self.synchronizationWriter?.close()
-                self.synchronizationWriter = nil
                 if self.recorderSettings.captureMode == .standard && self.recorderSettings.front.enabled && self.enabledCameraCount(in: self.recorderSettings) > 1 {
                     do {
                         var streams: [String: [TimestampAlignment.Sample]] = [:]
@@ -5980,6 +6272,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     } catch { self.reportRecordingFailure("Could not write the timestamp alignment index: \(error.localizedDescription)") }
                 }
                 self.writeCaptureMetaJSON(state: self.recordingFailure == nil ? "finished" : "failed")
+                let missingARKitFrames = self.arkitRecorder?.missingFrameCount ?? 0
                 self.wideRecorder = nil
                 self.ultraWideRecorder = nil
                 self.telephotoRecorder = nil
@@ -5994,8 +6287,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     self.startStopButton.accessibilityValue = "idle"
                     self.endRecordingBackgroundTask()
                     self.updateSize()
+                    let qualityMessage = missingARKitFrames > 0 && self.recordingFailure == nil
+                        ? String(format: SRText("ARKit source omitted %d frame slots. The recording and timestamps were preserved. Check meta.json."), missingARKitFrames) : nil
                     if showUpgradePromptAfterFinish {
-                        self.showFreeRecordingLimitAlert()
+                        self.showFreeRecordingLimitAlert(additionalMessage: qualityMessage)
+                    } else if let qualityMessage {
+                        if UIApplication.shared.applicationState == .background { self.deferredRecordingError = qualityMessage }
+                        else { self.showMessage(title: "Recording Quality", message: qualityMessage) }
                     }
                 }
             }
@@ -6254,9 +6552,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         badge.layer.cornerRadius = 8
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .semibold)
+        label.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
         label.textColor = .label
         label.textAlignment = .center
+        label.numberOfLines = 2
         label.adjustsFontSizeToFitWidth = true
         label.minimumScaleFactor = 0.72
         label.layer.shadowColor = UIColor.black.cgColor
@@ -6341,26 +6640,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func addSettingsCard(to stack: UIStackView, title: String, icon: String, identifier: String) -> UIStackView {
         let card = UIStackView()
         card.axis = .vertical
-        card.spacing = 10
+        card.spacing = 6
         card.isLayoutMarginsRelativeArrangement = true
-        card.layoutMargins = UIEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        card.layoutMargins = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
         card.backgroundColor = .secondarySystemGroupedBackground
-        card.layer.cornerRadius = 16
+        card.layer.cornerRadius = 14
         card.layer.borderWidth = 0
         card.layer.borderColor = UIColor.separator.cgColor
         card.accessibilityIdentifier = "settings.card.\(identifier)"
         let heading = UIStackView()
         heading.axis = .horizontal
-        heading.spacing = 9
+        heading.spacing = 7
         heading.alignment = .center
         let image = UIImageView(image: UIImage(systemName: icon))
         image.tintColor = .systemBlue
         image.contentMode = .scaleAspectFit
-        image.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        image.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        image.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        image.heightAnchor.constraint(equalToConstant: 16).isActive = true
         let label = UILabel()
         label.text = SRText(title)
-        label.font = settingsFont(17, weight: .semibold)
+        label.font = settingsFont(15, weight: .semibold)
         label.textColor = .label
         enableSettingsTextWrapping(label)
         heading.addArrangedSubview(image)
@@ -6380,7 +6679,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         control.selectedSegmentIndex = automatic ? 0 : 1
         control.selectedSegmentTintColor = .secondarySystemGroupedBackground
         control.backgroundColor = .tertiarySystemFill
-        control.setTitleTextAttributes([.font: settingsFont(15, weight: .medium), .foregroundColor: UIColor.label], for: .normal)
+        control.setTitleTextAttributes([.font: settingsFont(14, weight: .medium), .foregroundColor: UIColor.label], for: .normal)
         control.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
         control.addTarget(self, action: #selector(focusModeSelectionChanged(_:)), for: .valueChanged)
         stack.addArrangedSubview(control)
@@ -6396,7 +6695,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func addSettingsHeader(to stack: UIStackView) {
         let titleLabel = UILabel()
         titleLabel.text = SRText("Settings")
-        titleLabel.font = settingsFont(17, weight: .semibold)
+        titleLabel.font = settingsFont(15, weight: .semibold)
         titleLabel.textColor = .label
         enableSettingsTextWrapping(titleLabel)
 
@@ -6404,7 +6703,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let cancel = UIButton(type: .system)
         cancel.setTitle(SRText("Cancel"), for: .normal)
         cancel.setTitleColor(.systemBlue, for: .normal)
-        cancel.titleLabel?.font = .systemFont(ofSize: 16)
+        cancel.titleLabel?.font = settingsFont(14)
         cancel.accessibilityIdentifier = "settings.close"
         cancel.addTarget(self, action: #selector(hideSettingsOverlay), for: .touchUpInside)
         cancel.setContentHuggingPriority(.required, for: .horizontal)
@@ -6415,7 +6714,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func addSettingsFootnote(to stack: UIStackView, text: String) {
         let label = UILabel()
         label.text = SRText(text)
-        label.font = settingsFont(14)
+        label.font = settingsFont(12)
         label.textColor = UIColor.secondaryLabel
         enableSettingsTextWrapping(label)
         stack.addArrangedSubview(label)
@@ -6447,10 +6746,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         vertical: Bool = false,
         onChange: ((String) -> Void)? = nil
     ) {
+        let usesVerticalLayout = vertical || traitCollection.preferredContentSizeCategory.isAccessibilityCategory
         let row = UIStackView()
-        row.axis = vertical ? .vertical : .horizontal
-        row.alignment = vertical ? .fill : .center
-        row.spacing = vertical ? 7 : 12
+        row.axis = usesVerticalLayout ? .vertical : .horizontal
+        row.alignment = usesVerticalLayout ? .fill : .center
+        row.spacing = usesVerticalLayout ? 3 : 8
 
         let titleLabel = UILabel()
         titleLabel.text = SRText(title)
@@ -6458,7 +6758,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         titleLabel.font = settingsFont(14, weight: vertical ? .regular : .medium)
         titleLabel.textColor = vertical ? UIColor.secondaryLabel : .label
         enableSettingsTextWrapping(titleLabel)
-        if !vertical { titleLabel.widthAnchor.constraint(equalToConstant: compact ? 112 : 126).isActive = true }
+        if !usesVerticalLayout { titleLabel.widthAnchor.constraint(equalToConstant: compact ? 96 : 112).isActive = true }
 
         let button = UIButton(type: .system)
         button.contentHorizontalAlignment = .leading
@@ -6863,7 +7163,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.attributedTitle = AttributedString(
             SRText(title),
             attributes: AttributeContainer([
-                .font: settingsFont(16, weight: .medium)
+                .font: settingsFont(14, weight: .medium)
             ])
         )
         config.image = UIImage(systemName: "chevron.down")
@@ -6873,9 +7173,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.baseForegroundColor = .label
         config.cornerStyle = .medium
         config.contentInsets = NSDirectionalEdgeInsets(
-            top: 10,
-            leading: 12,
-            bottom: 10,
+            top: 6,
+            leading: 10,
+            bottom: 6,
             trailing: 12
         )
         return config
@@ -6897,6 +7197,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     @objc private func showSettingsOverlay() {
         guard settingsOverlayView == nil, !isRecording, recordingTransition == .none, presentedViewController == nil else { return }
+        // Capability probes may open AVCapture inputs. Release ARKit's camera
+        // first, even while the saved mode is still ARKit.
+        if isARKitMode, let session = arSession {
+            settingsPausedARSession = session
+            session.delegate = nil
+            session.pause()
+            // Let an in-flight frame finish touching camera settings before
+            // any capability probe queued below opens the camera.
+            sessionQueue.async { self.arkitFrameQueue.sync {} }
+        }
         let controller = PortraitSettingsViewController()
         controller.overrideUserInterfaceStyle = .light
         controller.modalPresentationStyle = .fullScreen
@@ -6959,21 +7269,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let stack = UIStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
-        stack.spacing = 12
+        stack.spacing = 8
         scrollView.addSubview(stack)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 18),
             scrollView.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
             header.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 24),
             header.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
-            header.topAnchor.constraint(equalTo: configPanel.contentView.topAnchor, constant: 12),
-            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
-            scrollView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -14),
+            header.topAnchor.constraint(equalTo: configPanel.contentView.topAnchor, constant: 4),
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
+            scrollView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -8),
 
             actionBar.leadingAnchor.constraint(equalTo: configPanel.contentView.leadingAnchor, constant: 24),
             actionBar.trailingAnchor.constraint(equalTo: configPanel.contentView.trailingAnchor, constant: -24),
-            actionBar.bottomAnchor.constraint(equalTo: configPanel.contentView.bottomAnchor, constant: -18),
-            actionBar.heightAnchor.constraint(greaterThanOrEqualToConstant: 54),
+            actionBar.bottomAnchor.constraint(equalTo: configPanel.contentView.bottomAnchor, constant: -8),
+            actionBar.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
 
             stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 6),
             stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -6),
@@ -6992,7 +7302,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Camera section container — rebuilt when mode changes
         let cameraContainer = UIStackView()
         cameraContainer.axis = .vertical
-        cameraContainer.spacing = 10
+        cameraContainer.spacing = 8
 
         addSettingsMenuRow(
             to: modeCard,
@@ -7122,16 +7432,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let dimensions = UIStackView()
             dimensions.axis = .vertical
             dimensions.distribution = .fillEqually
-            dimensions.spacing = 12
+            dimensions.spacing = 4
             for (key, title, value) in [("shared.resolution", "Resolution", reference.resolution), ("shared.frameRate", "Frame rate", reference.frameRate)] {
                 let field = UIStackView()
                 field.axis = .vertical
-                addSettingsMenuRow(to: field, key: key, title: title, items: [], selectedValue: value, compact: true, vertical: true)
+                addSettingsMenuRow(to: field, key: key, title: title, items: [], selectedValue: value, compact: true, vertical: false)
                 dimensions.addArrangedSubview(field)
             }
             captureCard.addArrangedSubview(dimensions)
             addSettingsRow(to: captureCard, key: "shared.autoExposure", title: "Auto exposure", detail: "", isOn: isAutoExposureEnabled(for: reference))
-            addSettingsMenuRow(to: captureCard, key: "shared.maxExposure", title: "Max exposure (ms)", items: ["1", "5", "10", "20", "30"], selectedValue: maxExposureDurationLabel(for: reference), compact: true, vertical: true)
+            addSettingsMenuRow(to: captureCard, key: "shared.maxExposure", title: "Max exposure (ms)", items: ["1", "5", "10", "20", "30"], selectedValue: maxExposureDurationLabel(for: reference), compact: true, vertical: false)
             updateAutoExposureControlState(keyPrefix: "shared", cameraEnabled: !enabled.isEmpty)
             let focusCard = addSettingsCard(to: container, title: "Focus", icon: "viewfinder", identifier: "focus")
             if enabled.count > 1 {
@@ -7157,7 +7467,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         statusLabel.accessibilityIdentifier = "purchase.status"
         settingsPurchaseStatusLabel = statusLabel
         statusLabel.text = purchaseStatusText()
-        statusLabel.font = settingsFont(14)
+        statusLabel.font = settingsFont(12)
         statusLabel.textColor = UIColor.secondaryLabel
         enableSettingsTextWrapping(statusLabel)
         stack.addArrangedSubview(statusLabel)
@@ -7202,7 +7512,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.attributedTitle = AttributedString(
             SRText(title),
             attributes: AttributeContainer([
-                .font: settingsFont(15, weight: .medium)
+                .font: settingsFont(14, weight: .medium)
             ])
         )
         config.baseBackgroundColor = backgroundColor
@@ -7258,7 +7568,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let titleLabel = UILabel()
         titleLabel.text = SRText(title)
-        titleLabel.font = settingsFont(15, weight: .medium)
+        titleLabel.font = settingsFont(14, weight: .medium)
         titleLabel.textColor = enabled ? .label : UIColor.secondaryLabel
         enableSettingsTextWrapping(titleLabel)
         if compact {
@@ -7269,7 +7579,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let detailLabel = UILabel()
         detailLabel.text = SRText(detail)
-        detailLabel.font = settingsFont(14)
+        detailLabel.font = settingsFont(12)
         detailLabel.textColor = UIColor.secondaryLabel
         detailLabel.isHidden = detail.isEmpty
         enableSettingsTextWrapping(detailLabel)
@@ -7377,7 +7687,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         config.baseBackgroundColor = .systemBlue
         config.baseForegroundColor = .white
         config.cornerStyle = .large
-        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14)
         saveButton.configuration = config
         saveButton.addTarget(self, action: #selector(saveSettingsOverlay), for: .touchUpInside)
         stack.addArrangedSubview(saveButton)
@@ -7455,6 +7765,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func resetPreviewSessionForSettingsChange(completion: ((String?) -> Void)? = nil) {
+        settingsPausedARSession = nil
         pendingPreviewCompletion = completion
         startStopButton.isEnabled = false
         sessionQueue.async {
@@ -7546,6 +7857,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.settingsOverlayView = nil
             self.settingsCameraContainer = nil
             self.settingsController = nil
+            let paused = self.settingsPausedARSession
+            self.settingsPausedARSession = nil
+            if let paused {
+                self.sessionQueue.async {
+                    guard self.isARKitMode, self.arSession === paused,
+                          let configuration = self.arkitConfiguration else { return }
+                    paused.delegate = self
+                    paused.run(configuration)
+                }
+            }
             self.updateAuxiliaryRailButtons(isRecording: self.isRecording)
         }
     }
@@ -7582,6 +7903,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             timeWriteLabel.text = recordingDataStatusText()
         }
         updateSize()
+        writePerformanceSampleIfNeeded()
         refreshOverlayStatus()
     }
 
@@ -7622,10 +7944,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func refreshOverlayStatus() {
         if isARKitMode {
             let res = arkitActiveResolution()
-            let hz = arkitFrameCount == 0 ? "0 Hz" : String(format: "%.0f Hz", targetRecordingFrameRate(for: recorderSettings.arkitCamera))
-            let trackingLabel = shortTrackingStateLabel(arkitTrackingState)
-            let recTag = isRecording ? "REC" : "preview"
-            cameraStatusRows["wide"]?.text = "ARKit \(Int(res.width))x\(Int(res.height)) | \(hz) | \(recTag) | \(trackingLabel)"
+            let capture = measuredCameraFPS[.wide] ?? 0
+            let stats = previewDiagnosticsJSON()["arkit"] as? [String: Any] ?? [:]
+            let displayed = stats["display_hz_estimate"] as? Double
+            let preview = displayed ?? stats["recent_enqueue_hz"] as? Double ?? 0
+            let trackingLabel = SRText(shortTrackingStateLabel(arkitTrackingState))
+            cameraStatusRows["wide"]?.text = "ARKit \(Int(res.width))x\(Int(res.height)) | \(trackingLabel)\n\(SRText("Cap"))\(String(format: "%.1f", capture)) | \(SRText(displayed == nil ? "Send" : "Display"))\(String(format: "%.1f", preview)) fps"
             updateCameraStatusColor(key: "wide", enabled: true, activeRecorder: arkitRecorder != nil)
             cameraStatusRows["ultra"]?.text = "ARKit OFF"
             updateCameraStatusColor(key: "ultra", enabled: false, activeRecorder: false)
@@ -7747,8 +8071,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         } else {
             cameraName = SRText("ULTRAWIDE")
         }
-        let hz = String(format: "%.1f Hz", measuredCameraFPS[camera] ?? 0)
-        return "\(cameraName) \(aspectLabel(for: resolution)) | \(resolution) | \(hz)"
+        let hz = String(format: "%.1f", measuredCameraFPS[camera] ?? 0)
+        let key = camera == .ultraWide ? "ultra" : camera.rawValue
+        let stats = previewDiagnosticsJSON()[key] as? [String: Any] ?? [:]
+        let display = stats["display_hz_estimate"] as? Double
+        let preview = display ?? stats["recent_enqueue_hz"] as? Double ?? 0
+        let previewTitle = SRText(display == nil ? "Send" : "Display")
+        return "\(cameraName) \(aspectLabel(for: resolution)) \(resolution)\n\(SRText("Cap"))\(hz) | \(previewTitle)\(String(format: "%.1f", preview)) fps"
     }
 
     private func depthStatusText() -> String {
@@ -7855,20 +8184,48 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         String(format: "%.1fMB", Double(bytes) / 1_000_000.0)
     }
 
-    private func currentCaptureBytes() -> Int64 {
-        guard let outDirURL = outDirURL,
-              let size = try? outDirURL.directoryTotalAllocatedSize(includingSubfolders: true) else {
-            return 0
-        }
-        return Int64(size)
+    private func currentCaptureBytes() -> Int64 { cachedCaptureBytes }
+    private func availableDiskBytes() -> Int64? { cachedFreeBytes }
+
+    private func beginPerformanceTrace() {
+        performanceWriter = SensorCSVWriter(url: outDirURL.appendingPathComponent("performance.csv"),
+            header: "host_sec,camera,capture_fps,preview_enqueue_fps,display_fps_estimate,renderer_dropped_lifetime,preview_copy_failures,max_preview_delay_ms,thermal_state,physical_footprint_mb")
+        performanceWriter?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
     }
 
-    private func availableDiskBytes() -> Int64? {
-        guard let values = try? getRecDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-              let bytes = values.volumeAvailableCapacityForImportantUsage else {
-            return nil
+    private func physicalFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
         }
-        return bytes
+        return status == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+
+    private func writePerformanceSampleIfNeeded() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard isRecording, now - lastPerformanceSample >= 0.9 else { return }
+        lastPerformanceSample = now
+        let memory = physicalFootprintMB()
+        var lines: [String] = []
+        for (key, value) in previewDiagnosticsJSON() {
+            guard let stats = value as? [String: Any] else { continue }
+            let camera: RecordingCamera? = [RecordingCamera.wide, .ultraWide, .telephoto, .front].first { ($0 == .ultraWide ? "ultra" : $0.rawValue) == key }
+            let capture = camera.flatMap { measuredCameraFPS[$0] } ?? (isARKitMode ? measuredCameraFPS[.wide] ?? 0 : 0)
+            let enqueue = stats["recent_enqueue_hz"] as? Double ?? 0
+            let display = (stats["display_hz_estimate"] as? Double).map { String(format: "%.3f", $0) } ?? ""
+            lines.append(String(format: "%.6f,%@,%.3f,%.3f,%@,%d,%d,%.3f,%d,%.2f", now, key,
+                capture, enqueue, display, stats["renderer_lifetime_dropped_frames"] as? Int ?? -1,
+                stats["copy_failures"] as? Int ?? 0, stats["max_submit_to_enqueue_ms"] as? Double ?? 0,
+                ProcessInfo.processInfo.thermalState.rawValue, memory))
+        }
+        // The writer reference and its close barrier belong to sessionQueue.
+        // Timer samples queued before Stop remain ordered ahead of finalization.
+        sessionQueue.async {
+            for line in lines { self.performanceWriter?.writeLine(line) }
+        }
     }
 
     private func estimatedRemainingRecordTime(captureBytes: Int64, freeBytes: Int64?) -> String {
@@ -7901,11 +8258,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func updateSize() {
-        var str: String = "?"
-        if let size = try? outDirURL?.sizeOnDisk() {
-            str = size
+        guard !storageRefreshPending else { return }
+        storageRefreshPending = true
+        let directory = outDirURL
+        let documents = getRecDir()
+        storageMonitorQueue.async {
+            let bytes = directory.flatMap { try? $0.directoryTotalAllocatedSize(includingSubfolders: true) }.map(Int64.init) ?? 0
+            let free = (try? documents.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage
+            DispatchQueue.main.async {
+                self.storageRefreshPending = false
+                self.cachedFreeBytes = free
+                if let free { self.diskCapacity = ByteCountFormatter.string(fromByteCount: free, countStyle: .file) }
+                if self.outDirURL == directory {
+                    self.cachedCaptureBytes = bytes
+                    self.fileSizeLabel.text = self.megabyteText(bytes) + " / " + self.diskCapacity
+                }
+            }
         }
-        fileSizeLabel.text = String(format: "%@ / %@", str, diskCapacity)
     }
 
     private func showError(msg: String) {
@@ -7932,12 +8301,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
-    private func showFreeRecordingLimitAlert() {
+    private func showFreeRecordingLimitAlert(additionalMessage: String? = nil) {
         DispatchQueue.main.async {
             guard self.presentedViewController == nil else { return }
             let alert = UIAlertController(
                 title: SRText("Free Recording Limit Reached"),
-                message: String(format: SRText("Free users can record up to %@ per session. Upgrade once to unlock unlimited recording length."), self.freeRecordingLimitMinutesText()),
+                message: String(format: SRText("Free users can record up to %@ per session. Upgrade once to unlock unlimited recording length."), self.freeRecordingLimitMinutesText()) + (additionalMessage.map { "\n\n" + $0 } ?? ""),
                 preferredStyle: .alert
             )
             alert.addAction(UIAlertAction(title: SRText("Upgrade"), style: .default) { _ in
@@ -8153,6 +8522,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 "rows": alignment.rows, "maximum_skew_sec": alignment.maximumSkew,
                 "method": "nearest existing frame by original sensor_sec; no media resampling or frame removal"] as [String: Any]
         }
+        if let recorder = arkitRecorder { result["arkit_frame_integrity"] = recorder.frameIntegrity }
         if let recordingFailure { result["failure"] = recordingFailure }
         if recorderSettings.captureMode == .arkit {
             result["arkit_target_fps"] = targetRecordingFrameRate(for: recorderSettings.arkitCamera)
@@ -8263,6 +8633,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "updated_utc_sec": utcSec,
             "recording_settings": currentRecordingSettingsJSON(),
             "recording_start": recordingStartJSON(),
+            "preview_pipeline_diagnostics": previewDiagnosticsJSON(),
             "capture_mode": recorderSettings.captureMode.rawValue,
             "coordinate_conventions": coordinateConventionsJSON(),
             "camera_extrinsics": cameraExtrinsicsJSON(),
@@ -8569,20 +8940,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
-    private func updateDiskCapacity() {
-        do {
-            let capacityValues = try getRecDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            if let capacityBytes = capacityValues.volumeAvailableCapacityForImportantUsage {
-                let limit = 100
-                if capacityBytes > (limit * 1024 * 1024 * 1024) {
-                    diskCapacity = String(format: "%d+ GB", limit)
-                } else {
-                    diskCapacity = ByteCountFormatter.string(fromByteCount: capacityBytes, countStyle: .file)
-                }
-            }
-        } catch {
-        }
-    }
+    private func updateDiskCapacity() { updateSize() }
 
     private func getRecDir() -> URL {
         return try! FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
