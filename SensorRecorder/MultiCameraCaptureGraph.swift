@@ -26,6 +26,7 @@ final class MultiCameraCaptureGraph {
         let automaticExposure: Bool
         let maxExposureSeconds: Double
         let automaticFocus: Bool
+        let focusLensPositions: [PhysicalCamera: Float]
         let audioEnabled: Bool
     }
     struct InputGroup {
@@ -195,12 +196,14 @@ final class MultiCameraCaptureGraph {
         } else { audioOutput = nil }
         graph.commitConfiguration(); committed = true
         for group in groups {
-            try applyControlPolicy(group.device, format: formats[group.device.uniqueID]!, duration: durations[group.device.uniqueID]!)
+            try applyControlPolicy(group.device, cameras: group.cameras,
+                                   format: formats[group.device.uniqueID]!, duration: durations[group.device.uniqueID]!)
         }
         if let issue = configurationIssue() { close(); throw Failure.unsupported(issue) }
     }
 
-    private func applyControlPolicy(_ device: AVCaptureDevice, format: AVCaptureDevice.Format, duration: CMTime) throws {
+    private func applyControlPolicy(_ device: AVCaptureDevice, cameras: Set<PhysicalCamera>,
+                                    format: AVCaptureDevice.Format, duration: CMTime) throws {
         try device.lockForConfiguration(); defer { device.unlockForConfiguration() }
         device.automaticallyAdjustsVideoHDREnabled = false
         if format.isVideoHDRSupported { device.isVideoHDREnabled = false }
@@ -215,11 +218,20 @@ final class MultiCameraCaptureGraph {
             if CMTimeCompare(exposure, format.maxExposureDuration) > 0 { exposure = format.maxExposureDuration }
             device.activeMaxExposureDuration = exposure
         } else if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
-        if request.automaticFocus, device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-        else if !request.automaticFocus, device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+        if request.automaticFocus, device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        } else if !request.automaticFocus, device.isFocusModeSupported(.locked) {
+            if device.isLockingFocusWithCustomLensPositionSupported,
+               let camera = PhysicalCamera.allCases.first(where: { cameras.contains($0) }),
+               let position = request.focusLensPositions[camera] {
+                device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+            } else {
+                device.setFocusModeLocked(lensPosition: AVCaptureDevice.currentLensPosition, completionHandler: nil)
+            }
+        }
         device.activeVideoMinFrameDuration = duration; device.activeVideoMaxFrameDuration = duration
     }
-    func configurationIssue() -> String? {
+    func configurationIssue(verifyFocusPosition: Bool = false) -> String? {
         for device in Dictionary(controllers.values.map { ($0.uniqueID, $0) }, uniquingKeysWith: { first, _ in first }).values {
             guard let format = formats[device.uniqueID], device.activeFormat === format else { return "A frozen camera format changed." }
             let min = CMTimeGetSeconds(device.activeVideoMinFrameDuration), max = CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
@@ -228,6 +240,11 @@ final class MultiCameraCaptureGraph {
             if request.automaticExposure && device.isExposureModeSupported(.continuousAutoExposure) && device.exposureMode != .continuousAutoExposure { return "A camera did not retain automatic exposure." }
             if request.automaticFocus && device.isFocusModeSupported(.continuousAutoFocus) && device.focusMode != .continuousAutoFocus { return "A camera did not retain automatic focus." }
             if !request.automaticFocus && device.isFocusModeSupported(.locked) && device.focusMode != .locked { return "A camera did not retain its focus lock." }
+            if verifyFocusPosition && !request.automaticFocus && device.isLockingFocusWithCustomLensPositionSupported,
+               let camera = PhysicalCamera.allCases.first(where: { controllers[$0]?.uniqueID == device.uniqueID }),
+               let requested = request.focusLensPositions[camera], abs(device.lensPosition - requested) > 0.03 {
+                return "The camera did not reach the requested focus position."
+            }
         }
         guard session.hardwareCost.isFinite, session.systemPressureCost.isFinite, session.hardwareCost <= 1, session.systemPressureCost <= 1 else { return "The exact camera configuration exceeds the capture budget." }
         // Input-port descriptions may remain nil during startup. The controller

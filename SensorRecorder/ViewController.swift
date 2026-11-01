@@ -2780,6 +2780,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var pendingPreviewCompletion: ((String?) -> Void)?
     private var settingsCapabilityGeneration = UUID()
     private var settingsMenuHasCandidates: [String: Bool] = [:]
+    // Access only from sessionQueue. SDK format support and graph budgets are
+    // stable for this device; the retry action invalidates these exact probes.
+    private var settingsProbeResults: [Data: Bool] = [:]
     private var isRecording = false
     // Main-thread UI state: keep configuration frozen until preparation or
     // every writer's finalization has finished, not merely until Stop is tapped.
@@ -4445,6 +4448,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc private func recheckCaptureCapabilities() {
         sessionQueue.async {
             self.validatedMultiCameraFormats.removeAll()
+            self.settingsProbeResults.removeAll()
             DispatchQueue.main.async { self.updateCameraResolutionMenus() }
         }
     }
@@ -4609,9 +4613,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let cameras = enabledPhysicalCameras(settings)
         guard cameras.count > 1, !settings.lidarDepthEnabled else { return nil }
         guard let reference = [settings.wide, settings.ultraWide, settings.telephoto, settings.front].first(where: \.enabled) else { return nil }
+        let positions: [PhysicalCamera: Float] = [
+            .wide: Float(clampedLensPosition(settings.wide.fixedFocusLensPosition, fallback: defaultWideFixedFocusLensPosition)),
+            .ultraWide: Float(clampedLensPosition(settings.ultraWide.fixedFocusLensPosition, fallback: defaultUltraWideFixedFocusLensPosition)),
+            .telephoto: Float(clampedLensPosition(settings.telephoto.fixedFocusLensPosition, fallback: defaultTelephotoFixedFocusLensPosition)),
+            .front: Float(clampedLensPosition(settings.front.fixedFocusLensPosition, fallback: defaultFrontFixedFocusLensPosition))
+        ]
         return .init(cameras: cameras, resolution: reference.resolution, fps: clampedFrameRate(from: reference.frameRate),
                      automaticExposure: isAutoExposureEnabled(for: reference), maxExposureSeconds: maxExposureDurationSeconds(for: reference),
-                     automaticFocus: reference.autoFocus, audioEnabled: includeAudio ?? settings.audioEnabled)
+                     automaticFocus: reference.autoFocus, focusLensPositions: positions,
+                     audioEnabled: includeAudio ?? settings.audioEnabled)
     }
 
     private func multiCameraProfileKey(_ request: MultiCameraCaptureGraph.Request) -> String {
@@ -5477,7 +5488,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             var value = stored
             value.enabled = settingsSwitches["\(key).enabled"]?.isOn ?? value.enabled
             value.autoFocus = settingsSwitches["shared.autoFocus"]?.isOn ?? settingsSwitches["\(key).autoFocus"]?.isOn ?? value.autoFocus
-            value.fixedFocusLensPosition = settingsSliders["\(key).fixedFocus"].map { Double($0.value) } ?? value.fixedFocusLensPosition
+            let sharedRearPosition = key == "front" ? nil : settingsSliders["shared.fixedFocus"]
+            value.fixedFocusLensPosition = settingsSliders["\(key).fixedFocus"].map { Double($0.value) }
+                ?? sharedRearPosition.map { Double($0.value) } ?? value.fixedFocusLensPosition
             if draft.captureMode == .standard && value.enabled {
                 value.resolution = selectedSettingsValue(for: "shared.resolution", fallback: value.resolution)
                 value.frameRate = selectedSettingsValue(for: "shared.frameRate", fallback: value.frameRate)
@@ -5513,6 +5526,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     // Called only on sessionQueue while the settings controller covers preview.
     // Probe the complete graph, including all other cameras, never a lens alone.
     private func jointConfigurationFits(_ settings: RecorderSettings) -> Bool {
+        if let key = try? JSONEncoder().encode(settings) {
+            if let cached = settingsProbeResults[key] { return cached }
+            let fits = probeJointConfiguration(settings)
+            settingsProbeResults[key] = fits
+            return fits
+        }
+        return probeJointConfiguration(settings)
+    }
+
+    private func probeJointConfiguration(_ settings: RecorderSettings) -> Bool {
         guard standardConfigurationIssue(settings) == nil else { return false }
         if enabledCameraCount(in: settings) > 1 {
             guard let request = multiCameraRequest(settings) else { return false }
@@ -5829,10 +5852,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return nil
     }
 
-    private func activeStandardConfigurationIssue() -> String? {
+    private func activeStandardConfigurationIssue(verifyFocusPosition: Bool = false) -> String? {
         if enabledCameraCount(in: recorderSettings) > 1 {
             guard let graph = multiCameraGraph else { return "The multi-camera capture graph is unavailable." }
-            return graph.configurationIssue()
+            return graph.configurationIssue(verifyFocusPosition: verifyFocusPosition)
         }
         let cameras = [("Wide", recorderSettings.wide, wideDevice),
                        ("Ultra-wide", recorderSettings.ultraWide, ultraWideDevice),
@@ -5852,6 +5875,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 formatResolution(device.activeFormat) != settings.resolution ||
                 abs(fps - requested) > 0.01 || abs(minimumFPS - requested) > 0.01 {
                 return "\(name) could not apply \(settings.resolution) at \(settings.frameRate) Hz. Please choose a compatible configuration."
+            }
+            if verifyFocusPosition && !settings.autoFocus && device.isLockingFocusWithCustomLensPositionSupported,
+               abs(device.lensPosition - lensPosition(for: settings, device: device)) > 0.03 {
+                return "\(name) did not reach the requested focus position."
             }
         }
         if recorderSettings.lidarDepthEnabled && lidarDevice?.activeDepthDataFormat == nil {
@@ -6261,7 +6288,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         logRecordingStartStep("files", startClock: startClock)
 
         sessionQueue.async {
-            if let issue = self.activeStandardConfigurationIssue() {
+            if let issue = self.activeStandardConfigurationIssue(verifyFocusPosition: true) {
                 self.writeCaptureMetaJSON(state: "failed")
                 DispatchQueue.main.async {
                     self.startStopButton.isEnabled = true
@@ -7247,31 +7274,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return lists.dropFirst().reduce(first) { $0.intersection($1) }.sorted { (Double($0) ?? 0) < (Double($1) ?? 0) }
     }
 
-    private func installCombinationMenu(draft: RecorderSettings, generation: UUID) {
+    private func installCombinationMenu(draft: RecorderSettings, generation: UUID, currentVerified: Bool,
+                                        onComplete: @escaping () -> Void) {
         guard let button = settingsMenuButtons["cameraCombination"] else { return }
         button.isEnabled = false
+        if currentVerified {
+            let title = combinationTitle(draft)
+            button.menu = UIMenu(children: [UIAction(title: SRText(title), state: .on) { _ in }])
+            button.isEnabled = true
+            button.accessibilityHint = SRText("Checking more camera combinations")
+            #if DEBUG
+            button.accessibilityLabel = "SCANNING:" + title
+            #else
+            button.accessibilityLabel = SRText("Checking more camera combinations") + ": " + SRText(title)
+            #endif
+        }
         sessionQueue.async { [weak self, weak button] in
             guard let self else { return }
-                let choices: [(String, RecorderSettings)] = self.withRestoredCaptureDevices {
-                    self.combinationCandidates(draft).compactMap { title, candidate in
-                        // Keep a working draft when possible; otherwise find a verified
-                        // common starting point before offering the new combination.
-                        if self.jointConfigurationFits(candidate) { return (title, candidate) }
-                        for resolution in self.commonResolutionChoices(candidate).reversed() {
-                            var seed = self.replacingCaptureValue(candidate, key: "shared.resolution", value: resolution)
-                            let rates = self.commonRateChoices(seed)
-                            let tries = Array(Set([rates.contains("30") ? "30" : "", rates.first ?? ""])).filter { !$0.isEmpty }
-                            for rate in tries {
-                                seed = self.replacingCaptureValue(seed, key: "shared.frameRate", value: rate)
-                                if self.jointConfigurationFits(seed) { return (title, seed) }
-                            }
-                        }
-                        return nil
-                    }
-                }
-                DispatchQueue.main.async {
-                    guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil, let button else { return }
-                    let groups = Dictionary(grouping: choices) { self.enabledCameraCount(in: $0.1) }
+            var choices: [(String, RecorderSettings)] = currentVerified ? [(self.combinationTitle(draft), draft)] : []
+            let candidates = self.combinationCandidates(draft).filter { !currentVerified || $0.0 != self.combinationTitle(draft) }
+            func publishChoices(completed: Bool = false) {
+                let verified = choices
+                DispatchQueue.main.async { [weak self, weak button] in
+                    guard let self, self.settingsCapabilityGeneration == generation,
+                          self.settingsOverlayView != nil, let button else { return }
+                    let groups = Dictionary(grouping: verified) { self.enabledCameraCount(in: $0.1) }
                     button.menu = UIMenu(children: groups.keys.sorted().map { count in
                         let title = [1: "Single camera", 2: "Dual cameras", 3: "Triple cameras"][count] ?? "\(count) cameras"
                         let actions = (groups[count] ?? []).map { name, candidate in
@@ -7283,10 +7310,51 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         return UIMenu(title: SRText(title), options: .displayInline, children: actions)
                     })
                     #if DEBUG
-                    button.accessibilityLabel = "OPTIONS:" + choices.map(\.0).joined(separator: "|")
+                    button.accessibilityLabel = (completed ? "OPTIONS:" : "SCANNING:") + verified.map(\.0).joined(separator: "|")
+                    #else
+                    button.accessibilityLabel = SRText(completed ? "Available camera combinations" : "Checking more camera combinations") + ": " + SRText(self.combinationTitle(draft))
                     #endif
-                    button.isEnabled = !choices.isEmpty
+                    button.accessibilityHint = SRText(completed ? "Available camera combinations" : "Checking more camera combinations")
+                    button.isEnabled = !verified.isEmpty
                 }
+            }
+            func scan(_ index: Int) {
+                guard index < candidates.count else {
+                    publishChoices(completed: true)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.settingsCapabilityGeneration == generation,
+                              self.settingsOverlayView != nil else { return }
+                        onComplete()
+                    }
+                    return
+                }
+                let (title, candidate) = candidates[index]
+                let verified: RecorderSettings? = self.withRestoredCaptureDevices {
+                    autoreleasepool {
+                        // Keep a working draft when possible; otherwise find a verified
+                        // common starting point before offering the new combination.
+                        if self.jointConfigurationFits(candidate) { return candidate }
+                        for resolution in self.commonResolutionChoices(candidate).reversed() {
+                            var seed = self.replacingCaptureValue(candidate, key: "shared.resolution", value: resolution)
+                            let rates = self.commonRateChoices(seed)
+                            let tries = Array(Set([rates.contains("30") ? "30" : "", rates.first ?? ""])).filter { !$0.isEmpty }
+                            for rate in tries {
+                                seed = self.replacingCaptureValue(seed, key: "shared.frameRate", value: rate)
+                                if self.jointConfigurationFits(seed) { return seed }
+                            }
+                        }
+                        return nil
+                    }
+                }
+                if let verified {
+                    choices.append((title, verified))
+                    publishChoices()
+                }
+                // Yield between hardware probes so edits and Save can use the
+                // capture queue without waiting for every combination.
+                self.sessionQueue.async { scan(index + 1) }
+            }
+            scan(0)
         }
     }
 
@@ -7335,6 +7403,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         settingsRetryButton?.isHidden = true
         let valueKeys = ["shared.resolution", "shared.frameRate"]
         for key in valueKeys {
+            settingsMenuHasCandidates[key] = false
             settingsMenuButtons[key]?.isEnabled = false
             settingsMenuButtons[key]?.configuration = settingsMenuConfiguration(title: "Checking…", compact: true)
             #if DEBUG
@@ -7367,10 +7436,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.settingsRetryButton?.isHidden = valid
                 // Rebuild both menus from the same resolved pair, never the
                 // transient new-resolution/old-rate draft.
-                self.installCombinationMenu(draft: effective, generation: generation)
-                self.installVerifiedMenu(key: "shared.resolution", candidates: resolutionCandidates, draft: effective, generation: generation)
-                self.installVerifiedMenu(key: "shared.frameRate", candidates: rateCandidates, draft: effective, generation: generation) {
-                    self.settingsSaveButton?.isEnabled = valid && self.settingsMenuHasCandidates["shared.resolution"] == true && self.settingsMenuHasCandidates["shared.frameRate"] == true
+                let enableSaveWhenReady = { [weak self] in
+                    guard let self else { return }
+                    self.settingsSaveButton?.isEnabled = valid
+                }
+                self.settingsSaveButton?.isEnabled = valid
+                self.installVerifiedMenu(key: "shared.frameRate", candidates: rateCandidates, draft: effective, generation: generation, onReady: enableSaveWhenReady)
+                self.installCombinationMenu(draft: effective, generation: generation, currentVerified: valid) { [weak self] in
+                    self?.installVerifiedMenu(key: "shared.resolution", candidates: resolutionCandidates,
+                                              draft: effective, generation: generation, onReady: enableSaveWhenReady)
                 }
                 for key in valueKeys {
                     let title = self.settingsMenuHasCandidates[key] != true ? "Not available"
@@ -7397,7 +7471,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func updateFixedFocusControlState(keyPrefix: String, cameraEnabled: Bool) {
         guard let slider = settingsSliders["\(keyPrefix).fixedFocus"] else { return }
-        let autoFocusEnabled = settingsSwitches["\(keyPrefix).autoFocus"]?.isOn ?? false
+        let autoFocusEnabled = settingsSwitches["shared.autoFocus"]?.isOn
+            ?? settingsSwitches["\(keyPrefix).autoFocus"]?.isOn ?? false
         let enabled = cameraEnabled && !autoFocusEnabled
         slider.isEnabled = enabled
         slider.superview?.isHidden = autoFocusEnabled
@@ -7708,8 +7783,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             updateAutoExposureControlState(keyPrefix: "shared", cameraEnabled: !enabled.isEmpty)
             let focusCard = addSettingsCard(to: container, title: "Focus", icon: "viewfinder", identifier: "focus")
             if enabled.count > 1 {
-                if MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(config))?.contains(where: { $0.device.isFocusModeSupported(.continuousAutoFocus) && $0.device.isFocusModeSupported(.locked) }) == true {
+                let groups = MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(config)) ?? []
+                if groups.contains(where: { $0.device.isFocusModeSupported(.continuousAutoFocus) && $0.device.isFocusModeSupported(.locked) }) {
                     addFocusModeControl(to: focusCard, keyPrefix: "shared", automatic: reference.autoFocus, manualTitle: "Lock current focus")
+                    for group in groups where group.device.isLockingFocusWithCustomLensPositionSupported {
+                        guard let camera = PhysicalCamera.allCases.first(where: { group.cameras.contains($0) }) else { continue }
+                        let key = group.cameras.count > 1 ? "shared" : camera.settingsKey
+                        let stored: CameraCaptureSettings
+                        switch camera {
+                        case .wide: stored = config.wide
+                        case .ultraWide: stored = config.ultraWide
+                        case .telephoto: stored = config.telephoto
+                        case .front: stored = config.front
+                        }
+                        addSettingsSliderRow(to: focusCard, key: "\(key).fixedFocus",
+                                             title: group.cameras.count > 1 ? "Rear Focus Position" : "\(camera.displayName) Focus Position",
+                                             value: clampedLensPosition(stored.fixedFocusLensPosition, fallback: camera == .ultraWide ? defaultUltraWideFixedFocusLensPosition : defaultWideFixedFocusLensPosition), compact: true)
+                        updateFixedFocusControlState(keyPrefix: key, cameraEnabled: true)
+                    }
                 } else {
                     addSettingsFootnote(to: focusCard, text: "Fixed-focus lenses")
                 }
@@ -7920,6 +8011,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         let cameraEnabled = settingsSwitches["\(keyPrefix).enabled"]?.isOn ?? true
         updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: cameraEnabled)
+        if keyPrefix == "shared" {
+            for camera in ["wide", "ultra", "telephoto", "front"] {
+                updateFixedFocusControlState(keyPrefix: camera, cameraEnabled: settingsSwitches["\(camera).enabled"]?.isOn ?? false)
+            }
+        }
         if keyPrefix != "arkit" { updateCameraResolutionMenus() }
     }
 

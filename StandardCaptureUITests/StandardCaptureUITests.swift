@@ -215,6 +215,7 @@ final class StandardCaptureUITests: XCTestCase {
     private func availableMenuChoices(_ key: String, pattern: String) -> [String] {
         let button = app.buttons["settings.menu.\(key)"]
         if key.hasPrefix("shared.") { wait(button, "label BEGINSWITH 'VERIFIED:'", timeout: 120) }
+        if key == "cameraCombination" { wait(button, "label BEGINSWITH 'OPTIONS:' OR label BEGINSWITH 'Available camera combinations'", timeout: 120) }
         reveal(button); wait(button, "enabled == true", timeout: 120)
         // The app publishes the exact SDK-validated menu entries in a DEBUG
         // accessibility label. Querying every transient UIMenu action repeatedly
@@ -545,11 +546,27 @@ final class StandardCaptureUITests: XCTestCase {
         closeSettings()
     }
 
+    func testMultiCameraFocusPresetsFollowHardwareSupport() throws {
+        configure(combination: "Wide + Ultra Wide", resolution: "640x480", rate: "30", sensors: false)
+        XCTAssertFalse(app.sliders["shared.fixedFocus"].exists)
+        XCTAssertFalse(app.sliders["wide.fixedFocus"].exists)
+        select("cameraCombination", "Wide + Front")
+        setSwitch("shared.autoFocus", false)
+        let wideFocus = app.sliders["wide.fixedFocus"]
+        reveal(wideFocus)
+        XCTAssertTrue(wideFocus.isEnabled)
+        XCTAssertFalse(app.sliders["front.fixedFocus"].exists)
+        wideFocus.adjust(toNormalizedSliderPosition: 0.8)
+        save()
+        record(seconds: 3)
+    }
+
     func testAllDeviceCameraCombinationsAreOffered() throws {
         app.buttons["main.settings"].tap()
         select("captureMode", "Standard")
         let menu = app.buttons["settings.menu.cameraCombination"]
         reveal(menu)
+        wait(menu, "label BEGINSWITH 'OPTIONS:' OR label BEGINSWITH 'Available camera combinations'", timeout: 120)
         menu.tap()
         let wide = menuOption("Wide")
         XCTAssertTrue(wide.waitForExistence(timeout: 120))
@@ -568,6 +585,16 @@ final class StandardCaptureUITests: XCTestCase {
             XCTAssertTrue(app.otherElements["settings.card.\(name)"].exists, "Missing expanded card: \(name)")
         }
         save()
+    }
+
+    func testSettingsAreUsableBeforeCombinationScanCompletes() throws {
+        app.buttons["main.settings"].tap()
+        let combination = app.buttons["settings.menu.cameraCombination"]
+        XCTAssertTrue(combination.waitForExistence(timeout: 10))
+        wait(combination, "enabled == true", timeout: 15)
+        wait(app.buttons["settings.save"], "enabled == true", timeout: 15)
+        app.buttons["settings.save"].tap()
+        XCTAssertTrue(app.buttons["main.settings"].waitForExistence(timeout: 30))
     }
 
     func testPortraitSettingsAndLandscapeReturn() throws {
@@ -786,6 +813,7 @@ final class StandardCaptureUITests: XCTestCase {
     private func select(_ key: String, _ value: String) {
         let button = app.buttons["settings.menu.\(key)"]
         if key.hasPrefix("shared.") { wait(button, "label BEGINSWITH 'VERIFIED:'", timeout: 120) }
+        if key == "cameraCombination" { wait(button, "label BEGINSWITH 'OPTIONS:' OR label BEGINSWITH 'Available camera combinations'", timeout: 120) }
         reveal(button)
         wait(button, "enabled == true", timeout: 120)
         if button.value as? String == value { return }
