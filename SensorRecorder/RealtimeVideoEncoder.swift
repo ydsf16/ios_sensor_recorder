@@ -94,11 +94,11 @@ final class RealtimeVideoEncoder {
         } catch { VTCompressionSessionInvalidate(created); throw error }
     }
 
-    func encode(_ sample: CMSampleBuffer, completion: @escaping (OSStatus, VTEncodeInfoFlags, CMSampleBuffer?) -> Void) throws {
-        guard let image = CMSampleBufferGetImageBuffer(sample) else { throw Failure.operation("pixel buffer", -1) }
+    func encode(_ image: CVPixelBuffer, presentationTimeStamp: CMTime, duration: CMTime,
+                completion: @escaping (OSStatus, VTEncodeInfoFlags, CMSampleBuffer?) -> Void) throws {
         let frame = Unmanaged.passRetained(Frame(completion))
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image,
-            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample), duration: CMSampleBufferGetDuration(sample),
+            presentationTimeStamp: presentationTimeStamp, duration: duration,
             frameProperties: nil, sourceFrameRefcon: frame.toOpaque(), infoFlagsOut: nil)
         guard status == noErr else { frame.release(); throw Failure.operation("submission", status) }
     }

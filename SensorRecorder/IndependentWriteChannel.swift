@@ -13,9 +13,10 @@ final class IndependentWriteChannel {
     private var failure: String?
     private var handler: ((String) -> Void)?
 
-    init(label: String, maximumBytes: Int = 4 * 1024 * 1024, maximumItems: Int = 4096) {
+    init(label: String, maximumBytes: Int = 4 * 1024 * 1024, maximumItems: Int = 4096,
+         qos: DispatchQoS = .utility) {
         self.label = label
-        queue = DispatchQueue(label: label, qos: .utility, autoreleaseFrequency: .workItem)
+        queue = DispatchQueue(label: label, qos: qos, autoreleaseFrequency: .workItem)
         self.maximumBytes = maximumBytes
         self.maximumItems = maximumItems
     }

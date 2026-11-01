@@ -74,6 +74,12 @@ private final class LivePreviewRenderer {
         }
     }
 
+    // The caller already owns a detached pool buffer. The mailbox retains at
+    // most one such frame, so the camera source pool is never held by preview.
+    func submitDetached(_ image: CVPixelBuffer, pts: CMTime) {
+        admit(image, pts: pts, format: nil, admitted: ProcessInfo.processInfo.systemUptime)
+    }
+
     func submit(_ image: CVPixelBuffer, pts: CMTime, format: CMFormatDescription? = nil) {
         var description = format
         if description == nil {
@@ -192,6 +198,33 @@ private final class LivePreviewRenderer {
             enqueueTimes.removeAll { now - $0 > 2 }
             maximumDelayMS = max(maximumDelayMS, (ProcessInfo.processInfo.systemUptime - frame.admitted) * 1000)
         } else { notReady += 1 }
+    }
+}
+
+/// Keep menu-anchor state stable until UIKit finishes the dismissal animation.
+private final class CaptureSettingsMenuButton: UIButton {
+    private var menuActive = false
+    private var pendingMenuWork: (() -> Void)?
+
+    func afterMenuDismissal(_ work: @escaping () -> Void) {
+        if menuActive { pendingMenuWork = work }
+        else { DispatchQueue.main.async(execute: work) }
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+        menuActive = true
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willEndFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        let complete = { [weak self] in
+            guard let self else { return }
+            self.menuActive = false
+            let work = self.pendingMenuWork; self.pendingMenuWork = nil
+            work?()
+        }
+        if let animator { animator.addCompletion(complete) } else { complete() }
     }
 }
 
@@ -361,6 +394,18 @@ private final class PortraitSettingsViewController: UIViewController {
 }
 
 private final class CameraStreamRecorder {
+    private struct StageTiming {
+        var count = 0
+        var totalNS: UInt64 = 0
+        var maxNS: UInt64 = 0
+        var overFrameBudget = 0
+        mutating func record(_ start: UInt64, frameRate: Double) {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start
+            count += 1; totalNS += elapsed; maxNS = max(maxNS, elapsed)
+            if Double(elapsed) > 1_000_000_000 / max(frameRate, 1) { overFrameBudget += 1 }
+        }
+        var csv: String { "\(count),\(String(format: "%.3f", Double(totalNS) / Double(max(count, 1)) / 1e6)),\(String(format: "%.3f", Double(maxNS) / 1e6)),\(overFrameBudget)" }
+    }
     fileprivate static let videoMediaTimeScale: CMTimeScale = 1_000_000
     private static let resolutionSupportLock = NSLock()
     private static var resolutionSupport: [String: Bool] = [:]
@@ -392,6 +437,10 @@ private final class CameraStreamRecorder {
     private var encodingFrames = 0
     private var movieOrigin: CMTime?
     private var inFlightFrames = DispatchSemaphore(value: 6)
+    private var captureCopyTiming = StageTiming() // capture queue only
+    private var encoderSubmitTiming = StageTiming() // encoding queue only
+    private var muxAppendTiming = StageTiming() // writer queue only
+    private var maxPendingPackets = 0 // writer queue only
     var onFailure: ((String) -> Void)? {
         didSet { if let failureMessage { onFailure?(failureMessage) } }
     }
@@ -461,7 +510,9 @@ private final class CameraStreamRecorder {
         writeInfoLine("# camera,\(cameraName)")
     }
 
-    func append(_ sampleBuffer: CMSampleBuffer, device: AVCaptureDevice?, sessionClock: CMClock?, recordSlot: Int64? = nil, sessionOrigin: CMTime? = nil, sensorSec: TimeInterval? = nil) {
+    func append(_ sampleBuffer: CMSampleBuffer, device: AVCaptureDevice?, sessionClock: CMClock?,
+                recordSlot: Int64? = nil, sessionOrigin: CMTime? = nil,
+                sensorSec: TimeInterval? = nil, preview: LivePreviewRenderer? = nil) {
         // Clock correlation can change while audio runs. Convert at admission,
         // once, rather than again after asynchronous encoding and disk writes.
         let capturedSensorSec = sensorSec ?? CMTimeGetSeconds(captureSensorTime(for: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), sessionClock: sessionClock))
@@ -472,43 +523,56 @@ private final class CameraStreamRecorder {
         }
         let exposureSec = device.map { CMTimeGetSeconds($0.exposureDuration) } ?? .nan
         let iso = device?.iso ?? .nan
-        let detached: CMSampleBuffer
-        do { detached = try captureStorage.copy(sampleBuffer) }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        let intrinsics = cameraIntrinsics(sampleBuffer)
+        let detached: CVPixelBuffer
+        let copyStart = DispatchTime.now().uptimeNanoseconds
+        do {
+            guard let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { throw CaptureSampleStorage.Failure.copy("image", -1) }
+            detached = try captureStorage.copyPixelBuffer(image)
+        }
         catch {
             inFlightFrames.signal()
             let pending = realtimeEncoder?.pendingFrameCount
             writerQueue.async { self.fail(error.localizedDescription + "; SDK pending frames: \(pending.map(String.init) ?? "unknown")") }
             return
         }
+        captureCopyTiming.record(copyStart, frameRate: captureFrameRate)
+        preview?.submitDetached(detached, pts: pts)
         encodingQueue.async {
             defer { self.inFlightFrames.signal() }
-            self.appendOnWriterQueue(detached, sensorSec: capturedSensorSec, exposureSec: exposureSec, iso: iso, recordSlot: recordSlot, sessionOrigin: sessionOrigin)
+            self.appendOnWriterQueue(detached, pts: pts, duration: duration, intrinsics: intrinsics,
+                                     sensorSec: capturedSensorSec, exposureSec: exposureSec, iso: iso,
+                                     recordSlot: recordSlot, sessionOrigin: sessionOrigin)
         }
     }
 
-    private func appendOnWriterQueue(_ sampleBuffer: CMSampleBuffer, sensorSec: TimeInterval, exposureSec: Double, iso: Float, recordSlot: Int64?, sessionOrigin: CMTime?) {
+    private func appendOnWriterQueue(_ image: CVPixelBuffer, pts: CMTime, duration: CMTime,
+                                     intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float)?,
+                                     sensorSec: TimeInterval, exposureSec: Double, iso: Float,
+                                     recordSlot: Int64?, sessionOrigin: CMTime?) {
         guard !encoderFinishing else { return }
         guard infoHandle != nil else { fail("Cannot open the video index file"); return }
-        if let image = CMSampleBufferGetImageBuffer(sampleBuffer), let expectedResolution,
+        if let expectedResolution,
            "\(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image))" != expectedResolution {
             fail("The delivered pixel dimensions differ from the validated settings")
             return
         }
         let sequence = recordSlot ?? receivedFrames
         receivedFrames += 1
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if firstPTS == nil { firstPTS = pts; movieOrigin = sessionOrigin ?? pts }
-        if realtimeEncoder == nil, let image = CMSampleBufferGetImageBuffer(sampleBuffer) {
+        if realtimeEncoder == nil {
             prepareEncoder(width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
         }
         guard let realtimeEncoder else { return }
-        let image = CMSampleBufferGetImageBuffer(sampleBuffer)!
         let frame = PendingFrame(presentationTime: pts, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image),
-                                 intrinsics: cameraIntrinsics(sampleBuffer), sensorSec: sensorSec,
+                                 intrinsics: intrinsics, sensorSec: sensorSec,
                                  exposureSec: exposureSec, iso: iso, sequence: sequence)
         writerQueue.async { self.encodingFrames += 1 }
+        let encodeStart = DispatchTime.now().uptimeNanoseconds
         do {
-            try realtimeEncoder.encode(sampleBuffer) { status, flags, encoded in
+            try realtimeEncoder.encode(image, presentationTimeStamp: pts, duration: duration) { status, flags, encoded in
                 guard self.encodedPacketSlots.wait(timeout: .now()) == .success else {
                     self.writerQueue.async { self.encodingFrames -= 1; self.fail("Compressed video write queue overflow") }
                     return
@@ -526,10 +590,12 @@ private final class CameraStreamRecorder {
                     guard self.writer != nil else { return }
                     var ready = frame; ready.encodedBuffer = encoded; ready.packetLease = lease
                     self.pendingFrames.append(ready)
+                    self.maxPendingPackets = max(self.maxPendingPackets, self.pendingFrames.count)
                     self.drainPendingFrames()
                 }
             }
         } catch { writerQueue.async { self.encodingFrames -= 1; self.fail(error.localizedDescription) } }
+        encoderSubmitTiming.record(encodeStart, frameRate: captureFrameRate)
     }
 
     private func scheduleDrainIfNeeded() {
@@ -551,7 +617,9 @@ private final class CameraStreamRecorder {
         }
         while !pendingFrames.isEmpty && input.isReadyForMoreMediaData && writer.status == .writing {
             let frame = pendingFrames.removeFirst()
+            let appendStart = DispatchTime.now().uptimeNanoseconds
             if let encoded = frame.encodedBuffer, input.append(encoded) {
+                muxAppendTiming.record(appendStart, frameRate: captureFrameRate)
                 writeInfo(frame)
                 frameIndex += 1
             } else {
@@ -616,6 +684,8 @@ private final class CameraStreamRecorder {
     }
 
     func finish(_ completion: @escaping () -> Void) {
+        let captureTiming = captureCopyTiming.csv
+        writerQueue.async { self.writeInfoLine("# diagnostic,capture_pixel_copy,count_avg_ms_max_ms_over_budget,\(captureTiming)") }
         encodingQueue.async {
             if self.encoderFinishing {
                 self.writerQueue.async {
@@ -626,9 +696,11 @@ private final class CameraStreamRecorder {
             self.encoderFinishing = true
             do { try self.realtimeEncoder?.complete() }
             catch { self.fail(error.localizedDescription) }
+            let encodeTiming = self.encoderSubmitTiming.csv
             // Encoder completion has enqueued every packet. The muxer queue
             // finishes only after those packet handlers and their CSV rows.
             self.writerQueue.async {
+                self.writeInfoLine("# diagnostic,encoder_submit,count_avg_ms_max_ms_over_budget,\(encodeTiming)")
                 self.finishCallbacks.append(completion)
                 self.isFinishing = true
                 if self.writer == nil && self.encodingFrames == 0 { self.finalizeWriter() }
@@ -646,6 +718,7 @@ private final class CameraStreamRecorder {
     private func finalizeWriter() {
         guard !finalizing else { return }
         finalizing = true
+        writeInfoLine("# diagnostic,mux_append,count_avg_ms_max_ms_over_budget,\(muxAppendTiming.csv),max_pending_packets,\(maxPendingPackets)")
         do { try infoHandle?.synchronize(); try infoHandle?.close() }
         catch { fail("Could not finalize the video index: \(error.localizedDescription)") }
         infoHandle = nil
@@ -733,9 +806,17 @@ private final class CameraStreamRecorder {
         guard realtimeEncoder == nil else { return }
         videoCodec = Self.preferredVideoCodec(width: width, height: height)
         do {
-            realtimeEncoder = try RealtimeVideoEncoder(width: width, height: height,
-                codec: videoCodec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-                framesPerSecond: targetFrameRate, bitRate: Self.videoBitRate(width: width, height: height, codec: videoCodec, framesPerSecond: targetFrameRate))
+            for attempt in 0..<3 {
+                do {
+                    realtimeEncoder = try RealtimeVideoEncoder(width: width, height: height,
+                        codec: videoCodec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+                        framesPerSecond: targetFrameRate, bitRate: Self.videoBitRate(width: width, height: height, codec: videoCodec, framesPerSecond: targetFrameRate))
+                    break
+                } catch RealtimeVideoEncoder.Failure.operation(_, let status) where status == -12912 && attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.25 * Double(attempt + 1))
+                }
+            }
+            guard realtimeEncoder != nil else { throw RealtimeVideoEncoder.Failure.operation("hardware verification", -12912) }
             if let pool = realtimeEncoder?.pixelBufferPool { captureStorage.useEncoderPool(pool, framesPerSecond: targetFrameRate) }
             writeInfoLine("# video,\(width)x\(height),codec,\(videoCodec.rawValue)")
             writeInfoLine("# encoder,VideoToolbox,hardware,\(realtimeEncoder?.hardwareAccelerated == true),real_time,true,frame_reordering,false")
@@ -984,12 +1065,12 @@ private final class ARKitFrameRecorder {
         pixelBuffer sourcePixelBuffer: CVPixelBuffer,
         presentationTime: CMTime,
         camera: ARCamera,
-        recordSlot: Int64
+        recordSlot: Int64,
+        preview: LivePreviewRenderer?
     ) {
-        guard let sample = makeSampleBuffer(pixelBuffer: sourcePixelBuffer, presentationTime: presentationTime) else { channel.reportFailure("Invalid ARKit input"); return }
         do {
-            let owned = try storage.copy(sample)
-            guard let image = CMSampleBufferGetImageBuffer(owned) else { return }
+            let image = try storage.copyPixelBuffer(sourcePixelBuffer)
+            preview?.submitDetached(image, pts: presentationTime)
             let snapshot = CameraSnapshot(camera)
             channel.enqueue(bytes: CVPixelBufferGetDataSize(image)) {
                 self.appendOnWriterQueue(pixelBuffer: image, presentationTime: presentationTime, camera: snapshot, recordSlot: recordSlot)
@@ -1479,7 +1560,8 @@ private final class LiDARDepthStreamRecorder {
 }
 
 private final class AudioStreamRecorder {
-    private let channel = IndependentWriteChannel(label: "com.sensorrecorder.audio", maximumBytes: 8 * 1024 * 1024, maximumItems: 512)
+    private let channel = IndependentWriteChannel(label: "com.sensorrecorder.audio", maximumBytes: 8 * 1024 * 1024,
+        maximumItems: 512, qos: .background)
     var onFailure: ((String) -> Void)? {
         get { channel.onFailure }
         set { channel.onFailure = newValue }
@@ -2174,6 +2256,7 @@ private final class GeoLocationStreamRecorder {
     private var count = 0
     private var firstSensorSec: TimeInterval?
     private var latestSensorSec: TimeInterval?
+    private var lastLocationUTCSec: TimeInterval?
     private let statusLock = NSLock()
 
     init(directory: URL) {
@@ -2204,6 +2287,10 @@ private final class GeoLocationStreamRecorder {
 
     func append(_ location: CLLocation) {
         let utcSec = location.timestamp.timeIntervalSince1970
+        // Core Location may deliver the same cached fix more than once.
+        // Preserve source timestamps and write each fix only once.
+        guard utcSec.isFinite, utcSec > (lastLocationUTCSec ?? -.infinity) else { return }
+        lastLocationUTCSec = utcSec
         let sensorSec = utcSec - utcMinusSensorOffsetSec
         let horizontalAccuracy = location.horizontalAccuracy
         let verticalAccuracy = location.verticalAccuracy
@@ -2596,6 +2683,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var synchronizationGroup: Int64 = 0
     private var synchronizationDroppedGroups = 0
     private var synchronizationMaxSkew = 0.0
+    private var syncCallbackCount = 0
+    private var syncCallbackTotalNS: UInt64 = 0
+    private var syncCallbackMaxNS: UInt64 = 0
+    private var syncPreviewMaxNS: UInt64 = 0
+    private var syncRecordMaxNS: UInt64 = 0
+    private var audioCaptureCount = 0
+    private var audioCaptureTotalNS: UInt64 = 0
+    private var audioCaptureMaxNS: UInt64 = 0
     private var initialRecordingSamples: [RecordingCamera: CMSampleBuffer] = [:]
     private var timestampAlignmentSummary: TimestampAlignment.Summary?
     private var synchronizationOrigin: CMTime?
@@ -3023,6 +3118,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var matrixResults: [[String: Any]] = []
     private var matrixIndex = 0
     private var matrixEnd = 0
+    private var matrixSelectedIndices: [Int]?
+    private var matrixSelectionCursor = 0
     private var matrixOriginalSettings: RecorderSettings?
     private var matrixRunID = UUID().uuidString
 
@@ -3040,12 +3137,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var base = recorderSettings
         base.captureMode = .standard
         base.lidarDepthEnabled = false
-        base.audioEnabled = false
+        base.audioEnabled = true
         base.imuEnabled = true
         base.deviceMotionEnabled = true
-        base.geoLocationEnabled = false
-        base.magnetometerEnabled = false
-        base.barometerEnabled = false
+        base.geoLocationEnabled = true
+        base.magnetometerEnabled = true
+        base.barometerEnabled = true
+        if ProcessInfo.processInfo.arguments.contains("--matrix-no-audio") { base.audioEnabled = false }
+        if ProcessInfo.processInfo.arguments.contains("--matrix-camera-only") {
+            base.audioEnabled = false
+            base.imuEnabled = false
+            base.deviceMotionEnabled = false
+            base.geoLocationEnabled = false
+            base.magnetometerEnabled = false
+            base.barometerEnabled = false
+        }
         for key in ["wide", "ultra", "telephoto", "front"] {
             switch key {
             case "wide": base.wide.autoExposure = true; base.wide.maxExposureDurationMS = "10"; base.wide.autoFocus = true
@@ -3057,7 +3163,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let arkitOnly = ProcessInfo.processInfo.arguments.contains("--matrix-arkit-only")
         if arkitOnly {
             base.captureMode = .arkit
-            base.imuEnabled = false; base.deviceMotionEnabled = false
             if let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: { $0.framesPerSecond == 30 }) {
                 base.arkitCamera.resolution = "\(Int(format.imageResolution.width))x\(Int(format.imageResolution.height))"
                 base.arkitCamera.frameRate = String(format.framesPerSecond)
@@ -3067,7 +3172,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ensurePermissions(requiredPermissions(for: base)) { granted in
             guard granted else { label.accessibilityValue = "failed"; return }
             if arkitOnly {
-                self.matrixProfiles = [base]; self.matrixIndex = 0; self.matrixEnd = 1
+                if ProcessInfo.processInfo.arguments.contains("--matrix-arkit-all-options") {
+                    self.matrixProfiles = self.arkitResolutionOptions(for: base.arkitCamera.resolution).flatMap { resolution in
+                        self.arkitRecordingRateChoices(resolution: resolution).map { rate in
+                            var profile = base
+                            profile.arkitCamera.resolution = resolution; profile.arkitCamera.frameRate = rate
+                            return profile
+                        }
+                    }
+                } else { self.matrixProfiles = [base] }
+                self.matrixIndex = 0; self.matrixEnd = self.matrixProfiles.count
+                let args = ProcessInfo.processInfo.arguments
+                if let flag = args.firstIndex(of: "--matrix-indices"), flag + 1 < args.count {
+                    self.matrixSelectedIndices = args[flag + 1].split(separator: ",").compactMap { Int($0) }
+                        .filter { $0 >= 0 && $0 < self.matrixProfiles.count }
+                    self.matrixSelectionCursor = 0
+                    if let first = self.matrixSelectedIndices?.first { self.matrixIndex = first }
+                }
                 self.runNextMatrixProfile()
                 return
             }
@@ -3097,6 +3218,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     }
                     self.matrixIndex = max(0, min(profileCount, argument("--matrix-offset", fallback: 0)))
                     self.matrixEnd = min(profileCount, self.matrixIndex + max(0, argument("--matrix-count", fallback: profileCount)))
+                    if let flag = args.firstIndex(of: "--matrix-indices"), flag + 1 < args.count {
+                        let indices = args[flag + 1].split(separator: ",").compactMap { Int($0) }
+                        self.matrixSelectedIndices = indices.filter { $0 >= 0 && $0 < profileCount }
+                        self.matrixSelectionCursor = 0
+                        if let first = self.matrixSelectedIndices?.first { self.matrixIndex = first }
+                    }
                     do {
                         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                         try encoder.encode(profiles).write(to: self.getRecDir().appendingPathComponent("capture-validation-profiles.json"), options: .atomic)
@@ -3108,7 +3235,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func runNextMatrixProfile() {
-        if matrixIndex >= matrixEnd {
+        if matrixSelectedIndices.map({ matrixSelectionCursor >= $0.count }) ?? (matrixIndex >= matrixEnd) {
             UIApplication.shared.isIdleTimerDisabled = false
             if let original = matrixOriginalSettings { recorderSettings = original }
             matrixStatus?.text = "Traversal finished: \(matrixResults.count) recordings"
@@ -3170,11 +3297,20 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func finishMatrixProfile(error: String?, directory: String?) {
         let profile = matrixProfiles[matrixIndex]
+        var finalError = error
+        if finalError == nil, profile.captureMode == .arkit, let directory,
+           let data = try? Data(contentsOf: getRecDir().appendingPathComponent(directory).appendingPathComponent("meta.json")),
+           let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let start = meta["recording_start"] as? [String: Any],
+           let integrity = start["arkit_frame_integrity"] as? [String: Any],
+           let missing = integrity["missing_target_slots"] as? Int, missing > 0 {
+            finalError = "ARKit source omitted \(missing) target frame slots"
+        }
         var result: [String: Any] = ["index": matrixIndex, "combination": combinationTitle(profile),
                                    "thermal": ProcessInfo.processInfo.thermalState.rawValue,
                                    "profile": (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(profile))) ?? [:]]
         result["directory"] = directory ?? NSNull()
-        result["error"] = error ?? NSNull()
+        result["error"] = finalError ?? NSNull()
         matrixResults.append(result)
         do {
             let data = try JSONSerialization.data(withJSONObject: ["run_id": matrixRunID, "total_profiles": matrixProfiles.count,
@@ -3184,8 +3320,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             matrixStatus?.text = error.localizedDescription; matrixStatus?.accessibilityValue = "failed"; return
         }
         if let alert = presentedViewController as? UIAlertController { alert.dismiss(animated: false) }
-        matrixIndex += 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.runNextMatrixProfile() }
+        if let selected = matrixSelectedIndices {
+            matrixSelectionCursor += 1
+            if matrixSelectionCursor < selected.count { matrixIndex = selected[matrixSelectionCursor] }
+        } else { matrixIndex += 1 }
+        let args = ProcessInfo.processInfo.arguments
+        let cooldown = args.firstIndex(of: "--matrix-cooldown").flatMap {
+            $0 + 1 < args.count ? Double(args[$0 + 1]) : nil
+        } ?? 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.5, cooldown)) { self.runNextMatrixProfile() }
     }
 
     private func inspectHardwareForTesting() {
@@ -3451,6 +3594,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         sessionQueue.async {
             if self.captureRecordingActive { self.reportRecordingFailure(message) }
             else if self.pendingPreviewCompletion != nil { self.previewConfigurationFailure = message }
+            else if self.settingsOverlayView != nil {
+                // A capability probe intentionally changes camera formats
+                // while the preview is suspended. Its transient session error
+                // must not interrupt a settings menu selection.
+                os_log("Ignoring capture session error during settings scan: %@", type: .info, message)
+            }
             else { self.showError(msg: message) }
         }
     }
@@ -3917,20 +4066,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         let pts = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000)
-        enqueueARKitPreview(frame.capturedImage, pts: pts)
 
         if isRecording {
             let pixelBuffer = frame.capturedImage
             let recordSlot = arkitRecordingSlotIfFrameShouldBeWritten(pts)
 
-            if let recordSlot = recordSlot {
-                arkitRecorder?.append(
+            if let recordSlot, let arkitRecorder {
+                let preview = arkitDisplayLayer.flatMap { objc_getAssociatedObject($0, &livePreviewAssociationKey) as? LivePreviewRenderer }
+                arkitRecorder.append(
                     pixelBuffer: pixelBuffer,
                     presentationTime: pts,
                     camera: frame.camera,
-                    recordSlot: recordSlot
+                    recordSlot: recordSlot,
+                    preview: preview
                 )
-            }
+            } else { enqueueARKitPreview(pixelBuffer, pts: pts) }
 
             // Process ARKit scene depth if available and recording
             if let sceneDepth = frame.sceneDepth,
@@ -3955,7 +4105,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     self?.latestDepthSensorSec = sensorSec
                 }
             }
-        }
+        } else { enqueueARKitPreview(frame.capturedImage, pts: pts) }
 
         guard arkitFrameCount % 30 == 0 else { return }
         let cadence = arkitCaptureTimes.count > 1 ? Double(arkitCaptureTimes.count - 1) / max(0.001, arkitCaptureTimes.last! - arkitCaptureTimes.first!) : 0
@@ -4045,6 +4195,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer, didOutput collection: AVCaptureSynchronizedDataCollection) {
         guard synchronizer === standardSynchronizer else { return }
+        let callbackStart = DispatchTime.now().uptimeNanoseconds
+        let measuring = captureRecordingActive
+        defer {
+            if measuring {
+                let elapsed = DispatchTime.now().uptimeNanoseconds - callbackStart
+                syncCallbackCount += 1
+                syncCallbackTotalNS += elapsed
+                syncCallbackMaxNS = max(syncCallbackMaxNS, elapsed)
+            }
+        }
         let hardware = multiCameraGraph?.hardwareSyncCameras ?? []
         let branches = standardVideoBranches().filter { hardware.contains($0.camera) }
         guard let primary = branches.first,
@@ -4073,6 +4233,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             case .front: frontFrameCount += 1; enqueuePreview(data.sampleBuffer, on: frontDisplayLayer, camera: .front)
             }
         }
+        if measuring { syncPreviewMaxNS = max(syncPreviewMaxNS, DispatchTime.now().uptimeNanoseconds - callbackStart) }
         if samples.first?.0.camera == .wide && wideFrameCount % 30 == 0 {
             setStatus(recorderSettings.front.enabled ? "Partial hardware sync" : "Hardware sync")
         }
@@ -4115,6 +4276,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func writeHardwareSynchronizedGroup(_ samples: [(StandardVideoBranch, CMSampleBuffer)]) {
+        let writeStart = DispatchTime.now().uptimeNanoseconds
+        defer { syncRecordMaxNS = max(syncRecordMaxNS, DispatchTime.now().uptimeNanoseconds - writeStart) }
         let seconds = samples.map { sensorSeconds(for: CMSampleBufferGetPresentationTimeStamp($0.1)) }
         let skew = (seconds.max() ?? 0) - (seconds.min() ?? 0)
         synchronizationMaxSkew = max(synchronizationMaxSkew, skew)
@@ -4139,7 +4302,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     ) {
         if let audioOutput = audioOutput, output === audioOutput {
             if captureRecordingActive || (isARKitMode && isRecording) {
+                let start = DispatchTime.now().uptimeNanoseconds
                 appendAudioSample(sampleBuffer)
+                let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                audioCaptureCount += 1; audioCaptureTotalNS += elapsed; audioCaptureMaxNS = max(audioCaptureMaxNS, elapsed)
             }
             return
         }
@@ -4220,9 +4386,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
         let sessionClock = captureSessionClock()
-        if let audioSample = copySampleBuffer(sampleBuffer) {
-            audioRecorder?.append(audioSample, sessionClock: sessionClock)
-        }
+        // AudioStreamRecorder immediately detaches PCM into its own block buffer.
+        // A shallow CMSampleBuffer copy here only adds work to the capture queue.
+        audioRecorder?.append(sampleBuffer, sessionClock: sessionClock)
         guard embedAudioInCameraMP4 else { return }
         if let wideAudioSample = copySampleBuffer(sampleBuffer) {
             wideRecorder?.appendAudio(wideAudioSample)
@@ -4314,14 +4480,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func appendRecordingSampleDirect(_ sampleBuffer: CMSampleBuffer, camera: RecordingCamera, recordSlot: Int64? = nil, sensorSec: TimeInterval? = nil) {
         let recorder: CameraStreamRecorder?
         let physical: AVCaptureDevice?
+        let displayLayer: AVSampleBufferDisplayLayer?
         switch camera {
-        case .wide: recorder = wideRecorder; physical = wideDevice
-        case .ultraWide: recorder = ultraWideRecorder; physical = ultraWideDevice
-        case .telephoto: recorder = telephotoRecorder; physical = telephotoDevice
-        case .front: recorder = frontRecorder; physical = frontDevice
+        case .wide: recorder = wideRecorder; physical = wideDevice; displayLayer = wideDisplayLayer
+        case .ultraWide: recorder = ultraWideRecorder; physical = ultraWideDevice; displayLayer = ultraWideDisplayLayer
+        case .telephoto: recorder = telephotoRecorder; physical = telephotoDevice; displayLayer = telephotoDisplayLayer
+        case .front: recorder = frontRecorder; physical = frontDevice; displayLayer = frontDisplayLayer
         }
+        let preview = displayLayer.flatMap { objc_getAssociatedObject($0, &livePreviewAssociationKey) as? LivePreviewRenderer }
         recorder?.append(sampleBuffer, device: multiCameraGraph?.controllers[camera] ?? physical,
-                         sessionClock: captureSessionClock(), recordSlot: recordSlot, sessionOrigin: synchronizationOrigin, sensorSec: sensorSec)
+                         sessionClock: captureSessionClock(), recordSlot: recordSlot,
+                         sessionOrigin: synchronizationOrigin, sensorSec: sensorSec, preview: preview)
     }
 
     private func resetRecordingSamplingState() {
@@ -4331,6 +4500,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func enqueuePreview(_ sampleBuffer: CMSampleBuffer, on displayLayer: AVSampleBufferDisplayLayer?, camera: RecordingCamera) {
         noteCaptureCadence(sampleBuffer, camera: camera)
+        if captureRecordingActive { return } // Recorder supplies its detached pool buffer.
         guard let layer = displayLayer else { return }
         (objc_getAssociatedObject(layer, &livePreviewAssociationKey) as? LivePreviewRenderer)?.submit(sampleBuffer)
     }
@@ -5566,7 +5736,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return result
     }
 
-    private func installVerifiedMenu(key: String, candidates: [String], draft: RecorderSettings, generation: UUID) {
+    private func installVerifiedMenu(key: String, candidates: [String], draft: RecorderSettings, generation: UUID, onReady: (() -> Void)? = nil) {
         guard let button = settingsMenuButtons[key] else { return }
         settingsMenuHasCandidates[key] = !candidates.isEmpty
         let selected = button.accessibilityValue ?? ""
@@ -5579,11 +5749,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         }
         let basePlan = plan
-        button.isEnabled = !candidates.isEmpty
-        button.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self, weak button] completion in
-            guard let self else { completion([]); return }
-            self.sessionQueue.async {
-                guard !self.isRecording else { DispatchQueue.main.async { completion([]) }; return }
+        button.isEnabled = false
+        // Finish SDK scans before exposing actions. Deferred menu providers can
+        // be queried repeatedly by accessibility while their anchor is closing.
+        sessionQueue.async { [weak self, weak button] in
+            guard let self, !self.isRecording else { return }
                 let valid: [(String, RecorderSettings)] = self.withRestoredCaptureDevices {
                     candidates.compactMap { value in
                         autoreleasepool {
@@ -5601,7 +5771,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     }
                 }
                 DispatchQueue.main.async {
-                    guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { completion([]); return }
+                    guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil, let button else { return }
                     let actions = valid.map { value, compatible in
                         UIAction(title: value, state: value == selected ? .on : .off) { [weak self, weak button] _ in
                             guard let self, self.settingsCapabilityGeneration == generation else { return }
@@ -5617,12 +5787,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                             self.settingsFormatSelectionChanged(key)
                         }
                     }
-                    if actions.isEmpty {
-                        completion([UIAction(title: "No compatible options for this combination", attributes: .disabled, handler: { _ in })])
-                    } else { completion(actions) }
+                    button.menu = UIMenu(children: actions)
+                    #if DEBUG
+                    button.accessibilityLabel = "VERIFIED:" + valid.map(\.0).joined(separator: "|")
+                    #endif
+                    button.isEnabled = !actions.isEmpty
+                    self.settingsMenuHasCandidates[key] = !actions.isEmpty
+                    button.configuration = self.settingsMenuConfiguration(title: actions.isEmpty ? "Not available" : button.accessibilityValue ?? "Choose…", compact: true)
+                    onReady?()
                 }
-            }
-        }])
+        }
     }
 
     private func standardConfigurationIssue(_ settings: RecorderSettings) -> String? {
@@ -5698,12 +5872,38 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         let unique = Dictionary(options.map { ($0.label, $0.area) }, uniquingKeysWith: max)
         let sorted = unique.sorted { $0.value > $1.value }
-        var labels = sorted.map(\.key)
-        let preferred = preferredResolution
-        if !labels.contains(preferred) && preferred.contains("x") {
-            labels.insert(preferred, at: 0)
+        return sorted.map(\.key)
+    }
+
+    // These are recording cadences; ARKit may capture at a higher native SDK
+    // cadence and downsample, but must never offer a target above that format.
+    private func arkitRecordingRateChoices(resolution: String) -> [String] {
+        let maximum = ARWorldTrackingConfiguration.supportedVideoFormats.filter {
+            "\(Int($0.imageResolution.width))x\(Int($0.imageResolution.height))" == resolution
+        }.map { Double($0.framesPerSecond) }.max() ?? 0
+        return ["1", "5", "10", "20", "30", "60"].filter {
+            guard let rate = Double($0) else { return false }
+            return CaptureRateOptions.isWithinProductLimit(rate) && rate <= maximum
         }
-        return labels.isEmpty ? ["1920x1440", "1280x720"] : labels
+    }
+
+    private func updateARKitFrameRateMenu() {
+        guard let resolution = settingsMenuButtons["arkit.resolution"]?.accessibilityValue,
+              let button = settingsMenuButtons["arkit.frameRate"] else { return }
+        let rates = arkitRecordingRateChoices(resolution: resolution)
+        let selected = CaptureRateOptions.compatibleOrder(current: button.accessibilityValue ?? "30", choices: rates).first
+        button.isEnabled = selected != nil
+        button.accessibilityValue = selected
+        button.configuration = settingsMenuConfiguration(title: selected ?? "Not available", compact: true)
+        #if DEBUG
+        button.accessibilityLabel = "OPTIONS:" + rates.joined(separator: "|")
+        #endif
+        button.menu = UIMenu(children: rates.map { rate in
+            UIAction(title: rate, state: rate == selected ? .on : .off) { [weak self, weak button] _ in
+                button?.accessibilityValue = rate
+                button?.configuration = self?.settingsMenuConfiguration(title: rate, compact: true)
+            }
+        })
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
@@ -6074,6 +6274,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.beginPerformanceTrace()
             self.synchronizationGroup = 0
             self.synchronizationDroppedGroups = 0
+            self.syncCallbackCount = 0
+            self.syncCallbackTotalNS = 0
+            self.syncCallbackMaxNS = 0
+            self.syncPreviewMaxNS = 0
+            self.syncRecordMaxNS = 0
+            self.audioCaptureCount = 0
+            self.audioCaptureTotalNS = 0
+            self.audioCaptureMaxNS = 0
             self.synchronizationMaxSkew = 0
             self.synchronizationOrigin = nil
             self.synchronizationOriginSensorSec = nil
@@ -6258,6 +6466,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             if let writer = self.performanceWriter { group.enter(); writer.close { group.leave() } }
             self.performanceWriter = nil
+            if self.syncCallbackCount > 0 {
+                self.synchronizationWriter?.writeLine("# diagnostic,sync_callback,count,\(self.syncCallbackCount),avg_ms,\(String(format: "%.3f", Double(self.syncCallbackTotalNS) / Double(self.syncCallbackCount) / 1e6)),max_ms,\(String(format: "%.3f", Double(self.syncCallbackMaxNS) / 1e6))")
+                self.synchronizationWriter?.writeLine("# diagnostic,sync_sections,preview_max_ms,\(String(format: "%.3f", Double(self.syncPreviewMaxNS) / 1e6)),record_max_ms,\(String(format: "%.3f", Double(self.syncRecordMaxNS) / 1e6))")
+            }
+            if self.audioCaptureCount > 0 {
+                self.synchronizationWriter?.writeLine("# diagnostic,audio_capture,count,\(self.audioCaptureCount),avg_ms,\(String(format: "%.3f", Double(self.audioCaptureTotalNS) / Double(self.audioCaptureCount) / 1e6)),max_ms,\(String(format: "%.3f", Double(self.audioCaptureMaxNS) / 1e6))")
+            }
             if let writer = self.synchronizationWriter { group.enter(); writer.close { group.leave() } }
             self.synchronizationWriter = nil
             group.notify(queue: self.sessionQueue) {
@@ -6760,11 +6975,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         enableSettingsTextWrapping(titleLabel)
         if !usesVerticalLayout { titleLabel.widthAnchor.constraint(equalToConstant: compact ? 96 : 112).isActive = true }
 
-        let button = UIButton(type: .system)
+        let button = CaptureSettingsMenuButton(type: .system)
         button.contentHorizontalAlignment = .leading
         enableSettingsButtonTextWrapping(button)
         button.accessibilityValue = resolvedSelectedValue(in: items, preferred: selectedValue)
         button.accessibilityIdentifier = "settings.menu.\(key)"
+        #if DEBUG
+        button.accessibilityLabel = "OPTIONS:" + items.joined(separator: "|")
+        #endif
         button.configuration = settingsMenuConfiguration(title: button.accessibilityValue ?? selectedValue, compact: compact)
         button.menu = UIMenu(children: items.map { item in
             UIAction(title: SRText(item), state: item == button.accessibilityValue ? .on : .off) { [weak self, weak button] _ in
@@ -6835,9 +7053,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
 
     private func settingsFormatSelectionChanged(_ key: String) {
-        if key.hasSuffix(".resolution") || key.hasSuffix(".frameRate") || key == "shared.maxExposure" {
-            updateCameraResolutionMenus()
+        guard key.hasSuffix(".resolution") || key.hasSuffix(".frameRate") || key == "shared.maxExposure" else { return }
+        let generation = UUID()
+        settingsCapabilityGeneration = generation
+        settingsSaveButton?.isEnabled = false
+        let refresh = { [weak self] in
+            guard let self, self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { return }
+            if key.hasPrefix("arkit.") {
+                self.updateARKitFrameRateMenu()
+                self.settingsSaveButton?.isEnabled = true
+            } else { self.updateCameraResolutionMenus(adjustFrameRate: key.hasSuffix(".resolution")) }
         }
+        if let button = settingsMenuButtons[key] as? CaptureSettingsMenuButton { button.afterMenuDismissal(refresh) }
+        else { refresh() }
     }
 
     private func addCameraSettingsSection(
@@ -6880,7 +7108,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             to: captureControls,
             key: "\(keyPrefix).frameRate",
             title: "Hz",
-            items: keyPrefix == "arkit" ? ["1", "5", "10", "20", "30", "60"] : [],
+            items: keyPrefix == "arkit" ? arkitRecordingRateChoices(resolution: settings.resolution) : [],
             selectedValue: settings.frameRate,
             compact: true
         )
@@ -6917,6 +7145,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         updateAutoExposureControlState(keyPrefix: keyPrefix, cameraEnabled: settings.enabled && available)
         updateFixedFocusControlState(keyPrefix: keyPrefix, cameraEnabled: settings.enabled && available)
         updateCameraSettingsGroup(keyPrefix: keyPrefix, enabled: settings.enabled && available)
+        if keyPrefix == "arkit" { updateARKitFrameRateMenu() }
     }
 
     private func addSettingsSubsectionTitle(
@@ -7020,9 +7249,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func installCombinationMenu(draft: RecorderSettings, generation: UUID) {
         guard let button = settingsMenuButtons["cameraCombination"] else { return }
-        button.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] completion in
-            guard let self else { completion([]); return }
-            self.sessionQueue.async {
+        button.isEnabled = false
+        sessionQueue.async { [weak self, weak button] in
+            guard let self else { return }
                 let choices: [(String, RecorderSettings)] = self.withRestoredCaptureDevices {
                     self.combinationCandidates(draft).compactMap { title, candidate in
                         // Keep a working draft when possible; otherwise find a verified
@@ -7041,9 +7270,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     }
                 }
                 DispatchQueue.main.async {
-                    guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { completion([]); return }
+                    guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil, let button else { return }
                     let groups = Dictionary(grouping: choices) { self.enabledCameraCount(in: $0.1) }
-                    completion(groups.keys.sorted().map { count in
+                    button.menu = UIMenu(children: groups.keys.sorted().map { count in
                         let title = [1: "Single camera", 2: "Dual cameras", 3: "Triple cameras"][count] ?? "\(count) cameras"
                         let actions = (groups[count] ?? []).map { name, candidate in
                             UIAction(title: SRText(name), state: name == self.combinationTitle(draft) ? .on : .off) { [weak self] _ in
@@ -7053,9 +7282,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         }
                         return UIMenu(title: SRText(title), options: .displayInline, children: actions)
                     })
+                    #if DEBUG
+                    button.accessibilityLabel = "OPTIONS:" + choices.map(\.0).joined(separator: "|")
+                    #endif
+                    button.isEnabled = !choices.isEmpty
                 }
-            }
-        }])
+        }
     }
 
     private func synchronizationDescription(_ settings: RecorderSettings) -> String {
@@ -7092,7 +7324,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         populateCameraSettings(container: container, isARKMode: false, arkitAvailable: ARWorldTrackingConfiguration.isSupported, configuration: draft)
     }
 
-    private func updateCameraResolutionMenus() {
+    private func updateCameraResolutionMenus(adjustFrameRate: Bool = true) {
         guard settingsMenuButtons["captureMode"]?.accessibilityValue != "ARKit" else { return }
         settingsCapabilityGeneration = UUID()
         let generation = settingsCapabilityGeneration
@@ -7102,16 +7334,44 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         settingsValidationLabel?.isHidden = false
         settingsRetryButton?.isHidden = true
         let valueKeys = ["shared.resolution", "shared.frameRate"]
-        for key in valueKeys { settingsMenuButtons[key]?.configuration = settingsMenuConfiguration(title: "Checking…", compact: true) }
+        for key in valueKeys {
+            settingsMenuButtons[key]?.isEnabled = false
+            settingsMenuButtons[key]?.configuration = settingsMenuConfiguration(title: "Checking…", compact: true)
+            #if DEBUG
+            settingsMenuButtons[key]?.accessibilityLabel = "CHECKING:"
+            #endif
+        }
         sessionQueue.async {
-            let valid = self.withRestoredCaptureDevices { self.jointConfigurationFits(draft) }
+            let compatible: RecorderSettings? = self.withRestoredCaptureDevices {
+                if self.jointConfigurationFits(draft) { return draft }
+                guard adjustFrameRate else { return nil }
+                let current = [draft.wide, draft.ultraWide, draft.telephoto, draft.front].first(where: \.enabled)?.frameRate ?? "30"
+                for rate in CaptureRateOptions.compatibleOrder(current: current, choices: self.commonRateChoices(draft)) {
+                    let candidate = self.replacingCaptureValue(draft, key: "shared.frameRate", value: rate)
+                    if self.jointConfigurationFits(candidate) { return candidate }
+                }
+                return nil
+            }
+            let effective = compatible ?? draft
+            let resolutionCandidates = self.commonResolutionChoices(effective)
+            let rateCandidates = self.commonRateChoices(effective)
             DispatchQueue.main.async {
                 guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { return }
-                self.settingsSaveButton?.isEnabled = valid
+                let valid = compatible != nil
+                if let reference = [effective.wide, effective.ultraWide, effective.telephoto, effective.front].first(where: \.enabled) {
+                    self.settingsMenuButtons["shared.frameRate"]?.accessibilityValue = reference.frameRate
+                }
                 self.settingsValidationLabel?.isHidden = valid
                 self.settingsValidationLabel?.text = valid ? nil : SRText("Configuration unavailable. Choose supported values or retry.")
                 self.settingsValidationLabel?.textColor = .systemRed
                 self.settingsRetryButton?.isHidden = valid
+                // Rebuild both menus from the same resolved pair, never the
+                // transient new-resolution/old-rate draft.
+                self.installCombinationMenu(draft: effective, generation: generation)
+                self.installVerifiedMenu(key: "shared.resolution", candidates: resolutionCandidates, draft: effective, generation: generation)
+                self.installVerifiedMenu(key: "shared.frameRate", candidates: rateCandidates, draft: effective, generation: generation) {
+                    self.settingsSaveButton?.isEnabled = valid && self.settingsMenuHasCandidates["shared.resolution"] == true && self.settingsMenuHasCandidates["shared.frameRate"] == true
+                }
                 for key in valueKeys {
                     let title = self.settingsMenuHasCandidates[key] != true ? "Not available"
                         : valid ? self.settingsMenuButtons[key]?.accessibilityValue ?? "Choose…" : "Choose…"
@@ -7119,10 +7379,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 }
             }
         }
-        installCombinationMenu(draft: draft, generation: generation)
-        installVerifiedMenu(key: "shared.resolution", candidates: commonResolutionChoices(draft), draft: draft, generation: generation)
-        installVerifiedMenu(key: "shared.frameRate", candidates: commonRateChoices(draft), draft: draft, generation: generation)
-
     }
 
     private func updateCameraSettingsGroup(keyPrefix: String, enabled: Bool) {
@@ -7197,6 +7453,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     @objc private func showSettingsOverlay() {
         guard settingsOverlayView == nil, !isRecording, recordingTransition == .none, presentedViewController == nil else { return }
+        // Capability scans reconfigure the same physical cameras used by the
+        // preview. Stop it before the first scan instead of repeatedly
+        // restarting it for every candidate while Settings is visible.
+        if !isARKitMode {
+            singlePreviewSession?.stopRunning()
+            sessionQueue.async { self.session.stopRunning() }
+        }
         // Capability probes may open AVCapture inputs. Release ARKit's camera
         // first, even while the saved mode is still ARKit.
         if isARKitMode, let session = arSession {
@@ -7682,6 +7945,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let saveButton = UIButton(type: .system)
         settingsSaveButton = saveButton
         saveButton.accessibilityIdentifier = "settings.save"
+        saveButton.isEnabled = recorderSettings.captureMode == .arkit ||
+            (settingsMenuButtons["shared.resolution"]?.isEnabled == true &&
+             settingsMenuButtons["shared.frameRate"]?.isEnabled == true &&
+             settingsMenuHasCandidates["shared.resolution"] == true &&
+             settingsMenuHasCandidates["shared.frameRate"] == true)
         var config = UIButton.Configuration.filled()
         config.title = SRText("Save Settings")
         config.baseBackgroundColor = .systemBlue
@@ -7769,6 +8037,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         pendingPreviewCompletion = completion
         startStopButton.isEnabled = false
         sessionQueue.async {
+            let wasARKit = self.arSession != nil
             self.tearDownARKitSession()
 
             if self.observesSessionRuntimeErrors {
@@ -7816,7 +8085,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.firstDepthSensorSec = nil
             self.latestDepthSensorSec = nil
 
-            DispatchQueue.main.async {
+            // ARKit releases the camera asynchronously after pause. Starting
+            // a new ARSession immediately can retain the previous 30 fps
+            // cadence even when the new SDK format requests 60 fps.
+            DispatchQueue.main.asyncAfter(deadline: .now() + (wasARKit ? 1.0 : 0.0)) {
                 self.wideDisplayLayer?.removeFromSuperlayer()
                 self.ultraWideDisplayLayer?.removeFromSuperlayer()
                 self.telephotoDisplayLayer?.removeFromSuperlayer()

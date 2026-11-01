@@ -139,6 +139,201 @@ final class StandardCaptureUITests: XCTestCase {
         }
     }
 
+    func testRearPairResolutionChangeFollowsFrameRateWithoutAlert() throws {
+        configure(combination: "Wide + Ultra Wide", resolution: "640x480", rate: "60", sensors: true)
+        for _ in 0..<2 {
+            select("shared.resolution", "3840x2160")
+            wait(app.buttons["settings.menu.shared.frameRate"], "enabled == true AND value == '30'", timeout: 120)
+            XCTAssertFalse(app.otherElements["capture.error"].exists)
+            let rate = app.buttons["settings.menu.shared.frameRate"]
+            rate.tap()
+            XCTAssertTrue(menuOption("30").waitForExistence(timeout: 120))
+            XCTAssertFalse(menuOption("60").exists)
+            menuOption("30").tap()
+            save(); record(seconds: 5)
+            app.buttons["main.settings"].tap()
+            select("shared.resolution", "640x480")
+            wait(app.buttons["settings.menu.shared.frameRate"], "enabled == true AND value == '30'", timeout: 120)
+            select("shared.frameRate", "60")
+        }
+        closeSettings()
+    }
+
+    func testEveryAvailableCameraResolutionAndRateOption() throws { try exerciseAvailableCameraOptions() }
+    func testAllOptionsWide() throws { try exerciseAvailableCameraOptions(only: "Wide") }
+    func testAllOptionsUltraWide() throws { try exerciseAvailableCameraOptions(only: "Ultra Wide") }
+    func testAllOptionsFront() throws { try exerciseAvailableCameraOptions(only: "Front") }
+    func testAllOptionsWideUltraWide() throws { try exerciseAvailableCameraOptions(only: "Wide + Ultra Wide") }
+    func testAllOptionsWideFront() throws { try exerciseAvailableCameraOptions(only: "Wide + Front") }
+    func testAllOptionsUltraWideFront() throws { try exerciseAvailableCameraOptions(only: "Ultra Wide + Front") }
+    func testAllOptionsTriple() throws { try exerciseAvailableCameraOptions(only: "Wide + Ultra Wide + Front") }
+
+    private func exerciseAvailableCameraOptions(only: String? = nil) throws {
+        executionTimeAllowance = 7200
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard")
+        for key in ["lidarDepth", "imu", "motion", "mag", "baro", "geo", "audio"] { setSwitch(key, false) }
+        let cameraPattern = "(Wide|Ultra Wide|Telephoto|Front)( \\+ (Wide|Ultra Wide|Telephoto|Front))*"
+        let combinations = availableMenuChoices("cameraCombination", pattern: cameraPattern).sorted().filter { only == nil || $0 == only }
+        XCTAssertFalse(combinations.isEmpty)
+        var checked = 0
+        for combination in combinations {
+            select("cameraCombination", combination)
+            let resolutions = availableMenuChoices("shared.resolution", pattern: "[0-9]+x[0-9]+").sorted {
+                func area(_ value: String) -> Int { value.split(separator: "x").compactMap { Int($0) }.reduce(1, *) }
+                return area($0) < area($1)
+            }
+            for resolution in resolutions {
+                let previous = Double(app.buttons["settings.menu.shared.frameRate"].value as? String ?? "") ?? 0
+                select("shared.resolution", resolution)
+                wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+                let followed = app.buttons["settings.menu.shared.frameRate"].value as? String ?? ""
+                let rates = availableMenuChoices("shared.frameRate", pattern: "[0-9]+([.][0-9]+)?").sorted { Double($0)! < Double($1)! }
+                XCTAssertFalse(rates.isEmpty)
+                let expected = rates.last(where: { Double($0)! <= previous }) ?? rates.first!
+                XCTAssertEqual(followed, expected, "Resolution must keep the old rate or follow a supported cadence")
+                for rate in rates {
+                    XCTAssertLessThanOrEqual(Double(rate)!, 60)
+                    select("shared.frameRate", rate)
+                    wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+                    XCTAssertFalse(app.otherElements["capture.error"].exists)
+                    XCTAssertEqual(app.buttons["settings.menu.shared.resolution"].value as? String, resolution)
+                    print("SETTINGS_OPTION_CHECK \(combination)|\(resolution)|\(rate)")
+                    checked += 1
+                }
+                save(); record(seconds: 3)
+                app.buttons["main.settings"].tap()
+                wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+                XCTAssertEqual(app.buttons["settings.menu.shared.resolution"].value as? String, resolution)
+                XCTAssertEqual(app.buttons["settings.menu.shared.frameRate"].value as? String, rates.last)
+            }
+        }
+        print("SETTINGS_OPTION_TOTAL \(checked), combinations \(combinations.count)")
+        closeSettings()
+    }
+
+    private func availableMenuChoices(_ key: String, pattern: String) -> [String] {
+        let button = app.buttons["settings.menu.\(key)"]
+        if key.hasPrefix("shared.") { wait(button, "label BEGINSWITH 'VERIFIED:'", timeout: 120) }
+        reveal(button); wait(button, "enabled == true", timeout: 120)
+        // The app publishes the exact SDK-validated menu entries in a DEBUG
+        // accessibility label. Querying every transient UIMenu action repeatedly
+        // can exhaust the on-device XCTest snapshot process.
+        let prefix = key.hasPrefix("shared.") ? "VERIFIED:" : "OPTIONS:"
+        let choices = (button.label.hasPrefix(prefix) ? String(button.label.dropFirst(prefix.count)) : "")
+            .split(separator: "|").map(String.init).filter {
+            NSPredicate(format: "SELF MATCHES %@", pattern).evaluate(with: $0)
+        }
+        if !choices.isEmpty { return choices }
+        button.tap()
+        let query = app.buttons.matching(NSPredicate(format: "label MATCHES %@ AND NOT identifier BEGINSWITH %@", pattern, "settings."))
+        XCTAssertTrue(query.firstMatch.waitForExistence(timeout: 120))
+        var found = Set<String>(), previous: [String] = []
+        for _ in 0..<32 {
+            let elements = query.allElementsBoundByIndex
+            found.formUnion(elements.map(\.label))
+            let visible = elements.filter(\.isHittable)
+            let labels = visible.map(\.label)
+            // A fully visible menu must not be dragged: UIKit treats that as
+            // selecting an action, rather than scrolling a non-scrollable list.
+            if visible.count == elements.count || labels == previous { break }
+            previous = labels
+            guard let first = visible.first else { break }
+            let rect = visible.dropFirst().reduce(first.frame) { $0.union($1.frame) }
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: rect.midX, dy: rect.maxY - 10))
+                .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(dx: rect.midX, dy: rect.minY + 10)))
+        }
+        if let choice = query.allElementsBoundByIndex.first(where: \.isHittable) { choice.tap() }
+        // A second broad accessibility query while UIKit dismisses a menu can
+        // stall XCTest's snapshot walker on device. The action has completed;
+        // let the dismissal animation settle before querying the next control.
+        Thread.sleep(forTimeInterval: 0.5)
+        if key == "cameraCombination" {
+            let warning = app.alerts["Camera Synchronization"]
+            if warning.waitForExistence(timeout: 1) { warning.buttons["Use This Combination"].tap() }
+        }
+        return Array(found)
+    }
+
+    func testEveryExposureChoiceAndSensorSwitchPersistence() throws {
+        configure(combination: "Wide + Ultra Wide", resolution: "640x480", rate: "30", sensors: true)
+        setSwitch("shared.autoExposure", true)
+        let exposures = availableMenuChoices("shared.maxExposure", pattern: "[0-9]+")
+        for exposure in exposures.sorted(by: { Double($0)! < Double($1)! }) {
+            select("shared.maxExposure", exposure)
+            wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+            XCTAssertEqual(app.buttons["settings.menu.shared.frameRate"].value as? String, "30")
+            save(); record(seconds: 3)
+            app.buttons["main.settings"].tap()
+            XCTAssertEqual(app.buttons["settings.menu.shared.maxExposure"].value as? String, exposure)
+        }
+        setSwitch("shared.autoExposure", false)
+        XCTAssertFalse(app.buttons["settings.menu.shared.maxExposure"].isEnabled)
+        save(); record(seconds: 3)
+        app.buttons["main.settings"].tap()
+        setSwitch("shared.autoExposure", true)
+        for enabled in [true, false] {
+            for key in ["imu", "motion", "mag", "baro", "geo", "audio"] { setSwitch(key, enabled); allowSystemPermissions() }
+            save()
+            app.buttons["main.settings"].tap()
+            for key in ["imu", "motion", "mag", "baro", "geo", "audio"] {
+                XCTAssertEqual(app.switches[key].value as? String, enabled ? "1" : "0")
+            }
+        }
+        XCTAssertFalse(app.switches["lidarDepth"].isEnabled, "This iPhone 12 has no LiDAR")
+        closeSettings()
+    }
+
+    func testManualFocusEndpointsAndMidpoint() throws {
+        configure(combination: "Wide", resolution: "640x480", rate: "30", sensors: false)
+        setSwitch("wide.autoFocus", false)
+        for position: CGFloat in [0, 0.5, 1] {
+            let focus = app.sliders["wide.fixedFocus"]
+            reveal(focus); focus.adjust(toNormalizedSliderPosition: position)
+            save(); record(seconds: 3)
+            app.buttons["main.settings"].tap()
+            XCTAssertTrue(app.segmentedControls["settings.focusMode.wide"].buttons["Manual"].isSelected)
+        }
+        setSwitch("wide.autoFocus", true)
+        save(); record(seconds: 3)
+    }
+
+    func testEveryARKitResolutionAndRecordingRateOption() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "ARKit")
+        let resolutions = availableMenuChoices("arkit.resolution", pattern: "[0-9]+x[0-9]+")
+        for resolution in resolutions {
+            select("arkit.resolution", resolution)
+            let followed = app.buttons["settings.menu.arkit.frameRate"].value as? String ?? ""
+            let rates = availableMenuChoices("arkit.frameRate", pattern: "[0-9]+([.][0-9]+)?")
+            XCTAssertTrue(rates.contains(followed))
+            for rate in rates {
+                select("arkit.frameRate", rate)
+                XCTAssertLessThanOrEqual(Double(rate)!, 60)
+                XCTAssertFalse(app.otherElements["capture.error"].exists)
+                print("ARKIT_OPTION_CHECK \(resolution)|\(rate)")
+            }
+        }
+        closeSettings()
+    }
+
+    func testOneHzMenusRemainResponsive() throws {
+        for combination in ["Front", "Wide + Ultra Wide + Front"] {
+            configure(combination: combination, resolution: "640x480", rate: "30", sensors: false)
+            let rates = availableMenuChoices("shared.frameRate", pattern: "[0-9]+([.][0-9]+)?")
+            XCTAssertTrue(rates.contains("1"))
+            select("shared.frameRate", "1")
+            wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+            select("shared.frameRate", "60")
+            select("shared.frameRate", "1")
+            save(); record(seconds: 9)
+            app.buttons["main.settings"].tap()
+            select("shared.frameRate", "60")
+            save(); record(seconds: 3)
+        }
+    }
+
     func testSDK4K60Recording() throws {
         configure(combination: "Wide", resolution: "3840x2160", rate: "60", sensors: true)
         save(); record(seconds: 30)
@@ -460,6 +655,27 @@ final class StandardCaptureUITests: XCTestCase {
         closeSettings()
     }
 
+    func testRepeatedModeAndCameraCombinationSwitches() throws {
+        executionTimeAllowance = 1200
+        app.buttons["main.settings"].tap()
+        for key in ["imu", "motion", "mag", "baro", "geo", "audio"] { setSwitch(key, false) }
+        let names = ["Wide", "Ultra Wide", "Front", "Wide + Ultra Wide", "Wide + Front", "Ultra Wide + Front", "Wide + Ultra Wide + Front"]
+        for _ in 0..<2 {
+            for name in names {
+                select("captureMode", "Standard")
+                select("cameraCombination", name)
+                wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
+                XCTAssertFalse(app.otherElements["capture.error"].exists, "Switching to \(name) failed")
+                XCTAssertEqual(app.buttons["settings.menu.cameraCombination"].value as? String, name)
+                select("captureMode", "ARKit")
+                XCTAssertTrue(app.buttons["settings.menu.arkit.resolution"].exists)
+                XCTAssertFalse(app.otherElements["capture.error"].exists)
+            }
+        }
+        select("captureMode", "Standard")
+        closeSettings()
+    }
+
     func testFreeRecordingLimit() throws {
         app.buttons["main.settings"].tap()
         let status = app.staticTexts["purchase.status"]
@@ -569,7 +785,9 @@ final class StandardCaptureUITests: XCTestCase {
 
     private func select(_ key: String, _ value: String) {
         let button = app.buttons["settings.menu.\(key)"]
+        if key.hasPrefix("shared.") { wait(button, "label BEGINSWITH 'VERIFIED:'", timeout: 120) }
         reveal(button)
+        wait(button, "enabled == true", timeout: 120)
         if button.value as? String == value { return }
         button.tap()
         let option = menuOption(value)
@@ -592,7 +810,11 @@ final class StandardCaptureUITests: XCTestCase {
             }
         }
         XCTAssertTrue(option.waitForExistence(timeout: 120), "\(key) does not offer \(value)")
-        option.tap()
+        // The device's floating AssistiveTouch control can cover the center
+        // of the top menu row; tap inside the row near its leading edge.
+        option.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+        // UIKit may keep the selected UIMenu action in the accessibility tree
+        // briefly after dismissal. Verify the setting value instead.
         if key == "cameraCombination", value.contains("Front"), value != "Front" {
             let warning = app.alerts["Camera Synchronization"]
             XCTAssertTrue(warning.waitForExistence(timeout: 5))
@@ -673,6 +895,7 @@ final class StandardCaptureUITests: XCTestCase {
     }
 
     private func wait(_ element: XCUIElement, _ predicate: String, timeout: TimeInterval) {
+        if NSPredicate(format: predicate).evaluate(with: element) { return }
         let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)], timeout: timeout)
         if result != .completed {
             print("Unmet predicate: \(predicate); element: \(element.debugDescription); application: \(app.state.rawValue)")
