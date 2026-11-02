@@ -45,6 +45,8 @@ To record with ARKit:
 
 ARKit recordings use `wide.mp4` for RGB and `arkit_pose.csv` for frame timestamps, position, quaternion, tracking state, exposure and camera intrinsics. Depth, when available, uses `lidar_depth/` and `lidar_depth_info.csv`; enabled audio/sensor streams retain their normal files. `meta.json` records the capture mode and settings.
 
+Camera CSV indexes preserve `sensor_sec` as the original capture timestamp and add `exposure_mid_sensor_sec` and `exposure_mid_utc_sec` for VIO. The midpoint is estimated as the original timestamp plus half the frame's exposure duration. Standard mode reads the frame's EXIF exposure attachment when available and records `exposure_source=frame_exif`; otherwise it uses the device's current exposure (`device_current`). ARKit uses its frame camera exposure (`arkit_frame`). A missing duration yields `nan`. This is an **estimated** midpoint: the SDK does not document whether capture PTS itself marks the start, middle, or end of exposure, and rolling shutter gives different image rows different times. Keep the original timestamp for auditing and calibrate the camera timing before claiming sub-frame physical accuracy.
+
 ARKit pose is an estimated trajectory, not ground truth. Check `tracking_state` before using it for evaluation or sensor fusion. Equal camera frame rates and comparable timestamps do not guarantee simultaneous exposure. See the coordinate convention below before consuming pose data.
 
 LiDAR depth output, when enabled, is stored as raw frame files:
@@ -171,6 +173,8 @@ ARKit 录制步骤：
 4. 回到 Landscape Right 横屏预览，开始录制，结束后导出 session 文件夹。
 
 ARKit 模式使用 `wide.mp4` 保存 RGB，使用 `arkit_pose.csv` 保存逐帧时间戳、位置、四元数、跟踪状态、曝光及相机内参。可用的深度保存到 `lidar_depth/` 和 `lidar_depth_info.csv`；已开启的音频、传感器仍使用各自常规文件。`meta.json` 记录采集模式和设置。
+
+相机 CSV 索引保留原始采集时间 `sensor_sec`，并增加供 VIO 使用的 `exposure_mid_sensor_sec` 和 `exposure_mid_utc_sec`。估算方法为原始时间加上逐帧曝光时长的一半。Standard 优先读取该帧的 EXIF 曝光信息（`exposure_source=frame_exif`），缺失时回退到设备当前曝光（`device_current`）；ARKit 使用该帧相机的曝光时长（`arkit_frame`）。无法取得曝光时写 `nan`。这是**估计**曝光中心：SDK 未保证原始 PTS 对应曝光开始、中心还是结束；滚动快门下各行也没有同一曝光中心。需要亚帧级物理精度时，应先标定时间基准。
 
 ARKit Pose 是估计轨迹，不是真值。用于评估或传感器融合前应检查 `tracking_state`。相同相机帧率和可比较的时间戳不代表同时曝光；使用 Pose 前请核对下方坐标约定。
 

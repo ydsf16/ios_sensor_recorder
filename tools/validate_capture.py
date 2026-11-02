@@ -61,6 +61,20 @@ def validate(session, ffprobe):
         require(all((int(r['width_px']), int(r['height_px'])) == (width, height) for r in data), f'{key}: index dimensions')
         times = [float(r['sensor_sec']) for r in data]
         sensor_times[key] = times
+        if 'exposure_mid_sensor_sec' in data[0]:
+            for row in data:
+                duration = float(row['exposure_sec'])
+                midpoint = float(row['exposure_mid_sensor_sec'])
+                source = row['exposure_source']
+                require(source in {'frame_exif', 'device_current', 'unavailable'}, f'{key}: unknown exposure source')
+                if source == 'unavailable':
+                    require(math.isnan(midpoint), f'{key}: midpoint was invented without exposure data')
+                else:
+                    require(math.isfinite(duration) and duration > 0 and math.isfinite(midpoint), f'{key}: invalid exposure midpoint')
+                    require(abs(midpoint - (float(row['sensor_sec']) + duration / 2)) < 0.000002,
+                            f'{key}: exposure midpoint does not match the indexed frame')
+                    require(abs(float(row['exposure_mid_utc_sec']) - (float(row['utc_sec']) + duration / 2)) < 0.000002,
+                            f'{key}: exposure midpoint UTC does not match the indexed frame')
         gaps = [b - a for a, b in zip(times, times[1:])]
         fps = float(settings[key]['target_frame_rate'])
         measured = (len(times) - 1) / (times[-1] - times[0])

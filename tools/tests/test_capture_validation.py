@@ -142,6 +142,20 @@ class CaptureValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'resampled'):
             self.run_validator()
 
+    def test_exposure_midpoint_corruption_is_detected(self):
+        path = self.session / 'wide_info.csv'
+        data = validator.rows(path)
+        for row in data:
+            row['utc_sec'] = row['sensor_sec']
+            row['exposure_sec'] = '0.010'
+            row['exposure_source'] = 'frame_exif'
+            row['exposure_mid_sensor_sec'] = float(row['sensor_sec']) + .005
+            row['exposure_mid_utc_sec'] = float(row['utc_sec']) + .005
+        data[3]['exposure_mid_sensor_sec'] += .01
+        self.write_csv(path.name, list(data[0]), [[row[k] for k in data[0]] for row in data])
+        with self.assertRaisesRegex(ValueError, 'exposure midpoint'):
+            self.run_validator()
+
     def add_capture_clock_indices(self):
         # Audio's synchronization clock can acquire a new host correlation while
         # the original media timestamps remain unchanged.

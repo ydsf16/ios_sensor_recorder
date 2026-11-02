@@ -31,6 +31,15 @@ def validate(session, ffprobe, allow_source_gaps=False):
     for row in data:
         require(all(math.isfinite(float(row[k])) for k in ['tx_m', 'ty_m', 'tz_m', 'qw', 'qx', 'qy', 'qz']), 'Non-finite pose')
         require(abs(sum(float(row[k]) ** 2 for k in ['qw', 'qx', 'qy', 'qz']) - 1) < .001, 'Non-unit pose quaternion')
+        if 'exposure_mid_sensor_sec' in row:
+            duration = float(row['exposure_sec'])
+            midpoint = float(row['exposure_mid_sensor_sec'])
+            require(row['exposure_source'] == 'arkit_frame', 'Unexpected ARKit exposure source')
+            if math.isfinite(duration) and duration > 0:
+                require(abs(midpoint - (float(row['sensor_sec']) + duration / 2)) < .000002,
+                        'ARKit exposure midpoint does not match the frame')
+            else:
+                require(math.isnan(midpoint), 'ARKit midpoint was invented without exposure data')
     times = [float(r['sensor_sec']) for r in data]
     gaps = [b - a for a, b in zip(times, times[1:])]
     target = float(settings['target_frame_rate'])

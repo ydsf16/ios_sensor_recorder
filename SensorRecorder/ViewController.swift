@@ -24,6 +24,31 @@ private func SRText(_ key: String) -> String {
     return srLocalizationBundle.localizedString(forKey: key, value: key, table: nil)
 }
 
+private struct FrameExposureTiming {
+    let durationSec: Double
+    let source: String
+
+    static func standard(_ sampleBuffer: CMSampleBuffer, device: AVCaptureDevice?) -> FrameExposureTiming {
+        // Read the exposure attached to this frame without copying its image or
+        // the whole attachment dictionary. The device property is only a fallback.
+        if let exif = CMGetAttachment(sampleBuffer, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? NSDictionary,
+           let value = exif[kCGImagePropertyExifExposureTime as String] as? NSNumber {
+            let seconds = value.doubleValue
+            if seconds.isFinite && seconds > 0 { return FrameExposureTiming(durationSec: seconds, source: "frame_exif") }
+        }
+        if let device {
+            let seconds = CMTimeGetSeconds(device.exposureDuration)
+            if seconds.isFinite && seconds > 0 { return FrameExposureTiming(durationSec: seconds, source: "device_current") }
+        }
+        return FrameExposureTiming(durationSec: .nan, source: "unavailable")
+    }
+
+    func estimatedMidpoint(after captureSensorSec: Double) -> Double {
+        guard captureSensorSec.isFinite, durationSec.isFinite, durationSec > 0 else { return .nan }
+        return captureSensorSec + durationSec / 2
+    }
+}
+
 private var livePreviewAssociationKey: UInt8 = 0
 
 /// A bounded, latest-frame preview mailbox. Recording never uses this mailbox.
@@ -419,6 +444,7 @@ private final class CameraStreamRecorder {
         var packetLease: PacketLease? = nil
         let sensorSec: TimeInterval
         let exposureSec: Double
+        let exposureSource: String
         let iso: Float
         let sequence: Int64
     }
@@ -521,7 +547,7 @@ private final class CameraStreamRecorder {
             writerQueue.async { self.fail("Capture-to-writer queue overflow; SDK pending frames: \(pending.map(String.init) ?? "unknown")") }
             return
         }
-        let exposureSec = device.map { CMTimeGetSeconds($0.exposureDuration) } ?? .nan
+        let exposure = FrameExposureTiming.standard(sampleBuffer, device: device)
         let iso = device?.iso ?? .nan
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let duration = CMSampleBufferGetDuration(sampleBuffer)
@@ -543,14 +569,15 @@ private final class CameraStreamRecorder {
         encodingQueue.async {
             defer { self.inFlightFrames.signal() }
             self.appendOnWriterQueue(detached, pts: pts, duration: duration, intrinsics: intrinsics,
-                                     sensorSec: capturedSensorSec, exposureSec: exposureSec, iso: iso,
+                                     sensorSec: capturedSensorSec, exposureSec: exposure.durationSec,
+                                     exposureSource: exposure.source, iso: iso,
                                      recordSlot: recordSlot, sessionOrigin: sessionOrigin)
         }
     }
 
     private func appendOnWriterQueue(_ image: CVPixelBuffer, pts: CMTime, duration: CMTime,
                                      intrinsics: (fx: Float, fy: Float, cx: Float, cy: Float)?,
-                                     sensorSec: TimeInterval, exposureSec: Double, iso: Float,
+                                     sensorSec: TimeInterval, exposureSec: Double, exposureSource: String, iso: Float,
                                      recordSlot: Int64?, sessionOrigin: CMTime?) {
         guard !encoderFinishing else { return }
         guard infoHandle != nil else { fail("Cannot open the video index file"); return }
@@ -568,7 +595,7 @@ private final class CameraStreamRecorder {
         guard let realtimeEncoder else { return }
         let frame = PendingFrame(presentationTime: pts, width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image),
                                  intrinsics: intrinsics, sensorSec: sensorSec,
-                                 exposureSec: exposureSec, iso: iso, sequence: sequence)
+                                 exposureSec: exposureSec, exposureSource: exposureSource, iso: iso, sequence: sequence)
         writerQueue.async { self.encodingFrames += 1 }
         let encodeStart = DispatchTime.now().uptimeNanoseconds
         do {
@@ -940,11 +967,14 @@ private final class CameraStreamRecorder {
         writeCSVHeaderIfNeeded()
         let sensorSec = frame.sensorSec
         let utcSec = sensorSec + utcMinusSensorOffsetSec
+        let midpointSec = FrameExposureTiming(durationSec: frame.exposureSec, source: frame.exposureSource)
+            .estimatedMidpoint(after: sensorSec)
+        let midpointUTC = midpointSec.isFinite ? midpointSec + utcMinusSensorOffsetSec : .nan
         writeInfoLine(String(
-            format: "%d,%lld,%.6f,%.6f,%.9f,%.3f,%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f",
+            format: "%d,%lld,%.6f,%.6f,%.9f,%.3f,%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%@",
             frameIndex, frame.sequence, sensorSec, utcSec, frame.exposureSec, frame.iso, frame.width, frame.height,
             frame.intrinsics?.fx ?? .nan, frame.intrinsics?.fy ?? .nan, frame.intrinsics?.cx ?? .nan, frame.intrinsics?.cy ?? .nan,
-            CMTimeGetSeconds(frame.presentationTime)
+            CMTimeGetSeconds(frame.presentationTime), midpointSec, midpointUTC, frame.exposureSource
         ))
     }
 
@@ -992,7 +1022,8 @@ private final class CameraStreamRecorder {
         guard !didWriteCSVHeader else { return }
         didWriteCSVHeader = true
         writeInfoLine("# capture_pts_sec,original_session_synchronization_clock_before_host_clock_conversion")
-        writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,exposure_sec,iso,width_px,height_px,fx_px,fy_px,cx_px,cy_px,capture_pts_sec")
+        writeInfoLine("# exposure_mid_sensor_sec,estimated_capture_pts_plus_half_exposure; PTS exposure anchor is not calibrated")
+        writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,exposure_sec,iso,width_px,height_px,fx_px,fy_px,cx_px,cy_px,capture_pts_sec,exposure_mid_sensor_sec,exposure_mid_utc_sec,exposure_source")
     }
 }
 
@@ -1271,16 +1302,19 @@ private final class ARKitFrameRecorder {
         let cy = intrinsics.columns.2.y
 
         let exposureSec = camera.exposureDuration
+        let midpointSec = FrameExposureTiming(durationSec: exposureSec, source: "arkit_frame")
+            .estimatedMidpoint(after: sensorSec)
+        let midpointUTC = midpointSec.isFinite ? midpointSec + utcMinusSensorOffsetSec : .nan
         let trackingLabel = trackingStateLabel(camera.trackingState)
 
         writeInfoLine(String(
-            format: "%d,%lld,%.6f,%.6f,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%@,%.9f,%.9f,%.9f,%.9f,%d,%d",
+            format: "%d,%lld,%.6f,%.6f,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%@,%.9f,%.9f,%.9f,%.9f,%d,%d,%.9f,%.9f,%@",
             frameIndex, recordSlot, sensorSec, utcSec,
             tx, ty, tz, qw, qx, qy, qz,
             Float(exposureSec),
             trackingLabel,
             fx, fy, cx, cy,
-            width, height
+            width, height, midpointSec, midpointUTC, "arkit_frame"
         ))
     }
 
@@ -1293,7 +1327,8 @@ private final class ARKitFrameRecorder {
     private func writeCSVHeaderIfNeeded() {
         guard !didWriteCSVHeader else { return }
         didWriteCSVHeader = true
-        writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,tx_m,ty_m,tz_m,qw,qx,qy,qz,exposure_sec,tracking_state,fx_px,fy_px,cx_px,cy_px,width_px,height_px")
+        writeInfoLine("# exposure_mid_sensor_sec,estimated_frame_timestamp_plus_half_exposure; ARFrame timestamp exposure anchor is not calibrated")
+        writeInfoLine("frame_index,record_slot,sensor_sec,utc_sec,tx_m,ty_m,tz_m,qw,qx,qy,qz,exposure_sec,tracking_state,fx_px,fy_px,cx_px,cy_px,width_px,height_px,exposure_mid_sensor_sec,exposure_mid_utc_sec,exposure_source")
     }
 
     private func trackingStateLabel(_ state: ARCamera.TrackingState) -> String {
@@ -9008,9 +9043,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "time_model": [
                 "sensor_sec": "monotonic host clock seconds; same time base used by AVFoundation capture timestamps after conversion, CoreMotion timestamps, and derived geo_location timestamps",
                 "capture_pts_sec": "Standard video original session synchronization-clock PTS, before host conversion; MP4 preserves this cadence relative to its common capture origin. sensor_sec is converted once on admission, since audio clock correlation can change.",
+                "exposure_mid_sensor_sec": "Estimated image exposure midpoint on the host clock: sensor_sec plus half the per-frame exposure duration, or half the current device exposure when per-frame metadata is unavailable. The capture PTS exposure anchor is not calibrated; preserve sensor_sec for source timing and use this estimate for VIO only with that limitation.",
+                "exposure_source": "frame_exif, device_current, arkit_frame, or unavailable",
                 "utc_sec": "Unix UTC seconds",
                 "utc_minus_sensor_offset_sec": utcMinusSensorOffsetSec,
-                "alignment": "Use sensor_sec for sensor fusion. Use utc_sec for wall-clock/GNSS-style correlation."
+                "alignment": "Use sensor_sec for original capture timing; exposure_mid_sensor_sec is the estimated image time for VIO. Use utc_sec for wall-clock/GNSS-style correlation."
             ],
             "streams": [
                 "wide_camera": [
@@ -9049,10 +9086,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         ? maxExposureDurationSeconds(for: recorderSettings.arkitCamera)
                         : maxExposureDurationSeconds(for: recorderSettings.wide),
                     "timestamp_column": "sensor_sec",
+                    "image_midpoint_column": "exposure_mid_sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": recorderSettings.captureMode == .arkit
-                        ? ["frame_index", "record_slot", "sensor_sec", "utc_sec", "tx_m", "ty_m", "tz_m", "qw", "qx", "qy", "qz", "exposure_sec", "tracking_state", "fx_px", "fy_px", "cx_px", "cy_px", "width_px", "height_px"]
-                        : ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                        ? ["frame_index", "record_slot", "sensor_sec", "utc_sec", "tx_m", "ty_m", "tz_m", "qw", "qx", "qy", "qz", "exposure_sec", "tracking_state", "fx_px", "fy_px", "cx_px", "cy_px", "width_px", "height_px", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
+                        : ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "ultrawide_camera": [
                     "enabled": recorderSettings.ultraWide.enabled && recorderSettings.captureMode == .standard,
@@ -9070,8 +9108,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     ),
                     "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.ultraWide),
                     "timestamp_column": "sensor_sec",
+                    "image_midpoint_column": "exposure_mid_sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "telephoto_camera": [
                     "enabled": recorderSettings.telephoto.enabled && recorderSettings.captureMode == .standard,
@@ -9089,8 +9128,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     ),
                     "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.telephoto),
                     "timestamp_column": "sensor_sec",
+                    "image_midpoint_column": "exposure_mid_sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "front_camera": [
                     "enabled": recorderSettings.front.enabled && recorderSettings.captureMode == .standard,
@@ -9108,8 +9148,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     ),
                     "max_exposure_duration_sec": maxExposureDurationSeconds(for: recorderSettings.front),
                     "timestamp_column": "sensor_sec",
+                    "image_midpoint_column": "exposure_mid_sensor_sec",
                     "utc_column": "utc_sec",
-                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"]
+                    "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "arkit_pose": [
                     "enabled": recorderSettings.captureMode == .arkit,
@@ -9133,6 +9174,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "pixel_orientation": "ARKit native landscape pixels; device locked to Landscape Right",
                     "source": "ARKit ARWorldTrackingConfiguration with builtInWideAngleCamera",
                     "timestamp_column": "sensor_sec",
+                    "image_midpoint_column": "exposure_mid_sensor_sec",
                     "utc_column": "utc_sec",
                     "schema": [
                         "frame_index",
@@ -9153,7 +9195,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         "cx_px",
                         "cy_px",
                         "width_px",
-                        "height_px"
+                        "height_px",
+                        "exposure_mid_sensor_sec",
+                        "exposure_mid_utc_sec",
+                        "exposure_source"
                     ]
                 ],
                 "audio": [
