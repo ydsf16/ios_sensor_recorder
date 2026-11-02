@@ -3198,6 +3198,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             default: base.front.autoExposure = true; base.front.maxExposureDurationMS = "10"; base.front.autoFocus = true
             }
         }
+        if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "--matrix-max-exposure-ms"),
+           ProcessInfo.processInfo.arguments.indices.contains(index + 1),
+           ["1", "5", "10", "20", "30"].contains(ProcessInfo.processInfo.arguments[index + 1]) {
+            let value = ProcessInfo.processInfo.arguments[index + 1]
+            base.wide.maxExposureDurationMS = value
+            base.ultraWide.maxExposureDurationMS = value
+            base.telephoto.maxExposureDurationMS = value
+            base.front.maxExposureDurationMS = value
+        }
         let arkitOnly = ProcessInfo.processInfo.arguments.contains("--matrix-arkit-only")
         if arkitOnly {
             base.captureMode = .arkit

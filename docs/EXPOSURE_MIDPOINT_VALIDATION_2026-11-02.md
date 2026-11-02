@@ -23,3 +23,7 @@ Debug and Release iPhoneOS builds succeeded, and all 23 Python tests passed. Aft
 | ARKit 1920×1440 at 30 fps | 161, all `arkit_frame` | PASS; 161 decoded frames, zero missing target slots |
 
 All new midpoint timestamps increased monotonically. The validators checked `exposure_mid_sensor_sec = sensor_sec + exposure_sec / 2` for each recorded row and checked that the MP4 timelines still matched the original frame timestamps. The recording directories were copied to `/tmp/SRP-exposure-center-device-wide30`, `/tmp/SRP-exposure-center-device-dual30`, and `/tmp/SRP-exposure-center-device-arkit30` on the test Mac.
+
+## Exact 5 ms exposure check
+
+The iPhone 12's DEBUG matrix recorder was run again with `--matrix-max-exposure-ms 5`, selecting Wide 1280×720 at 30 fps for a six-second recording. It produced 186 frames. Every frame reported per-frame EXIF `exposure_sec = 0.005000000`, and every `exposure_mid_sensor_sec` was 2.5 ms later than its original `sensor_sec` within CSV rounding (observed differences: 2.4995–2.5005 ms). The original `sensor_sec` is printed to six decimal places, so subtracting the printed columns can vary by 0.5 µs. The movie and index validator passed: 186 decoded HEVC frames, measured 30.002 fps, no missing frames, and maximum movie PTS disagreement 0.5 µs. The validation result reported no recording error. The copied files are under `/private/tmp/SRP-5ms-validation` on the test Mac.
