@@ -2577,14 +2577,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         private static let storageKey = "sensor_recorder.settings.v1"
         private static let configFileName = "sensor_recorder_settings.json"
 
-        static func load() -> RecorderSettings {
+        static func load() -> RecorderSettings? {
             if let data = try? Data(contentsOf: configFileURL),
                let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) {
                 return migratedSettingsIfNeeded(settings)
             }
             guard let data = UserDefaults.standard.data(forKey: storageKey),
                   let settings = try? JSONDecoder().decode(RecorderSettings.self, from: data) else {
-                return defaults
+                return nil
             }
             return migratedSettingsIfNeeded(settings)
         }
@@ -2679,7 +2679,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private weak var settingsValidationLabel: UILabel?
     private weak var settingsPurchaseStatusLabel: UILabel?
     private weak var settingsRetryButton: UIButton?
-    private var recorderSettings = RecorderSettings.load()
+    private var recorderSettings = RecorderSettings.defaults
     private var settingsMenuButtons: [String: UIButton] = [:]
     private var settingsSwitches: [String: UISwitch] = [:]
     private var settingsSliders: [String: UISlider] = [:]
@@ -3092,11 +3092,36 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return sanitized
     }
 
+    private func initialRecorderSettings() -> RecorderSettings {
+        var settings = RecorderSettings.defaults
+        settings.ultraWide.enabled = false
+        settings.lidarDepthEnabled = false
+        settings.wide.autoFocus = true
+
+        let resolutions = commonResolutionChoices(settings)
+        let preferred = "960x540"
+        let ordered = resolutions.contains(preferred)
+            ? [preferred] + resolutions.filter { $0 != preferred }
+            : resolutions
+        var fallback: RecorderSettings?
+        for resolution in ordered {
+            let sized = replacingCaptureValue(settings, key: "shared.resolution", value: resolution)
+            let rates = commonRateChoices(sized)
+            if rates.contains("30") {
+                return replacingCaptureValue(sized, key: "shared.frameRate", value: "30")
+            }
+            if fallback == nil, let rate = rates.last {
+                fallback = replacingCaptureValue(sized, key: "shared.frameRate", value: rate)
+            }
+        }
+        return fallback ?? settings
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
         PurchaseManager.shared.start()
-        recorderSettings = RecorderSettings.load()
+        recorderSettings = RecorderSettings.load() ?? initialRecorderSettings()
         sanitizeRecorderSettingsForCurrentDevice()
         view.backgroundColor = .systemGroupedBackground
         updateDiskCapacity()
