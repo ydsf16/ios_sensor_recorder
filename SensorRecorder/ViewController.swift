@@ -12,6 +12,7 @@ import simd
 import UniformTypeIdentifiers
 import ARKit
 import VideoToolbox
+import MetalKit
 
 private let srLocalizationBundle: Bundle = {
     let language = Locale.preferredLanguages.first?.lowercased().hasPrefix("zh") == true ? "zh-Hans" : "en"
@@ -795,6 +796,7 @@ private final class CameraStreamRecorder {
         writeInfoLine("# video_media_time_scale,\(Self.videoMediaTimeScale),units_per_second")
         writeInfoLine("# movie_media_time_scale,\(Self.videoMediaTimeScale),units_per_second")
         writeInfoLine("# exposure,mode,\(exposureModeLabel(device.exposureMode)),active_max_duration_sec,\(String(format: "%.9f", CMTimeGetSeconds(device.activeMaxExposureDuration)))")
+        writeInfoLine("# exposure,actual_duration_sec,\(String(format: "%.9f", CMTimeGetSeconds(device.exposureDuration))),actual_iso,\(String(format: "%.3f", device.iso))")
         writeInfoLine("# focus,mode,\(focusModeLabel(device.focusMode)),lens_position,\(String(format: "%.6f", device.lensPosition))")
         writeInfoLine("# control_state_source,\(device.deviceType.rawValue),current_controller_state_not_per_frame_EXIF")
         let gains = device.deviceWhiteBalanceGains
@@ -1418,11 +1420,16 @@ private final class LiDARDepthStreamRecorder {
     }
 
     func append(depthData: AVDepthData, sensorSec: TimeInterval) {
-        let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-        guard let pixelBuffer = ownedDepth(converted.depthDataMap) else { return }
-        let calibration = converted.cameraCalibrationData
-        channel.enqueue(bytes: CVPixelBufferGetDataSize(pixelBuffer)) {
-            self.appendFloat32DepthMap(pixelBuffer, calibration: calibration, sensorSec: sensorSec)
+        // AVDepthData retains its map. Keep it alive until this channel converts
+        // and writes it, so the shared capture callback never allocates or
+        // copies a full depth frame before returning to the other sensors.
+        let bytes = CVPixelBufferGetDataSize(depthData.depthDataMap)
+        channel.enqueue(bytes: bytes) {
+            let converted = depthData.depthDataType == kCVPixelFormatType_DepthFloat32
+                ? depthData : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+            self.appendFloat32DepthMap(converted.depthDataMap,
+                                       calibration: converted.cameraCalibrationData,
+                                       sensorSec: sensorSec)
         }
     }
 
@@ -2401,6 +2408,121 @@ private final class GeoLocationStreamRecorder {
     }
 }
 
+private final class DepthPreviewDiagnostics {
+    private let lock = NSLock()
+    private var submitted = 0
+    private var skipped = 0
+    private var rendered = 0
+    private var displayed = 0
+    private var totalRenderMS = 0.0
+    private var maxRenderMS = 0.0
+    private var firstDisplaySec: TimeInterval?
+    private var latestDisplaySec: TimeInterval?
+
+    func noteSubmitted() { lock.lock(); submitted += 1; lock.unlock() }
+    func noteSkipped() { lock.lock(); skipped += 1; lock.unlock() }
+    func noteRendered(milliseconds: Double, displayedAt: TimeInterval?) {
+        lock.lock()
+        rendered += 1
+        totalRenderMS += milliseconds
+        maxRenderMS = max(maxRenderMS, milliseconds)
+        if let displayedAt {
+            displayed += 1
+            if firstDisplaySec == nil { firstDisplaySec = displayedAt }
+            latestDisplaySec = displayedAt
+        }
+        lock.unlock()
+    }
+    func snapshot(reset: Bool) -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        let span = (latestDisplaySec ?? 0) - (firstDisplaySec ?? 0)
+        let result: [String: Any] = [
+            "submitted": submitted, "skipped_busy": skipped, "rendered": rendered,
+            "displayed": displayed, "display_fps": span > 0 ? Double(max(displayed - 1, 0)) / span : 0,
+            "mean_render_ms": rendered > 0 ? totalRenderMS / Double(rendered) : 0,
+            "max_render_ms": maxRenderMS
+        ]
+        if reset {
+            submitted = 0; skipped = 0; rendered = 0; displayed = 0
+            totalRenderMS = 0; maxRenderMS = 0
+            firstDisplaySec = nil; latestDisplaySec = nil
+        }
+        return result
+    }
+}
+
+private final class DepthMetalPreviewView: MTKView, MTKViewDelegate {
+    private var context: CIContext?
+    private var commandQueue: MTLCommandQueue?
+    private var pendingImage: CIImage?
+    private var pendingCompletion: ((Double, Bool) -> Void)?
+
+    override init(frame: CGRect, device: MTLDevice?) {
+        super.init(frame: frame, device: device)
+        configureRenderer()
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+        configureRenderer()
+    }
+
+    private func configureRenderer() {
+        guard let gpu = device ?? MTLCreateSystemDefaultDevice() else { return }
+        device = gpu
+        context = CIContext(mtlDevice: gpu, options: [.cacheIntermediates: false])
+        commandQueue = gpu.makeCommandQueue()
+        colorPixelFormat = .bgra8Unorm
+        framebufferOnly = false
+        // Render only at the sensor's preview resolution. Core Animation scales
+        // the drawable to the tile; a full-screen drawable wastes GPU bandwidth.
+        autoResizeDrawable = false
+        drawableSize = CGSize(width: 320, height: 240)
+        isPaused = true
+        enableSetNeedsDisplay = false
+        clearColor = MTLClearColorMake(0, 0, 0, 1)
+        isOpaque = true
+        isUserInteractionEnabled = false
+        delegate = self
+    }
+
+    func display(_ image: CIImage, completion: @escaping (Double, Bool) -> Void) {
+        pendingImage = image
+        pendingCompletion = completion
+        draw()
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        guard let image = pendingImage, let completion = pendingCompletion else { return }
+        pendingImage = nil
+        pendingCompletion = nil
+        let start = CACurrentMediaTime()
+        guard let context, let drawable = currentDrawable,
+              let commandBuffer = commandQueue?.makeCommandBuffer() else {
+            completion((CACurrentMediaTime() - start) * 1000, false)
+            return
+        }
+        let bounds = CGRect(x: 0, y: 0, width: drawable.texture.width, height: drawable.texture.height)
+        let scale = min(bounds.width / image.extent.width, bounds.height / image.extent.height)
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let centered = scaled.transformed(by: CGAffineTransform(
+            translationX: (bounds.width - scaled.extent.width) / 2 - scaled.extent.minX,
+            y: (bounds.height - scaled.extent.height) / 2 - scaled.extent.minY))
+        let composed = centered.composited(over: CIImage(color: .black).cropped(to: bounds))
+        context.render(composed, to: drawable.texture, commandBuffer: commandBuffer,
+                       bounds: bounds, colorSpace: CGColorSpaceCreateDeviceRGB())
+        commandBuffer.present(drawable)
+        commandBuffer.addCompletedHandler { _ in
+            let elapsed = (CACurrentMediaTime() - start) * 1000
+            DispatchQueue.main.async { completion(elapsed, true) }
+        }
+        commandBuffer.commit()
+    }
+}
+
 class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDataOutputSynchronizerDelegate, AVCaptureDepthDataOutputDelegate, CLLocationManagerDelegate, ARSessionDelegate {
     private typealias RecordingCamera = PhysicalCamera
 
@@ -2412,7 +2534,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private enum CaptureMode: String, Codable {
         case standard
+        case standardFree
         case arkit
+        var usesStandardCapture: Bool { self != .arkit }
     }
 
     private struct CameraCaptureSettings: Codable, Equatable {
@@ -2421,7 +2545,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var frameRate: String
         var autoFocus: Bool
         var autoExposure: Bool? = true
-        var maxExposureDurationMS: String? = "10"
+        var maxExposureDurationMS: String? = "5"
+        var fixedExposureDurationMS: Double? = 5
+        var fixedISO: Float? = 100
         var fixedFocusLensPosition: Double?
     }
 
@@ -2434,7 +2560,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let supportsMultiCam: Bool
     }
 
-    private struct RecorderSettings: Codable {
+    private struct RecorderSettings: Codable, Equatable {
         var settingsVersion: Int
         var captureMode: CaptureMode
         var wide: CameraCaptureSettings
@@ -2526,7 +2652,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 frameRate: "30",
                 autoFocus: false,
                 autoExposure: true,
-                maxExposureDurationMS: "10",
+                maxExposureDurationMS: "5",
                 fixedFocusLensPosition: 0.6
             ),
             ultraWide: CameraCaptureSettings(
@@ -2535,7 +2661,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 frameRate: "30",
                 autoFocus: false,
                 autoExposure: true,
-                maxExposureDurationMS: "10",
+                maxExposureDurationMS: "5",
                 fixedFocusLensPosition: 0.8
             ),
             telephoto: CameraCaptureSettings(
@@ -2544,7 +2670,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 frameRate: "30",
                 autoFocus: false,
                 autoExposure: true,
-                maxExposureDurationMS: "10",
+                maxExposureDurationMS: "5",
                 fixedFocusLensPosition: 0.6
             ),
             front: CameraCaptureSettings(
@@ -2553,7 +2679,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 frameRate: "30",
                 autoFocus: true,
                 autoExposure: true,
-                maxExposureDurationMS: "10",
+                maxExposureDurationMS: "5",
                 fixedFocusLensPosition: 0.6
             ),
             arkitCamera: CameraCaptureSettings(
@@ -2678,7 +2804,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private weak var settingsSaveButton: UIButton?
     private weak var settingsValidationLabel: UILabel?
     private weak var settingsPurchaseStatusLabel: UILabel?
-    private weak var settingsRetryButton: UIButton?
     private var recorderSettings = RecorderSettings.defaults
     private var settingsMenuButtons: [String: UIButton] = [:]
     private var settingsSwitches: [String: UISwitch] = [:]
@@ -2748,7 +2873,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var ultraWideCameraPreviewView: CameraPreviewView?
     private var telephotoCameraPreviewView: CameraPreviewView?
     private var frontCameraPreviewView: CameraPreviewView?
-    private var depthPreviewView: UIImageView?
+    private var depthPreviewView: DepthMetalPreviewView?
     private var singleVideoOutput: AVCaptureVideoDataOutput?
     private var singleFrameCount = 0
     private var diagnosticLayer: CALayer?
@@ -2804,6 +2929,27 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var lidarDepthFrameCount = 0
     private var firstDepthSensorSec: TimeInterval?
     private var latestDepthSensorSec: TimeInterval?
+    private var latestDepthResolution: String?
+    private var depthPreviewPresentedCount = 0
+    private var firstDepthPreviewSec: TimeInterval?
+    private var latestDepthPreviewSec: TimeInterval?
+    private var lastDepthPreviewSubmissionSec: TimeInterval = 0
+    private lazy var depthPreviewMaximumFPS: Double = {
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "--matrix-depth-preview-fps"),
+           arguments.indices.contains(index + 1), let value = Double(arguments[index + 1]), value.isFinite {
+            return max(0, min(value, 30))
+        }
+        return 30
+    }()
+    private let depthPreviewQueue = DispatchQueue(label: "com.sensorrecorder.depth.preview", qos: .userInitiated)
+    private let depthCaptureQueue = DispatchQueue(label: "com.sensorrecorder.depth.capture", qos: .userInitiated)
+    private let depthPreviewInFlight = DispatchSemaphore(value: 1)
+    private let depthPreviewDiagnostics = DepthPreviewDiagnostics()
+    // Only depthCaptureQueue reads this pointer. The capture queue installs or
+    // clears it synchronously so finish never races an in-flight depth append.
+    private var activeDepthRecorder: LiDARDepthStreamRecorder?
+    private var depthDropReasons: [String: Int] = [:] // depthCaptureQueue only
     private var widePreviewLayer: AVCaptureVideoPreviewLayer?
     private var ultraWidePreviewLayer: AVCaptureVideoPreviewLayer?
     private var telephotoPreviewLayer: AVCaptureVideoPreviewLayer?
@@ -2817,7 +2963,40 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var settingsMenuHasCandidates: [String: Bool] = [:]
     // Access only from sessionQueue. SDK format support and graph budgets are
     // stable for this device; the retry action invalidates these exact probes.
-    private var settingsProbeResults: [Data: Bool] = [:]
+    private var settingsProbeResults: [String: Bool] = [:]
+    private var settingsEncoderProbeResults: [String: Bool] = [:]
+    private var settingsCombinationResults: [String: [(String, RecorderSettings)]] = [:]
+    private struct SavedCapabilityProbes: Codable {
+        let signature: String
+        let results: [String: Bool]
+        let combinations: [String: [SavedCombination]]
+    }
+    private struct SavedCombination: Codable {
+        let name: String
+        let settings: RecorderSettings
+    }
+    private var capabilityProbeCacheURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("camera-capability-probes.json")
+    }
+    private var capabilityProbeSignature: String {
+        let version = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+        return "6:\(modelIdentifier()):\(UIDevice.current.systemVersion):\(version)"
+    }
+    private func loadCapabilityProbes() {
+        guard let data = try? Data(contentsOf: capabilityProbeCacheURL),
+              let saved = try? JSONDecoder().decode(SavedCapabilityProbes.self, from: data),
+              saved.signature == capabilityProbeSignature else { return }
+        settingsProbeResults = saved.results
+        settingsCombinationResults = saved.combinations.mapValues { $0.map { ($0.name, $0.settings) } }
+    }
+    private func saveCapabilityProbes() {
+        let saved = SavedCapabilityProbes(signature: capabilityProbeSignature,
+            results: settingsProbeResults,
+            combinations: settingsCombinationResults.mapValues { $0.map { SavedCombination(name: $0.0, settings: $0.1) } })
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        try? data.write(to: capabilityProbeCacheURL, options: .atomic)
+    }
     private var isRecording = false
     // Main-thread UI state: keep configuration frozen until preparation or
     // every writer's finalization has finished, not merely until Stop is tapped.
@@ -2829,13 +3008,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
     private var recordingGridOriginSec: TimeInterval?
     private var pendingLocationPermissionCompletion: ((Bool) -> Void)?
-    private let defaultCameraAutoExposureMaxDurationMS = "10"
+    private let defaultCameraAutoExposureMaxDurationMS = "5"
     private let defaultWideFixedFocusLensPosition = 0.6
     private let defaultUltraWideFixedFocusLensPosition = 0.8
     private let defaultTelephotoFixedFocusLensPosition = 0.6
     private let defaultFrontFixedFocusLensPosition = 0.6
     private let defaultARKitFixedFocusLensPosition = 0.6
-    private let depthEnabledCameraFrameRateLimit = 10.0
     private let freeRecordingLimitSeconds: TimeInterval = 120
     private let freeCountdownVisibleThresholdSeconds: TimeInterval = 20
     private let embedAudioInCameraMP4 = false
@@ -2935,7 +3113,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Standard settings are a requested configuration. An unavailable camera
         // or combination must be reported, including after relaunch, rather than
         // silently rewriting the saved request.
-        if updated.captureMode == .standard {
+        if updated.captureMode.usesStandardCapture {
             recorderSettings = updated
             return
         }
@@ -3029,8 +3207,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func isCameraSetSupportedByMultiCam(settings: RecorderSettings) -> Bool {
-        if settings.captureMode == .standard && enabledCameraCount(in: settings) > 1 {
-            return !settings.lidarDepthEnabled && MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(settings)) != nil
+        if settings.captureMode.usesStandardCapture && enabledCameraCount(in: settings) > 1 {
+            return MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(settings),
+                                                      depthEnabled: settings.lidarDepthEnabled,
+                                                      freeRunning: settings.captureMode == .standardFree) != nil
         }
         let wantedDevices = activeCameraDevices(for: settings)
         guard wantedDevices.count > 1 else { return true }
@@ -3089,17 +3269,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             sanitized.fixedFocusLensPosition,
             fallback: defaultLensPosition
         )
+        if !(sanitized.fixedExposureDurationMS ?? .nan).isFinite || (sanitized.fixedExposureDurationMS ?? 0) <= 0 {
+            sanitized.fixedExposureDurationMS = 5
+        }
+        if !(sanitized.fixedISO ?? .nan).isFinite || (sanitized.fixedISO ?? 0) <= 0 {
+            sanitized.fixedISO = 100
+        }
         return sanitized
     }
 
     private func initialRecorderSettings() -> RecorderSettings {
         var settings = RecorderSettings.defaults
-        settings.ultraWide.enabled = false
-        settings.lidarDepthEnabled = false
+        let capabilities = cameraCapabilities()
+        settings.lidarDepthEnabled = capabilities.hasLiDAR
+        settings.ultraWide.enabled = capabilities.hasUltraWide && AVCaptureMultiCamSession.isMultiCamSupported
+        if settings.ultraWide.enabled && settings.lidarDepthEnabled {
+            settings.captureMode = .standardFree
+        }
+        if settings.ultraWide.enabled && !isCameraSetSupportedByMultiCam(settings: settings) {
+            settings.ultraWide.enabled = false
+            settings.captureMode = .standard
+        }
         settings.wide.autoFocus = true
 
         let resolutions = commonResolutionChoices(settings)
-        let preferred = "960x540"
+        let preferred = "1280x720"
         let ordered = resolutions.contains(preferred)
             ? [preferred] + resolutions.filter { $0 != preferred }
             : resolutions
@@ -3121,6 +3315,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         super.viewDidLoad()
 
         PurchaseManager.shared.start()
+        loadCapabilityProbes()
         recorderSettings = RecorderSettings.load() ?? initialRecorderSettings()
         sanitizeRecorderSettingsForCurrentDevice()
         view.backgroundColor = .systemGroupedBackground
@@ -3198,8 +3393,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         view.addSubview(label)
         matrixStatus = label
         var base = recorderSettings
-        base.captureMode = .standard
-        base.lidarDepthEnabled = false
+        base.captureMode = ProcessInfo.processInfo.arguments.contains("--matrix-free") ? .standardFree : .standard
+        base.lidarDepthEnabled = ProcessInfo.processInfo.arguments.contains("--matrix-lidar")
         base.audioEnabled = true
         base.imuEnabled = true
         base.deviceMotionEnabled = true
@@ -3231,6 +3426,32 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             base.ultraWide.maxExposureDurationMS = value
             base.telephoto.maxExposureDurationMS = value
             base.front.maxExposureDurationMS = value
+        }
+        let args = ProcessInfo.processInfo.arguments
+        func argument(_ flag: String) -> String? {
+            guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else { return nil }
+            return args[index + 1]
+        }
+        if let milliseconds = argument("--matrix-fixed-exposure-ms").flatMap(Double.init),
+           let iso = argument("--matrix-fixed-iso").flatMap(Float.init) {
+            base.wide.autoExposure = false; base.wide.fixedExposureDurationMS = milliseconds; base.wide.fixedISO = iso
+            base.ultraWide.autoExposure = false; base.ultraWide.fixedExposureDurationMS = milliseconds; base.ultraWide.fixedISO = iso
+            base.telephoto.autoExposure = false; base.telephoto.fixedExposureDurationMS = milliseconds; base.telephoto.fixedISO = iso
+            base.front.autoExposure = false; base.front.fixedExposureDurationMS = milliseconds; base.front.fixedISO = iso
+        }
+        if args.contains("--matrix-manual-focus") {
+            base.wide.autoFocus = false; base.ultraWide.autoFocus = false
+            base.telephoto.autoFocus = false; base.front.autoFocus = false
+            for (flag, key) in [("--matrix-focus-wide", "wide"), ("--matrix-focus-ultra", "ultra"),
+                                ("--matrix-focus-telephoto", "telephoto"), ("--matrix-focus-front", "front")] {
+                guard let position = argument(flag).flatMap(Double.init), (0...1).contains(position) else { continue }
+                switch key {
+                case "wide": base.wide.fixedFocusLensPosition = position
+                case "ultra": base.ultraWide.fixedFocusLensPosition = position
+                case "telephoto": base.telephoto.fixedFocusLensPosition = position
+                default: base.front.fixedFocusLensPosition = position
+                }
+            }
         }
         let arkitOnly = ProcessInfo.processInfo.arguments.contains("--matrix-arkit-only")
         if arkitOnly {
@@ -3267,10 +3488,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.sessionQueue.async {
                 let profiles: [RecorderSettings] = self.withRestoredCaptureDevices {
                     var profiles: [RecorderSettings] = []
-                    for (_, candidate) in self.combinationCandidates(base) {
-                        for resolution in self.commonResolutionChoices(candidate).reversed() {
+                    let candidates = self.combinationCandidates(base)
+                    print("MATRIX_CANDIDATES \(candidates.map(\.0).joined(separator: "|"))")
+                    for (name, candidate) in candidates
+                        where argument("--matrix-combination").map({ $0 == name }) ?? true {
+                        #if DEBUG
+                        if let requestedResolution = argument("--matrix-resolution") {
+                            let rates = self.commonRateChoices(self.replacingCaptureValue(candidate, key: "shared.resolution", value: requestedResolution))
+                            print("MATRIX_CHOICES \(name) resolutions=\(self.commonResolutionChoices(candidate).joined(separator: "|")) \(requestedResolution) rates=\(rates.joined(separator: "|"))")
+                        }
+                        #endif
+                        for resolution in self.commonResolutionChoices(candidate).reversed()
+                            where argument("--matrix-resolution").map({ $0 == resolution }) ?? true {
                             let sized = self.replacingCaptureValue(candidate, key: "shared.resolution", value: resolution)
-                            for rate in self.commonRateChoices(sized) {
+                            for rate in self.commonRateChoices(sized)
+                                where argument("--matrix-rate").map({ $0 == rate }) ?? true {
                                 let profile = self.replacingCaptureValue(sized, key: "shared.frameRate", value: rate)
                                 if self.jointConfigurationFits(profile) { profiles.append(profile) }
                             }
@@ -3388,6 +3620,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let data = try JSONSerialization.data(withJSONObject: ["run_id": matrixRunID, "total_profiles": matrixProfiles.count,
                                                                  "results": matrixResults], options: [.prettyPrinted, .sortedKeys])
             try data.write(to: getRecDir().appendingPathComponent("capture-validation-\(matrixRunID).json"), options: .atomic)
+            try data.write(to: getRecDir().appendingPathComponent("capture-validation-latest.json"), options: .atomic)
         } catch {
             matrixStatus?.text = error.localizedDescription; matrixStatus?.accessibilityValue = "failed"; return
         }
@@ -3415,7 +3648,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         requestCameraAccess { granted in
             guard granted else { status.accessibilityValue = "permission_denied"; return }
             self.sessionQueue.async {
-                let types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera, .builtInDualCamera, .builtInDualWideCamera, .builtInTripleCamera]
+                let types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera, .builtInDualCamera, .builtInDualWideCamera, .builtInTripleCamera, .builtInLiDARDepthCamera]
                 let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
                 let devices = discovery.devices
                 let entries: [[String: Any]] = devices.map { device in
@@ -3426,6 +3659,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         "autofocus": device.isFocusModeSupported(.continuousAutoFocus),
                         "formats": device.formats.map { format -> [String: Any] in
                             ["resolution": self.formatResolution(format), "multicam": format.isMultiCamSupported,
+                             "depth_count": self.depthFormats(format).count,
                              "binned": format.isVideoBinned,
                              "rates": format.videoSupportedFrameRateRanges.map { [$0.minFrameRate, $0.maxFrameRate] }]
                         }]
@@ -3446,9 +3680,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                                             return "\(size.width)x\(size.height)"
                                         }]
                             }
+                            entry["depth_ports"] = input.ports.filter { $0.mediaType == .depthData }.count
                             if added { graph.removeInput(input) }
                             graph.commitConfiguration()
                         } catch { entry["input_error"] = error.localizedDescription }
+                    }
+                    if device.deviceType == .builtInLiDARDepthCamera {
+                        entry["depth_formats"] = device.formats.map { format in
+                            ["resolution": self.formatResolution(format),
+                             "multicam": format.isMultiCamSupported,
+                             "depth_count": self.depthFormats(format).count,
+                             "rates": format.videoSupportedFrameRateRanges.map { [$0.minFrameRate, $0.maxFrameRate] }] as [String: Any]
+                        }
                     }
                     return entry
                 }
@@ -4175,6 +4418,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         self?.firstDepthSensorSec = sensorSec
                     }
                     self?.latestDepthSensorSec = sensorSec
+                    self?.latestDepthResolution = "\(CVPixelBufferGetWidth(depthMap))x\(CVPixelBufferGetHeight(depthMap))"
                 }
             }
         } else { enqueueARKitPreview(frame.capturedImage, pts: pts) }
@@ -4444,16 +4688,53 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             firstDepthSensorSec = sensorSec
         }
         latestDepthSensorSec = sensorSec
-        if isRecording {
-            lidarDepthRecorder?.append(depthData: depthData, sensorSec: sensorSec)
-        }
-        if let image = depthPreviewImage(from: depthData) {
-            DispatchQueue.main.async {
-                self.depthPreviewView?.image = image
+        let depthMap = depthData.depthDataMap
+        latestDepthResolution = "\(CVPixelBufferGetWidth(depthMap))x\(CVPixelBufferGetHeight(depthMap))"
+        activeDepthRecorder?.append(depthData: depthData, sensorSec: sensorSec)
+        // Preview is best effort: it may skip a frame, but never stalls the
+        // depth callback or the independent disk writer.
+        let previewTime = CACurrentMediaTime()
+        if depthPreviewMaximumFPS > 0,
+           previewTime - lastDepthPreviewSubmissionSec >= 1 / depthPreviewMaximumFPS,
+           depthPreviewInFlight.wait(timeout: .now()) == .success {
+            lastDepthPreviewSubmissionSec = previewTime
+            depthPreviewDiagnostics.noteSubmitted()
+            depthPreviewQueue.async {
+                let renderStart = CACurrentMediaTime()
+                let image = self.depthPreviewImage(from: depthData)
+                let preparationMS = (CACurrentMediaTime() - renderStart) * 1000
+                DispatchQueue.main.async {
+                    guard output === self.lidarDepthOutput, let image, let view = self.depthPreviewView else {
+                        self.depthPreviewDiagnostics.noteRendered(milliseconds: preparationMS, displayedAt: nil)
+                        self.depthPreviewInFlight.signal()
+                        return
+                    }
+                    view.display(image) { gpuMS, displayed in
+                        let displayedAt = displayed ? CACurrentMediaTime() : nil
+                        self.depthPreviewDiagnostics.noteRendered(milliseconds: preparationMS + gpuMS,
+                                                                  displayedAt: displayedAt)
+                        if let displayedAt {
+                            self.depthPreviewPresentedCount += 1
+                            if self.firstDepthPreviewSec == nil { self.firstDepthPreviewSec = displayedAt }
+                            self.latestDepthPreviewSec = displayedAt
+                        }
+                        self.depthPreviewInFlight.signal()
+                    }
+                }
             }
+        } else if depthPreviewMaximumFPS > 0,
+                  previewTime - lastDepthPreviewSubmissionSec >= 1 / depthPreviewMaximumFPS {
+            depthPreviewDiagnostics.noteSkipped()
         }
         guard lidarDepthFrameCount % 15 == 0 else { return }
         setStatus("Depth")
+    }
+
+    func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData,
+                         timestamp: CMTime, connection: AVCaptureConnection,
+                         reason: AVCaptureOutput.DataDroppedReason) {
+        guard output === lidarDepthOutput else { return }
+        depthDropReasons[String(describing: reason), default: 0] += 1
     }
 
     private func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
@@ -4511,14 +4792,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 if let size { self.measuredCameraSizes[camera] = size }
                 self.refreshOverlayStatus()
             }
-        }
-    }
-
-    @objc private func recheckCaptureCapabilities() {
-        sessionQueue.async {
-            self.validatedMultiCameraFormats.removeAll()
-            self.settingsProbeResults.removeAll()
-            DispatchQueue.main.async { self.updateCameraResolutionMenus() }
         }
     }
 
@@ -4585,6 +4858,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if reset { renderer.resetStatistics() }
             result[name] = renderer.statistics()
         }
+        if recorderSettings.lidarDepthEnabled {
+            var depth = depthPreviewDiagnostics.snapshot(reset: reset)
+            depthCaptureQueue.sync {
+                depth["capture_drops"] = depthDropReasons
+                if reset { depthDropReasons.removeAll() }
+            }
+            result["depth"] = depth
+        }
         return result
     }
 
@@ -4606,71 +4887,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return CMTimeGetSeconds(sensorTime)
     }
 
-    private func depthPreviewImage(from depthData: AVDepthData) -> UIImage? {
-        let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-        let pixelBuffer = converted.depthDataMap
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        guard width > 0, height > 0,
-              let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-            return nil
-        }
-
-        var minDepth = Float.greatestFiniteMagnitude
-        var maxDepth: Float = 0
-        for row in 0..<height {
-            let rowBase = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: Float32.self)
-            for column in 0..<width {
-                let value = rowBase[column]
-                if value.isFinite && value > 0 {
-                    minDepth = min(minDepth, value)
-                    maxDepth = max(maxDepth, value)
-                }
-            }
-        }
-        guard minDepth.isFinite, maxDepth > minDepth else { return nil }
-
-        var rgba = [UInt8](repeating: 0, count: width * height * 4)
-        let range = max(maxDepth - minDepth, 0.001)
-        for row in 0..<height {
-            let rowBase = baseAddress.advanced(by: row * bytesPerRow).assumingMemoryBound(to: Float32.self)
-            for column in 0..<width {
-                let value = rowBase[column]
-                let pixelIndex = (row * width + column) * 4
-                guard value.isFinite, value > 0 else {
-                    rgba[pixelIndex + 3] = 255
-                    continue
-                }
-                let nearWarm = 1.0 - min(max(Double((value - minDepth) / range), 0.0), 1.0)
-                rgba[pixelIndex + 0] = UInt8(255.0 * nearWarm)
-                rgba[pixelIndex + 1] = UInt8(255.0 * (1.0 - abs(nearWarm - 0.5) * 2.0))
-                rgba[pixelIndex + 2] = UInt8(255.0 * (1.0 - nearWarm))
-                rgba[pixelIndex + 3] = 255
-            }
-        }
-
-        let data = Data(rgba)
-        guard let provider = CGDataProvider(data: data as CFData),
-              let cgImage = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: width * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            return nil
-        }
-        return UIImage(cgImage: cgImage)
+    private func depthPreviewImage(from depthData: AVDepthData) -> CIImage? {
+        // Keep the camera's depth buffer as the Core Image source. Core Image
+        // encodes the color mapping on Metal; no CPU pixel walk or RGBA copy.
+        guard let depth = CIImage(depthData: depthData),
+              let matrix = CIFilter(name: "CIColorMatrix"),
+              let colors = CIFilter(name: "CIFalseColor") else { return nil }
+        let scale = -1.0 / 4.8
+        let bias = 5.0 / 4.8
+        matrix.setValue(depth, forKey: kCIInputImageKey)
+        let vector = CIVector(x: scale, y: 0, z: 0, w: 0)
+        matrix.setValue(vector, forKey: "inputRVector")
+        matrix.setValue(vector, forKey: "inputGVector")
+        matrix.setValue(vector, forKey: "inputBVector")
+        matrix.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
+        matrix.setValue(CIVector(x: bias, y: bias, z: bias, w: 0), forKey: "inputBiasVector")
+        guard let normalized = matrix.outputImage else { return nil }
+        colors.setValue(normalized, forKey: kCIInputImageKey)
+        colors.setValue(CIColor(red: 0.05, green: 0.2, blue: 0.9), forKey: "inputColor0")
+        colors.setValue(CIColor(red: 1, green: 0.15, blue: 0.05), forKey: "inputColor1")
+        return colors.outputImage
     }
 
     private func enabledPhysicalCameras(_ settings: RecorderSettings) -> Set<PhysicalCamera> {
@@ -4680,7 +4916,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func multiCameraRequest(_ settings: RecorderSettings, includeAudio: Bool? = nil) -> MultiCameraCaptureGraph.Request? {
         let cameras = enabledPhysicalCameras(settings)
-        guard cameras.count > 1, !settings.lidarDepthEnabled else { return nil }
+        guard cameras.count > 1 else { return nil }
         guard let reference = [settings.wide, settings.ultraWide, settings.telephoto, settings.front].first(where: \.enabled) else { return nil }
         let positions: [PhysicalCamera: Float] = [
             .wide: Float(clampedLensPosition(settings.wide.fixedFocusLensPosition, fallback: defaultWideFixedFocusLensPosition)),
@@ -4690,12 +4926,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ]
         return .init(cameras: cameras, resolution: reference.resolution, fps: clampedFrameRate(from: reference.frameRate),
                      automaticExposure: isAutoExposureEnabled(for: reference), maxExposureSeconds: maxExposureDurationSeconds(for: reference),
+                     fixedExposureSeconds: (reference.fixedExposureDurationMS ?? 5) / 1000,
+                     fixedISO: reference.fixedISO ?? 100,
                      automaticFocus: reference.autoFocus, focusLensPositions: positions,
-                     audioEnabled: includeAudio ?? settings.audioEnabled)
+                     audioEnabled: includeAudio ?? settings.audioEnabled,
+                     depthEnabled: settings.lidarDepthEnabled, freeRunning: settings.captureMode == .standardFree)
     }
 
     private func multiCameraProfileKey(_ request: MultiCameraCaptureGraph.Request) -> String {
-        request.cameras.map(\.rawValue).sorted().joined(separator: "+") + ":\(request.resolution):\(request.fps):\(request.audioEnabled)"
+        request.cameras.map(\.rawValue).sorted().joined(separator: "+") +
+            ":\(request.resolution):\(request.fps):\(request.audioEnabled):\(request.depthEnabled):\(request.freeRunning):" +
+            "\(request.automaticExposure):\(request.fixedExposureSeconds):\(request.fixedISO)"
     }
 
     private func configureMultiCameraPreview(includeAudio: Bool) {
@@ -4707,6 +4948,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let graph = try MultiCameraCaptureGraph.make(request, frozenFormats: validatedMultiCameraFormats[multiCameraProfileKey(request)])
             multiCameraGraph = graph
             session = graph.session
+            if let depthOutput = graph.depthOutput {
+                depthOutput.setDelegate(self, callbackQueue: depthCaptureQueue)
+                lidarDepthOutput = depthOutput
+                lidarDepthPort = graph.depthPort
+                lidarDevice = graph.depthDevice
+                DispatchQueue.main.async {
+                    self.installDepthPreviewViewIfNeeded()
+                    self.layoutPreviewLayers()
+                    self.refreshOverlayStatus()
+                }
+            }
             observeSessionRuntimeErrorsIfNeeded()
             if let output = graph.audioOutput {
                 configureAudioSessionForCapture()
@@ -4874,7 +5126,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let output = AVCaptureDepthDataOutput()
             output.isFilteringEnabled = true
             output.alwaysDiscardsLateDepthData = true
-            output.setDelegate(self, callbackQueue: sessionQueue)
+            output.setDelegate(self, callbackQueue: depthCaptureQueue)
             guard session.canAddOutput(output) else {
                 os_log("Cannot add LiDAR depth output.", type: .error)
                 session.removeInput(input)
@@ -4917,7 +5169,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let output = AVCaptureDepthDataOutput()
         output.isFilteringEnabled = true
         output.alwaysDiscardsLateDepthData = true
-        output.setDelegate(self, callbackQueue: sessionQueue)
+        output.setDelegate(self, callbackQueue: depthCaptureQueue)
         guard session.canAddOutput(output) else {
             os_log("Cannot add LiDAR depth output.", type: .error)
             return
@@ -4943,42 +5195,38 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func configureLiDARDeviceForDepth(_ device: AVCaptureDevice) throws {
-        let formatPair = preferredDepthFormatPair(for: device)
-        guard let videoFormat = formatPair.videoFormat,
-              let depthFormat = formatPair.depthFormat else {
-            throw NSError(
-                domain: "SensorRecorder",
-                code: -10,
-                userInfo: [NSLocalizedDescriptionKey: "No supported LiDAR depth format found."]
-            )
+        guard let plan = standaloneDepthPlan(for: device) else {
+            throw NSError(domain: "SensorRecorder", code: -10,
+                          userInfo: [NSLocalizedDescriptionKey: "No supported LiDAR depth format found."])
         }
 
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
-        device.activeFormat = videoFormat
-        device.activeDepthDataFormat = depthFormat
-
-        let fps = supportedFrameRate(for: videoFormat, requested: depthEnabledCameraFrameRateLimit)
-        let duration = frameDuration(for: min(fps, depthEnabledCameraFrameRateLimit))
-        device.activeVideoMinFrameDuration = duration
-        device.activeVideoMaxFrameDuration = duration
+        device.activeFormat = plan.video
+        device.activeDepthDataFormat = plan.depth
+        device.activeVideoMinFrameDuration = plan.duration
+        device.activeVideoMaxFrameDuration = plan.duration
     }
 
-    private func preferredDepthFormatPair(for device: AVCaptureDevice) -> (videoFormat: AVCaptureDevice.Format?, depthFormat: AVCaptureDevice.Format?) {
-        var candidates: [(videoFormat: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format, score: Int)] = []
-        for videoFormat in device.formats {
-            for depthFormat in videoFormat.supportedDepthDataFormats {
-                let subtype = CMFormatDescriptionGetMediaSubType(depthFormat.formatDescription)
-                guard subtype == kCVPixelFormatType_DepthFloat32 || subtype == kCVPixelFormatType_DepthFloat16 else {
-                    continue
+    private func standaloneDepthPlan(for device: AVCaptureDevice)
+        -> (video: AVCaptureDevice.Format, depth: AVCaptureDevice.Format, duration: CMTime)? {
+        var best: (video: AVCaptureDevice.Format, depth: AVCaptureDevice.Format, duration: CMTime)?
+        for video in device.formats where !AVCaptureMultiCamSession.isMultiCamSupported || video.isMultiCamSupported {
+            for depth in depthFormats(video) {
+                guard let depthRate = depth.videoSupportedFrameRateRanges.map(\.maxFrameRate).max(),
+                      let commonRate = frameRateChoices([video], ceiling: depthRate).compactMap(Double.init).max()
+                else { continue }
+                let duration = supportedFrameDuration(for: video, requested: commonRate)
+                if let best {
+                    let comparison = CMTimeCompare(duration, best.duration)
+                    if comparison > 0 || (comparison == 0 && depthProbeScore(depth) <= depthProbeScore(best.depth)) {
+                        continue
+                    }
                 }
-                let dimensions = CMVideoFormatDescriptionGetDimensions(depthFormat.formatDescription)
-                let area = Int(dimensions.width) * Int(dimensions.height)
-                let floatScore = subtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0
-                candidates.append((videoFormat, depthFormat, floatScore + area))
+                best = (video, depth, duration)
             }
         }
-        return candidates.max(by: { $0.score < $1.score }).map { ($0.videoFormat, $0.depthFormat) } ?? (nil, nil)
+        return best
     }
 
     private func configureSessionPresetForActiveFormats() {
@@ -5185,13 +5433,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func installDepthPreviewViewIfNeeded() {
         guard depthPreviewView == nil else { return }
-        let imageView = UIImageView(frame: .zero)
-        imageView.backgroundColor = .black
-        imageView.contentMode = .scaleAspectFit
-        imageView.clipsToBounds = true
-        imageView.isUserInteractionEnabled = false
-        sceneView.insertSubview(imageView, at: 0)
-        depthPreviewView = imageView
+        let metalView = DepthMetalPreviewView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        metalView.backgroundColor = .black
+        metalView.clipsToBounds = true
+        sceneView.insertSubview(metalView, at: 0)
+        depthPreviewView = metalView
     }
 
 
@@ -5204,11 +5450,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
 
-        guard let format = preferredFormats(for: device, settings: settings, requiresMultiCamFormat: requiresMultiCamFormat).first else {
+        let depthPair = device.deviceType == .builtInLiDARDepthCamera
+            ? depthCapabilityPairs(settings: recorderSettings).first : nil
+        let format = device.deviceType == .builtInLiDARDepthCamera
+            ? depthPair?.video
+            : preferredFormats(for: device, settings: settings, requiresMultiCamFormat: requiresMultiCamFormat).first
+        guard let format else {
             throw NSError(domain: "SensorRecorder", code: -11,
                           userInfo: [NSLocalizedDescriptionKey: "No compatible recording format is available."])
         }
         device.activeFormat = format
+        if #available(iOS 18.0, *), format.isAutoVideoFrameRateSupported {
+            device.isAutoVideoFrameRateEnabled = false
+        }
 
         let fps = activeFrameRate(for: device, settings: settings)
         let duration = supportedFrameDuration(for: device.activeFormat, requested: fps)
@@ -5227,7 +5481,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if device.activeFormat.isVideoHDRSupported { device.isVideoHDREnabled = false }
         }
         applyAutoExposurePolicy(to: device, settings: settings)
-        configureDepthFormatIfAvailable(for: device)
+        if let depthPair { device.activeDepthDataFormat = depthPair.depth }
 
         if settings.autoFocus {
             if device.isFocusModeSupported(.continuousAutoFocus) {
@@ -5247,31 +5501,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
     }
 
-    private func configureDepthFormatIfAvailable(for device: AVCaptureDevice) {
-        guard device.deviceType == .builtInLiDARDepthCamera,
-              let depthFormat = preferredDepthFormat(for: device.activeFormat) else {
-            return
-        }
-        device.activeDepthDataFormat = depthFormat
-    }
-
-    private func preferredDepthFormat(for videoFormat: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
-        videoFormat.supportedDepthDataFormats
-            .filter {
-                let subtype = CMFormatDescriptionGetMediaSubType($0.formatDescription)
-                return subtype == kCVPixelFormatType_DepthFloat32 || subtype == kCVPixelFormatType_DepthFloat16
-            }
-            .max { lhs, rhs in
-                let lhsSubtype = CMFormatDescriptionGetMediaSubType(lhs.formatDescription)
-                let rhsSubtype = CMFormatDescriptionGetMediaSubType(rhs.formatDescription)
-                let lhsDimensions = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
-                let rhsDimensions = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
-                let lhsScore = (lhsSubtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0) + Int(lhsDimensions.width) * Int(lhsDimensions.height)
-                let rhsScore = (rhsSubtype == kCVPixelFormatType_DepthFloat32 ? 1_000_000_000 : 0) + Int(rhsDimensions.width) * Int(rhsDimensions.height)
-                return lhsScore < rhsScore
-            }
-    }
-
     private func clampedLensPosition(_ value: Double) -> Double {
         min(1.0, max(0.0, value))
     }
@@ -5289,8 +5518,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func applyAutoExposurePolicy(to device: AVCaptureDevice, settings: CameraCaptureSettings) {
         guard isAutoExposureEnabled(for: settings) else {
-            if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
+            if device.isExposureModeSupported(.custom) {
+                let requested = CMTime(seconds: (settings.fixedExposureDurationMS ?? 5) / 1000,
+                                       preferredTimescale: 1_000_000_000)
+                let duration = clampedExposureDuration(requested, for: device.activeFormat)
+                let iso = min(max(settings.fixedISO ?? 100, device.activeFormat.minISO), device.activeFormat.maxISO)
+                device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
             }
             return
         }
@@ -5330,10 +5563,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return device.formats.filter { format in
             guard !requiresMultiCamFormat || format.isMultiCamSupported else { return false }
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            if recorderSettings.captureMode == .standard {
+            if recorderSettings.captureMode.usesStandardCapture {
                 guard Int(dimensions.width) == targetWidth,
                       Int(dimensions.height) == targetHeight,
-                      supportsFPS(preferredCaptureFrameRateRequest(for: settings), format: format) else { return false }
+                      supportsFPS(preferredCaptureFrameRateRequest(for: settings), format: format),
+                      exposureSettingsFit(settings, format: format) else { return false }
             }
             return CameraStreamRecorder.isRecordableMP4Resolution(
                 width: Int(dimensions.width),
@@ -5408,16 +5642,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         case .front:
             requested = clampedFrameRate(from: recorderSettings.front.frameRate)
         }
-        return limitedCameraFrameRate(requested)
+        return requested
     }
 
     private func targetRecordingFrameRate(for settings: CameraCaptureSettings) -> Double {
-        limitedCameraFrameRate(clampedFrameRate(from: settings.frameRate))
-    }
-
-    private func limitedCameraFrameRate(_ requested: Double) -> Double {
-        recorderSettings.captureMode == .arkit && recorderSettings.lidarDepthEnabled
-            ? min(requested, depthEnabledCameraFrameRateLimit) : requested
+        clampedFrameRate(from: settings.frameRate)
     }
 
     private func isAutoExposureEnabled(for settings: CameraCaptureSettings) -> Bool {
@@ -5427,7 +5656,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func maxExposureDurationSeconds(for settings: CameraCaptureSettings) -> TimeInterval {
         let defaultMilliseconds = Double(defaultCameraAutoExposureMaxDurationMS) ?? 10
         let milliseconds = Double(settings.maxExposureDurationMS ?? defaultCameraAutoExposureMaxDurationMS) ?? defaultMilliseconds
-        return min(max(milliseconds, 0.1), 1000) / 1000.0
+        return min(max(milliseconds, 0.1), 1000 / max(clampedFrameRate(from: settings.frameRate), 1)) / 1000.0
+    }
+
+    private func autoExposureLimitChoices(frameRate: String) -> [String] {
+        let frameMilliseconds = 1000 / max(Double(frameRate) ?? 30, 1)
+        return ["1", "2", "5", "10", "20", "30"].filter { (Double($0) ?? .infinity) <= frameMilliseconds + 0.0001 }
     }
 
     private func maxExposureDurationLabel(for settings: CameraCaptureSettings) -> String {
@@ -5460,7 +5694,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     private func frameDuration(for fps: Double) -> CMTime {
-        let scale: Int32 = recorderSettings.captureMode == .standard ? 60_000 : 600
+        let scale: Int32 = recorderSettings.captureMode.usesStandardCapture ? 60_000 : 600
         let value = max(Int64(round(Double(scale) / max(fps, 0.1))), 1)
         return CMTime(value: value, timescale: scale)
     }
@@ -5509,6 +5743,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         format.videoSupportedFrameRateRanges.contains { fps >= $0.minFrameRate - 0.001 && fps <= $0.maxFrameRate + 0.001 }
     }
 
+    private func exposureSettingsFit(_ settings: CameraCaptureSettings, format: AVCaptureDevice.Format) -> Bool {
+        if isAutoExposureEnabled(for: settings) { return true }
+        guard let milliseconds = settings.fixedExposureDurationMS, milliseconds.isFinite, milliseconds > 0,
+              let iso = settings.fixedISO, iso.isFinite else { return false }
+        let seconds = milliseconds / 1000
+        return seconds >= CMTimeGetSeconds(format.minExposureDuration) - 0.000001 &&
+            seconds <= min(CMTimeGetSeconds(format.maxExposureDuration), 1 / clampedFrameRate(from: settings.frameRate)) + 0.000001 &&
+            iso >= format.minISO && iso <= format.maxISO
+    }
+
     private func depthFormats(_ video: AVCaptureDevice.Format) -> [AVCaptureDevice.Format] {
         video.supportedDepthDataFormats.filter {
             let subtype = CMFormatDescriptionGetMediaSubType($0.formatDescription)
@@ -5518,11 +5762,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func capabilityFormats(_ key: String, settings: RecorderSettings) -> [AVCaptureDevice.Format] {
         if enabledCameraCount(in: settings) > 1 {
-            guard !settings.lidarDepthEnabled, let camera = PhysicalCamera.allCases.first(where: { $0.settingsKey == key }),
-                  let device = MultiCameraCaptureGraph.controllerDevice(for: camera, cameras: enabledPhysicalCameras(settings)) else { return [] }
+            guard let camera = PhysicalCamera.allCases.first(where: { $0.settingsKey == key }),
+                  let device = MultiCameraCaptureGraph.controllerDevice(for: camera, cameras: enabledPhysicalCameras(settings),
+                                                                         depthEnabled: settings.lidarDepthEnabled,
+                                                                         freeRunning: settings.captureMode == .standardFree) else { return [] }
             return device.formats.filter { format in
                 let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                return format.isMultiCamSupported && CameraStreamRecorder.isRecordableMP4Resolution(width: Int(size.width), height: Int(size.height))
+                return format.isMultiCamSupported && CameraStreamRecorder.isRecordableMP4Resolution(width: Int(size.width), height: Int(size.height)) &&
+                    (key != "wide" || !settings.lidarDepthEnabled || !depthFormats(format).isEmpty)
             }
         }
         guard let device = settingsDevice(key, settings: settings) else { return [] }
@@ -5550,7 +5797,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func settingsDraft() -> RecorderSettings {
         var draft = recorderSettings
-        draft.captureMode = settingsMenuButtons["captureMode"]?.accessibilityValue == "ARKit" ? .arkit : .standard
+        let modeValue = settingsMenuButtons["captureMode"]?.accessibilityValue
+        draft.captureMode = modeValue == "ARKit" ? .arkit : modeValue == "Standard · Free" ? .standardFree : .standard
         draft.lidarDepthEnabled = settingsSwitches["lidarDepth"]?.isOn ?? draft.lidarDepthEnabled
         draft.audioEnabled = settingsSwitches["audio"]?.isOn ?? draft.audioEnabled
         func camera(_ key: String, _ stored: CameraCaptureSettings) -> CameraCaptureSettings {
@@ -5560,11 +5808,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let sharedRearPosition = key == "front" ? nil : settingsSliders["shared.fixedFocus"]
             value.fixedFocusLensPosition = settingsSliders["\(key).fixedFocus"].map { Double($0.value) }
                 ?? sharedRearPosition.map { Double($0.value) } ?? value.fixedFocusLensPosition
-            if draft.captureMode == .standard && value.enabled {
+            if draft.captureMode.usesStandardCapture && value.enabled {
                 value.resolution = selectedSettingsValue(for: "shared.resolution", fallback: value.resolution)
                 value.frameRate = selectedSettingsValue(for: "shared.frameRate", fallback: value.frameRate)
                 value.autoExposure = settingsSwitches["shared.autoExposure"]?.isOn ?? isAutoExposureEnabled(for: value)
-                value.maxExposureDurationMS = selectedSettingsValue(for: "shared.maxExposure", fallback: maxExposureDurationLabel(for: value))
+                let requestedLimit = selectedSettingsValue(for: "shared.maxExposure", fallback: maxExposureDurationLabel(for: value))
+                value.maxExposureDurationMS = CaptureRateOptions.compatibleOrder(
+                    current: requestedLimit, choices: autoExposureLimitChoices(frameRate: value.frameRate)).first ?? "1"
+                value.fixedExposureDurationMS = Double(selectedSettingsValue(for: "shared.fixedExposure",
+                    fallback: String(value.fixedExposureDurationMS ?? 5)))
+                value.fixedISO = Float(selectedSettingsValue(for: "shared.fixedISO",
+                    fallback: String(value.fixedISO ?? 100)))
             }
             return value
         }
@@ -5572,6 +5826,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         draft.ultraWide = camera("ultra", draft.ultraWide)
         draft.telephoto = camera("telephoto", draft.telephoto)
         draft.front = camera("front", draft.front)
+        draft.imuEnabled = settingsSwitches["imu"]?.isOn ?? draft.imuEnabled
+        draft.deviceMotionEnabled = settingsSwitches["motion"]?.isOn ?? draft.deviceMotionEnabled
+        draft.magnetometerEnabled = settingsSwitches["mag"]?.isOn ?? draft.magnetometerEnabled
+        draft.barometerEnabled = settingsSwitches["baro"]?.isOn ?? draft.barometerEnabled
+        draft.geoLocationEnabled = settingsSwitches["geo"]?.isOn ?? draft.geoLocationEnabled
         return draft
     }
 
@@ -5588,24 +5847,49 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 !settings.wide.enabled || depth.videoSupportedFrameRateRanges.contains {
                     $0.minFrameRate <= clampedFrameRate(from: settings.wide.frameRate)
                 }
-            }.map { (video, $0) }
+            }.sorted { depthProbeScore($0) > depthProbeScore($1) }.map { (video, $0) }
         }
     }
 
     // Called only on sessionQueue while the settings controller covers preview.
     // Probe the complete graph, including all other cameras, never a lens alone.
+    private func jointConfigurationKey(_ settings: RecorderSettings) -> String {
+        let cameras = [("wide", settings.wide), ("ultra", settings.ultraWide),
+                       ("telephoto", settings.telephoto), ("front", settings.front)]
+        return ([settings.captureMode.rawValue, settings.audioEnabled.description,
+                    settings.lidarDepthEnabled.description] + cameras.filter { $0.1.enabled }.map { name, camera in
+            [name, camera.resolution, camera.frameRate, camera.autoFocus.description,
+             isAutoExposureEnabled(for: camera).description, maxExposureDurationLabel(for: camera),
+             String(camera.fixedExposureDurationMS ?? 0), String(camera.fixedISO ?? 0)].joined(separator: ":")
+        }).joined(separator: "|")
+    }
+
     private func jointConfigurationFits(_ settings: RecorderSettings) -> Bool {
-        if let key = try? JSONEncoder().encode(settings) {
-            if let cached = settingsProbeResults[key] { return cached }
-            let fits = probeJointConfiguration(settings)
-            settingsProbeResults[key] = fits
-            return fits
-        }
-        return probeJointConfiguration(settings)
+        let key = jointConfigurationKey(settings)
+        let forceProbe = ProcessInfo.processInfo.arguments.contains("--matrix-debug-probes")
+        if !forceProbe, let cached = settingsProbeResults[key] { return cached }
+        let fits = probeJointConfiguration(settings)
+        settingsProbeResults[key] = fits
+        return fits
     }
 
     private func probeJointConfiguration(_ settings: RecorderSettings) -> Bool {
-        guard standardConfigurationIssue(settings) == nil else { return false }
+        func reject(_ reason: String) -> Bool {
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--matrix-debug-probes") {
+                print("MATRIX_SINGLE_REJECT \(combinationTitle(settings)) \(settings.wide.resolution)@\(settings.wide.frameRate): \(reason)")
+            }
+            #endif
+            return false
+        }
+        if let issue = standardConfigurationIssue(settings) {
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--validate-capture-matrix") {
+                print("MATRIX_CONFIGURATION_REJECT \(combinationTitle(settings)) \(settings.wide.resolution)@\(settings.wide.frameRate): \(issue)")
+            }
+            #endif
+            return false
+        }
         if enabledCameraCount(in: settings) > 1 {
             guard let request = multiCameraRequest(settings) else { return false }
             do {
@@ -5614,7 +5898,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 guard sdkEncoderPlanFits(settings) else { return false }
                 validatedMultiCameraFormats[multiCameraProfileKey(request)] = graph.formats
                 return true
-            } catch { return false }
+            } catch {
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--validate-capture-matrix") {
+                    print("MATRIX_GRAPH_REJECT \(combinationTitle(settings)) \(settings.wide.resolution)@\(settings.wide.frameRate): \(error.localizedDescription)")
+                }
+                #endif
+                return false
+            }
         }
         let graph = makeCaptureSession(for: settings)
         graph.beginConfiguration()
@@ -5633,55 +5924,56 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let cameras = [("wide", settings.wide), ("ultra", settings.ultraWide),
                        ("telephoto", settings.telephoto), ("front", settings.front)]
         for (key, camera) in cameras where camera.enabled {
-            guard let device = settingsDevice(key, settings: settings),
-                  let format = capabilityFormats(key, settings: settings).first(where: {
-                      formatResolution($0) == camera.resolution && supportsFPS(clampedFrameRate(from: camera.frameRate), format: $0) &&
-                      (key != "wide" || !settings.lidarDepthEnabled || compatibleDepthFormat(video: $0, settings: settings) != nil)
-                  }) else { return false }
+            guard let device = settingsDevice(key, settings: settings) else { return reject("missing device \(key)") }
+            let depthPair = key == "wide" && settings.lidarDepthEnabled
+                ? depthCapabilityPairs(settings: settings).first : nil
+            let format = key == "wide" && settings.lidarDepthEnabled
+                ? depthPair?.video
+                : capabilityFormats(key, settings: settings).first {
+                    formatResolution($0) == camera.resolution && supportsFPS(clampedFrameRate(from: camera.frameRate), format: $0)
+                }
+            guard let format else { return reject("missing matching format \(key)") }
             do {
                 try device.lockForConfiguration()
                 device.activeFormat = format
+                if #available(iOS 18.0, *), format.isAutoVideoFrameRateSupported {
+                    device.isAutoVideoFrameRateEnabled = false
+                }
                 let duration = supportedFrameDuration(for: format, requested: clampedFrameRate(from: camera.frameRate))
                 device.activeVideoMinFrameDuration = duration
                 device.activeVideoMaxFrameDuration = duration
-                if key == "wide", settings.lidarDepthEnabled,
-                   let depth = compatibleDepthFormat(video: format, settings: settings) {
-                    device.activeDepthDataFormat = depth
-                }
+                if let depthPair { device.activeDepthDataFormat = depthPair.depth }
                 device.unlockForConfiguration()
                 let input = try AVCaptureDeviceInput(device: device)
-                guard graph.canAddInput(input) else { return false }
+                guard graph.canAddInput(input) else { return reject("cannot add input \(key)") }
                 graph.addInputWithNoConnections(input)
                 if graph is AVCaptureMultiCamSession { input.videoMinFrameDurationOverride = duration }
                 let output = AVCaptureVideoDataOutput()
                 output.alwaysDiscardsLateVideoFrames = false
                 output.automaticallyConfiguresOutputBufferDimensions = false
                 output.deliversPreviewSizedOutputBuffers = false
-                guard graph.canAddOutput(output), let port = input.ports.first(where: { $0.mediaType == .video }) else { return false }
+                guard graph.canAddOutput(output), let port = input.ports.first(where: { $0.mediaType == .video }) else { return reject("cannot add video output \(key)") }
                 graph.addOutputWithNoConnections(output)
                 let connection = AVCaptureConnection(inputPorts: [port], output: output)
-                guard graph.canAddConnection(connection) else { return false }
+                guard graph.canAddConnection(connection) else { return reject("cannot add video connection \(key)") }
                 graph.addConnection(connection)
-                guard MultiCameraCaptureGraph.configureEncoderPixelFormat(output) else { return false }
+                guard MultiCameraCaptureGraph.configureEncoderPixelFormat(output) else { return reject("encoder pixel format \(key)") }
                 configureVideoConnection(connection)
                 if connection.isCameraIntrinsicMatrixDeliverySupported { connection.isCameraIntrinsicMatrixDeliveryEnabled = true }
                 if key == "wide", settings.lidarDepthEnabled {
                     guard addProbeDepthOutput(input: input, graph: graph) else { return false }
                     depthConnected = true
                 }
-            } catch { return false }
+            } catch { return reject("device setup \(key): \(error.localizedDescription)") }
         }
         if settings.lidarDepthEnabled && !depthConnected {
             guard let device = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back),
-                  let pair = depthCapabilityPairs(settings: settings).filter({
-                      compatibleDepthFormat(video: $0.video, settings: settings) === $0.depth &&
-                      supportsFPS(depthEnabledCameraFrameRateLimit, format: $0.video)
-                  }).max(by: { a, b in depthProbeScore(a.depth) < depthProbeScore(b.depth) }) else { return false }
+                  let pair = standaloneDepthPlan(for: device) else { return false }
             do {
                 try device.lockForConfiguration()
                 device.activeFormat = pair.video
                 device.activeDepthDataFormat = pair.depth
-                let duration = supportedFrameDuration(for: pair.video, requested: depthEnabledCameraFrameRateLimit)
+                let duration = pair.duration
                 device.activeVideoMinFrameDuration = duration
                 device.activeVideoMaxFrameDuration = duration
                 device.unlockForConfiguration()
@@ -5712,7 +6004,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let min = CMTimeGetSeconds(device.activeVideoMinFrameDuration)
             let max = CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
             let fps = clampedFrameRate(from: camera.frameRate)
-            guard min > 0, max > 0, abs(1 / min - fps) < 0.01, abs(1 / max - fps) < 0.01 else { return false }
+            guard min > 0, max > 0, abs(1 / min - fps) < 0.01, abs(1 / max - fps) < 0.01 else {
+                return reject("active cadence \(key): min=\(min) max=\(max) requested=\(fps)")
+            }
         }
         if settings.lidarDepthEnabled {
             guard let device = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back),
@@ -5723,6 +6017,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func sdkEncoderPlanFits(_ settings: RecorderSettings) -> Bool {
         let cameras = [settings.wide, settings.ultraWide, settings.telephoto, settings.front].filter(\.enabled)
+        let key = cameras.map { "\($0.resolution)@\($0.frameRate)" }.joined(separator: "+")
+        if let cached = settingsEncoderProbeResults[key] { return cached }
         var encoders: [RealtimeVideoEncoder] = []
         do {
             for camera in cameras {
@@ -5737,12 +6033,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
             // Keep every SDK session alive together to check joint availability,
             // rather than checking each encoder in isolation.
-            return withExtendedLifetime(encoders) { true }
-        } catch { return false }
-    }
-
-    private func compatibleDepthFormat(video: AVCaptureDevice.Format, settings _: RecorderSettings) -> AVCaptureDevice.Format? {
-        preferredDepthFormat(for: video)
+            let fits = withExtendedLifetime(encoders) { true }
+            settingsEncoderProbeResults[key] = fits
+            return fits
+        } catch {
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--validate-capture-matrix") {
+                print("MATRIX_ENCODER_REJECT \(key): \(error.localizedDescription)")
+            }
+            #endif
+            settingsEncoderProbeResults[key] = false
+            return false
+        }
     }
 
     private func depthProbeScore(_ format: AVCaptureDevice.Format) -> Int {
@@ -5768,11 +6070,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified).devices.sorted { $0.isVirtualDevice && !$1.isVirtualDevice }
         let snapshots = devices.map { ($0, $0.activeFormat, $0.activeVideoMinFrameDuration, $0.activeVideoMaxFrameDuration,
                                        $0.activeDepthDataFormat, $0.activeDepthDataMinFrameDuration, $0.activeMaxExposureDuration,
-                                       $0.focusMode, $0.lensPosition, $0.exposureMode, $0.whiteBalanceMode, $0.deviceWhiteBalanceGains) }
+                                       $0.focusMode, $0.lensPosition, $0.exposureMode, $0.exposureDuration,
+                                       $0.iso, $0.whiteBalanceMode, $0.deviceWhiteBalanceGains) }
         let running = session.isRunning
         if running { session.stopRunning() }
         defer {
-            for (device, format, min, max, depth, depthMin, exposureMax, focus, lens, exposure, whiteBalance, gains) in snapshots {
+            for (device, format, min, max, depth, depthMin, exposureMax, focus, lens, exposure, exposureDuration, iso, whiteBalance, gains) in snapshots {
                 do {
                     try device.lockForConfiguration()
                     device.activeFormat = format
@@ -5792,7 +6095,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                             device.setFocusModeLocked(lensPosition: lens, completionHandler: nil)
                         } else { device.focusMode = focus }
                     }
-                    if device.isExposureModeSupported(exposure) { device.exposureMode = exposure }
+                    if exposure == .custom && device.isExposureModeSupported(.custom) {
+                        device.setExposureModeCustom(duration: clampedExposureDuration(exposureDuration, for: format),
+                                                     iso: Swift.min(Swift.max(iso, format.minISO), format.maxISO), completionHandler: nil)
+                    } else if device.isExposureModeSupported(exposure) { device.exposureMode = exposure }
                     if device.isWhiteBalanceModeSupported(whiteBalance) {
                         if whiteBalance == .locked { device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil) }
                         else { device.whiteBalanceMode = whiteBalance }
@@ -5811,7 +6117,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard parts.count == 2 else { return result }
         func replace(_ camera: inout CameraCaptureSettings) {
             if parts[1] == "resolution" { camera.resolution = value }
-            else { camera.frameRate = value }
+            else if parts[1] == "frameRate" { camera.frameRate = value }
+            else if parts[1] == "fixedExposure" { camera.fixedExposureDurationMS = Double(value) }
+            else if parts[1] == "fixedISO" { camera.fixedISO = Float(value) }
         }
         switch parts[0] {
         case "wide": replace(&result.wide)
@@ -5834,7 +6142,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let selected = button.accessibilityValue ?? ""
         var plan = draft
         if key.hasPrefix("shared.") {
-            for field in ["resolution", "frameRate"] {
+            for field in ["resolution", "frameRate", "fixedExposure", "fixedISO"] {
                 if let value = settingsMenuButtons["shared.\(field)"]?.accessibilityValue {
                     plan = replacingCaptureValue(plan, key: "shared.\(field)", value: value)
                 }
@@ -5846,22 +6154,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // be queried repeatedly by accessibility while their anchor is closing.
         sessionQueue.async { [weak self, weak button] in
             guard let self, !self.isRecording else { return }
-                let valid: [(String, RecorderSettings)] = self.withRestoredCaptureDevices {
-                    candidates.compactMap { value in
-                        autoreleasepool {
-                            let candidate = self.replacingCaptureValue(basePlan, key: key, value: value)
-                            if key == "shared.resolution" {
-                                let current = [basePlan.wide, basePlan.ultraWide, basePlan.telephoto, basePlan.front].first(where: \.enabled)?.frameRate ?? "30"
-                                for rate in CaptureRateOptions.compatibleOrder(current: current, choices: self.commonRateChoices(candidate)) {
-                                    let compatible = self.replacingCaptureValue(candidate, key: "shared.frameRate", value: rate)
-                                    if self.jointConfigurationFits(compatible) { return (value, compatible) }
-                                }
-                                return nil
-                            }
-                            return self.jointConfigurationFits(candidate) ? (value, candidate) : nil
-                        }
-                    }
-                }
+            var valid: [(String, RecorderSettings)] = []
+            func scan(_ offset: Int) {
+                guard DispatchQueue.main.sync(execute: { self.settingsCapabilityGeneration == generation && self.settingsOverlayView != nil }) else { return }
+                guard offset < candidates.count else {
+                self.saveCapabilityProbes()
                 DispatchQueue.main.async {
                     guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil, let button else { return }
                     let actions = valid.map { value, compatible in
@@ -5888,6 +6185,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     button.configuration = self.settingsMenuConfiguration(title: actions.isEmpty ? "Not available" : button.accessibilityValue ?? "Choose…", compact: true)
                     onReady?()
                 }
+                    return
+                }
+                // A short batch lets another settings edit reach sessionQueue
+                // before a long list of formats has finished probing.
+                let next = min(offset + 3, candidates.count)
+                let batch: [(String, RecorderSettings)] = self.withRestoredCaptureDevices {
+                    candidates[offset..<next].compactMap { value in
+                        autoreleasepool {
+                            let candidate = self.replacingCaptureValue(basePlan, key: key, value: value)
+                            if key == "shared.resolution" {
+                                let current = [basePlan.wide, basePlan.ultraWide, basePlan.telephoto, basePlan.front].first(where: \.enabled)?.frameRate ?? "30"
+                                for rate in CaptureRateOptions.compatibleOrder(current: current, choices: self.commonRateChoices(candidate)) {
+                                    let compatible = self.replacingCaptureValue(candidate, key: "shared.frameRate", value: rate)
+                                    if self.jointConfigurationFits(compatible) { return (value, compatible) }
+                                }
+                                return nil
+                            }
+                            return self.jointConfigurationFits(candidate) ? (value, candidate) : nil
+                        }
+                    }
+                }
+                valid.append(contentsOf: batch)
+                self.sessionQueue.async { scan(next) }
+            }
+            scan(0)
         }
     }
 
@@ -5896,10 +6218,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         if enabled.contains(where: { !CaptureRateOptions.isWithinProductLimit(Double($0.frameRate) ?? .nan) }) {
             return "This version supports up to 60 fps. Select an SDK-supported frame rate of 60 fps or lower in Settings."
         }
+        if settings.lidarDepthEnabled && enabled.contains(where: { (Double($0.frameRate) ?? .infinity) > 30 }) {
+            return "LiDAR capture supports camera frame rates up to 30 fps."
+        }
         if let first = enabled.first, enabled.contains(where: {
             $0.resolution != first.resolution || $0.frameRate != first.frameRate ||
             isAutoExposureEnabled(for: $0) != isAutoExposureEnabled(for: first) ||
-            maxExposureDurationLabel(for: $0) != maxExposureDurationLabel(for: first)
+            maxExposureDurationLabel(for: $0) != maxExposureDurationLabel(for: first) ||
+            $0.fixedExposureDurationMS != first.fixedExposureDurationMS || $0.fixedISO != first.fixedISO
         }) { return "Choose one shared resolution, frame rate and exposure policy for the camera combination." }
         guard isCameraSetSupportedByMultiCam(settings: settings) else {
             return "This device does not support the selected camera combination."
@@ -5907,15 +6233,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let configuredCameras = [("wide", settings.wide), ("ultra", settings.ultraWide),
                        ("telephoto", settings.telephoto), ("front", settings.front)]
         for (key, camera) in configuredCameras where camera.enabled {
+            if !isAutoExposureEnabled(for: camera), settingsDevice(key, settings: settings)?.isExposureModeSupported(.custom) != true {
+                return "\(key): fixed exposure is not supported by this camera."
+            }
             let matches = capabilityFormats(key, settings: settings).filter {
-                formatResolution($0) == camera.resolution && supportsFPS(clampedFrameRate(from: camera.frameRate), format: $0)
+                formatResolution($0) == camera.resolution && supportsFPS(clampedFrameRate(from: camera.frameRate), format: $0) &&
+                    exposureSettingsFit(camera, format: $0)
             }
             if matches.isEmpty { return "\(key): \(camera.resolution) at \(camera.frameRate) Hz is not supported by this camera configuration." }
         }
         if settings.lidarDepthEnabled {
-            if enabled.contains(where: { clampedFrameRate(from: $0.frameRate) > depthEnabledCameraFrameRateLimit }) {
-                return "The existing Depth capture path limits RGB to 10 Hz. Select a supported rate or disable Depth."
-            }
             if depthCapabilityPairs(settings: settings).isEmpty { return "Depth is unavailable with this camera configuration." }
         }
         return nil
@@ -5977,9 +6304,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let maximum = ARWorldTrackingConfiguration.supportedVideoFormats.filter {
             "\(Int($0.imageResolution.width))x\(Int($0.imageResolution.height))" == resolution
         }.map { Double($0.framesPerSecond) }.max() ?? 0
-        return ["1", "5", "10", "20", "30", "60"].filter {
+        let lidarEnabled = settingsSwitches["lidarDepth"]?.isOn ?? recorderSettings.lidarDepthEnabled
+        return ["1", "2", "5", "10", "20", "30", "60"].filter {
             guard let rate = Double($0) else { return false }
-            return CaptureRateOptions.isWithinProductLimit(rate) && rate <= maximum
+            return CaptureRateOptions.isWithinProductLimit(rate) && rate <= maximum && (!lidarEnabled || rate <= 30)
         }
     }
 
@@ -6207,6 +6535,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard !isRecording, recordingTransition == .none else { return }
         if isARKitMode && !CaptureRateOptions.isWithinProductLimit(Double(recorderSettings.arkitCamera.frameRate) ?? .nan) {
             showError(msg: "This version supports up to 60 fps. Select a supported frame rate in Settings.")
+            return
+        }
+        if isARKitMode && recorderSettings.lidarDepthEnabled &&
+            (Double(recorderSettings.arkitCamera.frameRate) ?? .infinity) > 30 {
+            showError(msg: "LiDAR capture supports camera frame rates up to 30 fps.")
             return
         }
         recordingTransition = .preparing
@@ -6467,6 +6800,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.lidarDepthRecorder = LiDARDepthStreamRecorder(outputDirectory: self.outDirURL)
                     self.lidarDepthRecorder?.onFailure = { [weak self] reason in self?.sessionQueue.async { self?.reportRecordingFailure(reason) } }
             }
+            self.depthCaptureQueue.sync { self.activeDepthRecorder = self.lidarDepthRecorder }
             self.logRecordingStartStep("lidar_depth_recorder", startClock: startClock)
 
             let sensorOptions = SensorStreamRecorder.Options(
@@ -6530,6 +6864,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
         sessionQueue.async {
             self.captureRecordingActive = false
+            self.depthCaptureQueue.sync { self.activeDepthRecorder = nil }
             self.resetRecordingSamplingState()
             if let wideRecorder = self.wideRecorder {
                 group.enter()
@@ -6715,6 +7050,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         cameraStatusRows["telephoto"] = telephotoBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["front"] = frontBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
         cameraStatusRows["depth"] = depthBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
+        cameraStatusRows["depth"]?.accessibilityIdentifier = "hud.depth.status"
         captureStatusRows["summary"] = summaryBadge.subviewsRecursive().compactMap { $0 as? UILabel }.first
 
         // Mode badge — shows capture mode + tracking state
@@ -6996,6 +7332,29 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         stack.addArrangedSubview(control)
     }
 
+    private func addExposureModeControl(to stack: UIStackView, automatic: Bool, fixedAvailable: Bool) {
+        let state = UISwitch()
+        state.isOn = automatic
+        state.accessibilityIdentifier = "shared.autoExposure"
+        settingsSwitches["shared.autoExposure"] = state
+        let control = UISegmentedControl(items: [SRText("Auto · exposure limit"), SRText("Fixed · time + ISO")])
+        control.accessibilityIdentifier = "settings.exposureMode.shared"
+        control.selectedSegmentIndex = automatic ? 0 : 1
+        control.setEnabled(fixedAvailable, forSegmentAt: 1)
+        control.selectedSegmentTintColor = .secondarySystemGroupedBackground
+        control.backgroundColor = .tertiarySystemFill
+        control.setTitleTextAttributes([.font: settingsFont(12, weight: .medium)], for: .normal)
+        control.heightAnchor.constraint(greaterThanOrEqualToConstant: 38).isActive = true
+        control.addTarget(self, action: #selector(exposureModeSelectionChanged(_:)), for: .valueChanged)
+        stack.addArrangedSubview(control)
+    }
+
+    @objc private func exposureModeSelectionChanged(_ sender: UISegmentedControl) {
+        guard let state = settingsSwitches["shared.autoExposure"] else { return }
+        state.isOn = sender.selectedSegmentIndex == 0
+        autoExposureSwitchChanged(state)
+    }
+
     @objc private func focusModeSelectionChanged(_ sender: UISegmentedControl) {
         guard let prefix = sender.accessibilityIdentifier?.replacingOccurrences(of: "settings.focusMode.", with: ""),
               let state = settingsSwitches["\(prefix).autoFocus"] else { return }
@@ -7149,7 +7508,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
 
     private func settingsFormatSelectionChanged(_ key: String) {
-        guard key.hasSuffix(".resolution") || key.hasSuffix(".frameRate") || key == "shared.maxExposure" else { return }
+        guard key.hasSuffix(".resolution") || key.hasSuffix(".frameRate") ||
+              ["shared.maxExposure", "shared.fixedExposure", "shared.fixedISO"].contains(key) else { return }
         let generation = UUID()
         settingsCapabilityGeneration = generation
         settingsSaveButton?.isEnabled = false
@@ -7295,6 +7655,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             camera.frameRate = reference.frameRate
             camera.autoExposure = reference.autoExposure
             camera.maxExposureDurationMS = reference.maxExposureDurationMS
+            camera.fixedExposureDurationMS = reference.fixedExposureDurationMS
+            camera.fixedISO = reference.fixedISO
             camera.autoFocus = reference.autoFocus
             return camera
         }
@@ -7336,18 +7698,86 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private func commonRateChoices(_ settings: RecorderSettings) -> [String] {
         let cameras = [("wide", settings.wide), ("ultra", settings.ultraWide), ("telephoto", settings.telephoto), ("front", settings.front)].filter { $0.1.enabled }
         let lists = cameras.map { key, camera in
-            Set(frameRateChoices(capabilityFormats(key, settings: settings).filter { formatResolution($0) == camera.resolution },
-                                 ceiling: settings.lidarDepthEnabled ? depthEnabledCameraFrameRateLimit : .greatestFiniteMagnitude))
+            Set(frameRateChoices(capabilityFormats(key, settings: settings).filter { formatResolution($0) == camera.resolution }))
         }
         guard let first = lists.first else { return [] }
-        return lists.dropFirst().reduce(first) { $0.intersection($1) }.sorted { (Double($0) ?? 0) < (Double($1) ?? 0) }
+        return lists.dropFirst().reduce(first) { $0.intersection($1) }
+            .filter { !settings.lidarDepthEnabled || (Double($0) ?? .infinity) <= 30 }
+            .sorted { (Double($0) ?? 0) < (Double($1) ?? 0) }
+    }
+
+    private func fixedExposureChoices(_ settings: RecorderSettings) -> (times: [String], gains: [String]) {
+        let cameras = [("wide", settings.wide), ("ultra", settings.ultraWide),
+                       ("telephoto", settings.telephoto), ("front", settings.front)].filter { $0.1.enabled }
+        guard !cameras.isEmpty else { return ([], []) }
+        let formats = cameras.map { key, camera in
+            capabilityFormats(key, settings: settings).filter {
+                formatResolution($0) == camera.resolution && supportsFPS(clampedFrameRate(from: camera.frameRate), format: $0)
+            }
+        }
+        let currentISO = cameras[0].1.fixedISO ?? 100
+        let currentTime = cameras[0].1.fixedExposureDurationMS ?? 5
+        let timeCandidates: [Double] = Array(Set([0.5, 1, 2, 2.5, 4, 5, 8, 10, 16, 20, 30, currentTime])).sorted()
+        let gainCandidates: [Float] = Array(Set([50, 64, 100, 200, 400, 800, 1600, 3200, currentISO])).sorted()
+        let times = timeCandidates.filter { value in
+            zip(cameras, formats).allSatisfy { entry, options in
+                options.contains { format in
+                    value / 1000 >= CMTimeGetSeconds(format.minExposureDuration) - 0.000001 &&
+                    value / 1000 <= min(CMTimeGetSeconds(format.maxExposureDuration), 1 / clampedFrameRate(from: entry.1.frameRate)) + 0.000001 &&
+                    currentISO >= format.minISO && currentISO <= format.maxISO
+                }
+            }
+        }.map { String(format: "%g", $0) }
+        let gains = gainCandidates.filter { value in
+            zip(cameras, formats).allSatisfy { _, options in
+                options.contains { format in value >= format.minISO && value <= format.maxISO &&
+                    currentTime / 1000 >= CMTimeGetSeconds(format.minExposureDuration) - 0.000001 &&
+                    currentTime / 1000 <= CMTimeGetSeconds(format.maxExposureDuration) + 0.000001 }
+            }
+        }.map { String(format: "%g", $0) }
+        return (times, gains)
+    }
+
+    private func combinationCacheKey(_ draft: RecorderSettings) -> String {
+        let reference = [draft.wide, draft.ultraWide, draft.telephoto, draft.front].first(where: \.enabled) ?? draft.wide
+        return "\(draft.captureMode.rawValue):\(draft.lidarDepthEnabled):\(draft.audioEnabled):" +
+            "\(isAutoExposureEnabled(for: reference)):\(maxExposureDurationLabel(for: reference)):" +
+            "\(reference.fixedExposureDurationMS ?? 0):\(reference.fixedISO ?? 0)"
+    }
+
+    // The last verified menu is useful before the capture queue finishes its
+    // current preview or format work. A versioned cache avoids showing choices
+    // verified against another build or device.
+    private func showCachedCombinationMenu(for draft: RecorderSettings) {
+        guard let button = settingsMenuButtons["cameraCombination"],
+              let data = try? Data(contentsOf: capabilityProbeCacheURL),
+              let saved = try? JSONDecoder().decode(SavedCapabilityProbes.self, from: data),
+              saved.signature == capabilityProbeSignature,
+              let cached = saved.combinations[combinationCacheKey(draft)] else { return }
+        let generation = settingsCapabilityGeneration
+        let groups = Dictionary(grouping: cached) { enabledCameraCount(in: $0.settings) }
+        button.menu = UIMenu(children: groups.keys.sorted().map { count in
+            let title = [1: "Single camera", 2: "Dual cameras", 3: "Triple cameras"][count] ?? "\(count) cameras"
+            return UIMenu(title: SRText(title), options: .displayInline, children: (groups[count] ?? []).map { choice in
+                UIAction(title: SRText(choice.name), state: choice.name == combinationTitle(draft) ? .on : .off) { [weak self] _ in
+                    guard let self, self.settingsCapabilityGeneration == generation else { return }
+                    self.confirmCameraCombination(choice.name == self.combinationTitle(draft) ? draft : choice.settings)
+                }
+            })
+        })
+        button.isEnabled = !cached.isEmpty
+        button.accessibilityHint = SRText("Available camera combinations")
+        #if DEBUG
+        button.accessibilityLabel = "OPTIONS:" + cached.map(\.name).joined(separator: "|")
+        #endif
     }
 
     private func installCombinationMenu(draft: RecorderSettings, generation: UUID, currentVerified: Bool,
                                         onComplete: @escaping () -> Void) {
         guard let button = settingsMenuButtons["cameraCombination"] else { return }
-        button.isEnabled = false
-        if currentVerified {
+        let hasCachedChoices = button.menu?.children.isEmpty == false
+        if !hasCachedChoices { button.isEnabled = false }
+        if currentVerified && !hasCachedChoices {
             let title = combinationTitle(draft)
             button.menu = UIMenu(children: [UIAction(title: SRText(title), state: .on) { _ in }])
             button.isEnabled = true
@@ -7360,6 +7790,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         sessionQueue.async { [weak self, weak button] in
             guard let self else { return }
+            let reference = [draft.wide, draft.ultraWide, draft.telephoto, draft.front].first(where: \.enabled) ?? draft.wide
+            let cacheKey = self.combinationCacheKey(draft)
             var choices: [(String, RecorderSettings)] = currentVerified ? [(self.combinationTitle(draft), draft)] : []
             let candidates = self.combinationCandidates(draft).filter { !currentVerified || $0.0 != self.combinationTitle(draft) }
             func publishChoices(completed: Bool = false) {
@@ -7388,7 +7820,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 }
             }
             func scan(_ index: Int) {
+                guard DispatchQueue.main.sync(execute: { self.settingsCapabilityGeneration == generation && self.settingsOverlayView != nil }) else { return }
                 guard index < candidates.count else {
+                    self.settingsCombinationResults[cacheKey] = choices
+                    self.saveCapabilityProbes()
                     publishChoices(completed: true)
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.settingsCapabilityGeneration == generation,
@@ -7400,14 +7835,24 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 let (title, candidate) = candidates[index]
                 let verified: RecorderSettings? = self.withRestoredCaptureDevices {
                     autoreleasepool {
+                        func stillCurrent() -> Bool {
+                            DispatchQueue.main.sync { self.settingsCapabilityGeneration == generation && self.settingsOverlayView != nil }
+                        }
                         // Keep a working draft when possible; otherwise find a verified
                         // common starting point before offering the new combination.
                         if self.jointConfigurationFits(candidate) { return candidate }
-                        for resolution in self.commonResolutionChoices(candidate).reversed() {
+                        let resolutions = self.commonResolutionChoices(candidate)
+                        let preferred = [reference.resolution, "1280x720", "960x540", "640x480", "1920x1080", "1920x1440"]
+                        let ordered = Array(NSOrderedSet(array: preferred.filter { resolutions.contains($0) } + resolutions.reversed())) as? [String] ?? resolutions
+                        var attempts = 0
+                        for resolution in ordered {
+                            guard stillCurrent() else { return nil }
                             var seed = self.replacingCaptureValue(candidate, key: "shared.resolution", value: resolution)
                             let rates = self.commonRateChoices(seed)
-                            let tries = Array(Set([rates.contains("30") ? "30" : "", rates.first ?? ""])).filter { !$0.isEmpty }
-                            for rate in tries {
+                            for rate in CaptureRateOptions.compatibleOrder(current: "30", choices: rates) {
+                                guard stillCurrent() else { return nil }
+                                guard attempts < 12 else { return nil }
+                                attempts += 1
                                 seed = self.replacingCaptureValue(seed, key: "shared.frameRate", value: rate)
                                 if self.jointConfigurationFits(seed) { return seed }
                             }
@@ -7417,11 +7862,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 }
                 if let verified {
                     choices.append((title, verified))
-                    publishChoices()
+                    if choices.count == 1 || choices.count.isMultiple(of: 4) { publishChoices() }
                 }
                 // Yield between hardware probes so edits and Save can use the
                 // capture queue without waiting for every combination.
                 self.sessionQueue.async { scan(index + 1) }
+            }
+            if let cached = self.settingsCombinationResults[cacheKey] {
+                choices = cached
+                if currentVerified {
+                    choices.removeAll { $0.0 == self.combinationTitle(draft) }
+                    choices.insert((self.combinationTitle(draft), draft), at: 0)
+                }
+                publishChoices(completed: true)
+                DispatchQueue.main.async(execute: onComplete)
+                return
             }
             scan(0)
         }
@@ -7429,6 +7884,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func synchronizationDescription(_ settings: RecorderSettings) -> String {
         let cameras = enabledPhysicalCameras(settings)
+        if settings.captureMode == .standardFree { return "Independent camera streams · original timestamps" }
         let rear = cameras.subtracting([.front])
         if cameras.count <= 1 { return "Single camera" }
         let names = PhysicalCamera.allCases.filter { rear.contains($0) }.map(\.displayName).joined(separator: " + ")
@@ -7437,7 +7893,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return "Timestamp alignment · no hardware sync"
     }
 
-    private func confirmCameraCombination(_ candidate: RecorderSettings) {
+    private func confirmCameraCombination(_ verified: RecorderSettings) {
+        var candidate = verified
+        let current = settingsDraft()
+        for camera in PhysicalCamera.allCases {
+            switch camera {
+            case .wide:
+                candidate.wide.autoFocus = current.wide.autoFocus
+                candidate.wide.fixedFocusLensPosition = current.wide.fixedFocusLensPosition
+            case .ultraWide:
+                candidate.ultraWide.autoFocus = current.ultraWide.autoFocus
+                candidate.ultraWide.fixedFocusLensPosition = current.ultraWide.fixedFocusLensPosition
+            case .telephoto:
+                candidate.telephoto.autoFocus = current.telephoto.autoFocus
+                candidate.telephoto.fixedFocusLensPosition = current.telephoto.fixedFocusLensPosition
+            case .front:
+                candidate.front.autoFocus = current.front.autoFocus
+                candidate.front.fixedFocusLensPosition = current.front.fixedFocusLensPosition
+            }
+        }
+        if candidate.captureMode == .standardFree { rebuildCameraSettings(candidate); return }
         guard candidate.front.enabled && enabledCameraCount(in: candidate) > 1 else { rebuildCameraSettings(candidate); return }
         let rear = enabledPhysicalCameras(candidate).subtracting([.front])
         let message = synchronizationDescription(candidate) + "\n\n" + (rear.count > 1
@@ -7449,19 +7924,20 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         (settingsController ?? self).present(alert, animated: true)
     }
 
-    private func rebuildCameraSettings(_ draft: RecorderSettings) {
+    private func rebuildCameraSettings(_ draft: RecorderSettings, adjustResolution: Bool = false) {
         guard let container = settingsCameraContainer else { return }
         container.arrangedSubviews.forEach { $0.removeFromSuperview() }
         let prefixes = ["wide.", "ultra.", "telephoto.", "front.", "arkit.", "shared.", "depth."]
         settingsMenuButtons = settingsMenuButtons.filter { item in !prefixes.contains(where: { item.key.hasPrefix($0) }) && item.key != "cameraCombination" }
-        settingsSwitches = settingsSwitches.filter { item in !prefixes.contains(where: { item.key.hasPrefix($0) }) && item.key != "lidarDepth" }
+        settingsSwitches = settingsSwitches.filter { item in !prefixes.contains(where: { item.key.hasPrefix($0) }) }
         settingsSliders.removeAll()
         settingsSliderValueLabels.removeAll()
         cameraSettingsGroups.removeAll()
-        populateCameraSettings(container: container, isARKMode: false, arkitAvailable: ARWorldTrackingConfiguration.isSupported, configuration: draft)
+        populateCameraSettings(container: container, isARKMode: false, arkitAvailable: ARWorldTrackingConfiguration.isSupported,
+                               configuration: draft, adjustResolution: adjustResolution)
     }
 
-    private func updateCameraResolutionMenus(adjustFrameRate: Bool = true) {
+    private func updateCameraResolutionMenus(adjustFrameRate: Bool = true, adjustResolution: Bool = false) {
         guard settingsMenuButtons["captureMode"]?.accessibilityValue != "ARKit" else { return }
         settingsCapabilityGeneration = UUID()
         let generation = settingsCapabilityGeneration
@@ -7469,7 +7945,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         settingsSaveButton?.isEnabled = false
         settingsValidationLabel?.text = SRText("Checking configuration…")
         settingsValidationLabel?.isHidden = false
-        settingsRetryButton?.isHidden = true
         let valueKeys = ["shared.resolution", "shared.frameRate"]
         for key in valueKeys {
             settingsMenuHasCandidates[key] = false
@@ -7488,6 +7963,27 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     let candidate = self.replacingCaptureValue(draft, key: "shared.frameRate", value: rate)
                     if self.jointConfigurationFits(candidate) { return candidate }
                 }
+                for resolution in self.commonResolutionChoices(draft) where resolution != draft.wide.resolution {
+                    let sized = self.replacingCaptureValue(draft, key: "shared.resolution", value: resolution)
+                    for rate in CaptureRateOptions.compatibleOrder(current: current, choices: self.commonRateChoices(sized)) {
+                        let candidate = self.replacingCaptureValue(sized, key: "shared.frameRate", value: rate)
+                        if self.jointConfigurationFits(candidate) { return candidate }
+                    }
+                }
+                if self.enabledCameraCount(in: draft) > 1 {
+                    var single = draft
+                    single.wide.enabled = true
+                    single.ultraWide.enabled = false
+                    single.telephoto.enabled = false
+                    single.front.enabled = false
+                    for resolution in self.commonResolutionChoices(single) {
+                        let sized = self.replacingCaptureValue(single, key: "shared.resolution", value: resolution)
+                        for rate in CaptureRateOptions.compatibleOrder(current: current, choices: self.commonRateChoices(sized)) {
+                            let candidate = self.replacingCaptureValue(sized, key: "shared.frameRate", value: rate)
+                            if self.jointConfigurationFits(candidate) { return candidate }
+                        }
+                    }
+                }
                 return nil
             }
             let effective = compatible ?? draft
@@ -7495,14 +7991,46 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let rateCandidates = self.commonRateChoices(effective)
             DispatchQueue.main.async {
                 guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { return }
-                let valid = compatible != nil
+                guard let compatible else {
+                    let saved = self.recorderSettings
+                    if self.combinationTitle(draft) == self.combinationTitle(saved) &&
+                        draft.lidarDepthEnabled == saved.lidarDepthEnabled && draft.audioEnabled == saved.audioEnabled &&
+                        draft.wide.resolution == saved.wide.resolution && draft.wide.frameRate == saved.wide.frameRate {
+                        self.settingsValidationLabel?.isHidden = true
+                        self.settingsSaveButton?.isEnabled = false
+                        return
+                    }
+                    self.settingsSwitches["lidarDepth"]?.isOn = self.recorderSettings.lidarDepthEnabled
+                    self.settingsSwitches["audio"]?.isOn = self.recorderSettings.audioEnabled
+                    self.rebuildCameraSettings(self.recorderSettings)
+                    return
+                }
+                if self.enabledCameraCount(in: compatible) != self.enabledCameraCount(in: draft) ||
+                    self.combinationTitle(compatible) != self.combinationTitle(draft) {
+                    self.rebuildCameraSettings(compatible)
+                    return
+                }
+                let valid = true
                 if let reference = [effective.wide, effective.ultraWide, effective.telephoto, effective.front].first(where: \.enabled) {
+                    self.settingsMenuButtons["shared.resolution"]?.accessibilityValue = reference.resolution
                     self.settingsMenuButtons["shared.frameRate"]?.accessibilityValue = reference.frameRate
+                    if let limitButton = self.settingsMenuButtons["shared.maxExposure"] {
+                        let choices = self.autoExposureLimitChoices(frameRate: reference.frameRate)
+                        let current = limitButton.accessibilityValue ?? self.maxExposureDurationLabel(for: reference)
+                        let selected = CaptureRateOptions.compatibleOrder(current: current, choices: choices).first ?? "1"
+                        limitButton.accessibilityValue = selected
+                        limitButton.configuration = self.settingsMenuConfiguration(title: selected, compact: true)
+                        limitButton.menu = UIMenu(children: choices.map { value in
+                            UIAction(title: value, state: value == selected ? .on : .off) { [weak self, weak limitButton] _ in
+                                limitButton?.accessibilityValue = value
+                                limitButton?.configuration = self?.settingsMenuConfiguration(title: value, compact: true)
+                                self?.settingsFormatSelectionChanged("shared.maxExposure")
+                            }
+                        })
+                    }
                 }
                 self.settingsValidationLabel?.isHidden = valid
-                self.settingsValidationLabel?.text = valid ? nil : SRText("Configuration unavailable. Choose supported values or retry.")
-                self.settingsValidationLabel?.textColor = .systemRed
-                self.settingsRetryButton?.isHidden = valid
+                self.settingsValidationLabel?.text = nil
                 // Rebuild both menus from the same resolved pair, never the
                 // transient new-resolution/old-rate draft.
                 let enableSaveWhenReady = { [weak self] in
@@ -7511,10 +8039,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 }
                 self.settingsSaveButton?.isEnabled = valid
                 self.installVerifiedMenu(key: "shared.frameRate", candidates: rateCandidates, draft: effective, generation: generation, onReady: enableSaveWhenReady)
-                self.installCombinationMenu(draft: effective, generation: generation, currentVerified: valid) { [weak self] in
-                    self?.installVerifiedMenu(key: "shared.resolution", candidates: resolutionCandidates,
-                                              draft: effective, generation: generation, onReady: enableSaveWhenReady)
+                self.installVerifiedMenu(key: "shared.resolution", candidates: resolutionCandidates,
+                                         draft: effective, generation: generation, onReady: enableSaveWhenReady)
+                if let reference = [effective.wide, effective.ultraWide, effective.telephoto, effective.front].first(where: \.enabled),
+                   !self.isAutoExposureEnabled(for: reference) {
+                    let choices = self.fixedExposureChoices(effective)
+                    self.installVerifiedMenu(key: "shared.fixedExposure", candidates: choices.times,
+                                             draft: effective, generation: generation)
+                    self.installVerifiedMenu(key: "shared.fixedISO", candidates: choices.gains,
+                                             draft: effective, generation: generation)
                 }
+                self.installCombinationMenu(draft: effective, generation: generation, currentVerified: valid) {}
                 for key in valueKeys {
                     let title = self.settingsMenuHasCandidates[key] != true ? "Not available"
                         : valid ? self.settingsMenuButtons[key]?.accessibilityValue ?? "Choose…" : "Choose…"
@@ -7535,7 +8070,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let autoExposureEnabled = settingsSwitches["\(keyPrefix).autoExposure"]?.isOn ?? true
         let enabled = cameraEnabled && autoExposureEnabled
         button.isEnabled = enabled
-        button.alpha = enabled ? 1.0 : 0.6
+        button.superview?.isHidden = !autoExposureEnabled
+        for key in ["\(keyPrefix).fixedExposure", "\(keyPrefix).fixedISO"] {
+            let fixed = settingsMenuButtons[key]
+            fixed?.superview?.isHidden = autoExposureEnabled
+            fixed?.isEnabled = cameraEnabled && !autoExposureEnabled
+        }
     }
 
     private func updateFixedFocusControlState(keyPrefix: String, cameraEnabled: Bool) {
@@ -7700,11 +8240,25 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         ])
 
         let arkitAvailable = ARWorldTrackingConfiguration.isSupported
-        let initialMode = recorderSettings.captureMode == .arkit && arkitAvailable ? "ARKit" : "Standard"
+        let initialMode = recorderSettings.captureMode == .arkit && arkitAvailable ? "ARKit"
+            : recorderSettings.captureMode == .standardFree ? "Standard · Free" : "Standard · Hardware Sync"
 
-        let account = addSettingsCard(to: stack, title: "Account", icon: "person.crop.circle", identifier: "account")
-        addPurchaseSection(to: account)
         let modeCard = addSettingsCard(to: stack, title: "Mode", icon: "square.stack.3d.up", identifier: "mode")
+        let modeHelp = UIButton(type: .system)
+        modeHelp.setImage(UIImage(systemName: "questionmark.circle"), for: .normal)
+        modeHelp.accessibilityIdentifier = "settings.mode.help"
+        modeHelp.accessibilityLabel = SRText("Explain capture modes")
+        modeHelp.addAction(UIAction { [weak self] _ in
+            let message = SRText("Standard · Hardware Sync: supported rear cameras share a hardware-timed capture group.\n\nStandard · Free: supported cameras run independently with original timestamps.\n\nARKit: world tracking and its camera stream use ARKit timing.")
+            let alert = UIAlertController(title: SRText("Capture Modes"), message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: SRText("OK"), style: .default))
+            (self?.settingsController ?? self)?.present(alert, animated: true)
+        }, for: .touchUpInside)
+        if let heading = modeCard.arrangedSubviews.first as? UIStackView {
+            heading.addArrangedSubview(UIView())
+            heading.addArrangedSubview(modeHelp)
+        }
+        addSensorMatrix(to: stack, settings: recorderSettings, lidarAvailable: cameraCapabilities().hasLiDAR)
 
         // Camera section container — rebuilt when mode changes
         let cameraContainer = UIStackView()
@@ -7715,23 +8269,26 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             to: modeCard,
             key: "captureMode",
             title: "",
-            items: arkitAvailable ? ["Standard", "ARKit"] : ["Standard"],
+            items: arkitAvailable ? ["Standard · Hardware Sync", "Standard · Free", "ARKit"] : ["Standard · Hardware Sync", "Standard · Free"],
             selectedValue: initialMode,
             compact: false,
             vertical: true,
             onChange: { [weak self, weak cameraContainer] newMode in
                 guard let self = self, let cameraContainer = cameraContainer else { return }
                 let isARK = newMode == "ARKit"
+                var staged = self.settingsDraft()
+                staged.captureMode = isARK ? .arkit : newMode == "Standard · Free" ? .standardFree : .standard
                 self.settingsCapabilityGeneration = UUID()
                 self.settingsValidationLabel = nil
                 self.settingsSaveButton?.isEnabled = true
                 cameraContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
                 self.cameraSettingsGroups.removeAll()
-                self.settingsSwitches = self.settingsSwitches.filter { !$0.key.hasPrefix("shared.") && !$0.key.hasPrefix("depth.") && $0.key != "lidarDepth" && !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
+                self.settingsSwitches = self.settingsSwitches.filter { !$0.key.hasPrefix("shared.") && !$0.key.hasPrefix("depth.") && !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
                 self.settingsSliders = self.settingsSliders.filter { !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
                 self.settingsSliderValueLabels = self.settingsSliderValueLabels.filter { !$0.key.hasPrefix("wide.") && !$0.key.hasPrefix("ultra.") && !$0.key.hasPrefix("telephoto.") && !$0.key.hasPrefix("front.") && !$0.key.hasPrefix("arkit.") }
                 self.settingsMenuButtons = self.settingsMenuButtons.filter { $0.key == "captureMode" }
-                self.populateCameraSettings(container: cameraContainer, isARKMode: isARK, arkitAvailable: arkitAvailable)
+                self.populateCameraSettings(container: cameraContainer, isARKMode: isARK, arkitAvailable: arkitAvailable,
+                                            configuration: staged)
             }
         )
         if !arkitAvailable {
@@ -7742,13 +8299,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         self.settingsCameraContainer = cameraContainer
         self.populateCameraSettings(container: cameraContainer, isARKMode: initialMode == "ARKit", arkitAvailable: arkitAvailable)
 
-        let sensors = addSettingsCard(to: stack, title: "Sensors", icon: "waveform.path", identifier: "sensors")
-        let sensorRows = [("imu", "IMU", recorderSettings.imuEnabled), ("motion", "Motion", recorderSettings.deviceMotionEnabled),
-                          ("mag", "Magnetometer", recorderSettings.magnetometerEnabled), ("baro", "Barometer", recorderSettings.barometerEnabled),
-                          ("geo", "Location", recorderSettings.geoLocationEnabled), ("audio", "Audio", recorderSettings.audioEnabled)]
-        for (key, title, value) in sensorRows {
-            addSettingsRow(to: sensors, key: key, title: title, detail: "", isOn: value)
-        }
+        let account = addSettingsCard(to: stack, title: "Account", icon: "person.crop.circle", identifier: "account")
+        addPurchaseSection(to: account)
         let developer = addSettingsCard(to: stack, title: "Developer", icon: "person.crop.square", identifier: "developer")
         var brandConfiguration = UIButton.Configuration.plain()
         brandConfiguration.title = "TinyGrapeLab"
@@ -7770,15 +8322,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }, for: .touchUpInside)
         developer.addArrangedSubview(info)
         addSettingsActionButtons(to: actionBar)
-        present(controller, animated: true)
+        present(controller, animated: false)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             scrollView.flashScrollIndicators()
         }
     }
 
-    private func populateCameraSettings(container: UIStackView, isARKMode: Bool, arkitAvailable: Bool, configuration: RecorderSettings? = nil) {
+    private func populateCameraSettings(container: UIStackView, isARKMode: Bool, arkitAvailable: Bool,
+                                        configuration: RecorderSettings? = nil, adjustResolution: Bool = false) {
         let capabilities = cameraCapabilities()
+        var config = configuration ?? recorderSettings
+        if settingsMenuButtons["captureMode"]?.accessibilityValue == "Standard · Free" { config.captureMode = .standardFree }
 
         if isARKMode {
             let captureCard = addSettingsCard(to: container, title: "AR Camera", icon: "camera", identifier: "camera")
@@ -7793,9 +8348,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 available: arkitAvailable,
                 unavailableReason: arkitAvailable ? nil : "ARKit not available"
             )
-            addDepthSettingsCard(to: container, enabled: recorderSettings.lidarDepthEnabled, available: capabilities.hasLiDAR)
         } else {
-            let config = configuration ?? recorderSettings
             let cameras = [("wide", "Wide", config.wide, capabilities.hasWide, defaultWideFixedFocusLensPosition),
                            ("ultra", "Ultra Wide", config.ultraWide, capabilities.hasUltraWide, defaultUltraWideFixedFocusLensPosition),
                            ("telephoto", "Telephoto", config.telephoto, capabilities.hasTelephoto, defaultTelephotoFixedFocusLensPosition),
@@ -7808,6 +8361,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             settingsValidationLabel = validation
             addSettingsMenuRow(to: cameraCard, key: "cameraCombination", title: "Camera combination", items: [],
                                selectedValue: combinationTitle(config), compact: true, vertical: true)
+            showCachedCombinationMenu(for: config)
             for (key, _, camera, available, _) in cameras {
                 let state = UISwitch()
                 state.isOn = camera.enabled && available
@@ -7829,12 +8383,6 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             enableSettingsTextWrapping(synchronizationLabel)
             cameraCard.addArrangedSubview(synchronizationLabel)
             cameraCard.addArrangedSubview(validation)
-            let retry = makePurchaseButton(title: "Retry", backgroundColor: .tertiarySystemFill, foregroundColor: .systemBlue)
-            retry.accessibilityIdentifier = "settings.retry"
-            retry.isHidden = true
-            retry.addTarget(self, action: #selector(recheckCaptureCapabilities), for: .touchUpInside)
-            cameraCard.addArrangedSubview(retry)
-            settingsRetryButton = retry
             let captureCard = addSettingsCard(to: container, title: "Capture", icon: "slider.horizontal.3", identifier: "capture")
             let dimensions = UIStackView()
             dimensions.axis = .vertical
@@ -7847,17 +8395,38 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 dimensions.addArrangedSubview(field)
             }
             captureCard.addArrangedSubview(dimensions)
-            addSettingsRow(to: captureCard, key: "shared.autoExposure", title: "Auto exposure", detail: "", isOn: isAutoExposureEnabled(for: reference))
-            addSettingsMenuRow(to: captureCard, key: "shared.maxExposure", title: "Max exposure (ms)", items: ["1", "5", "10", "20", "30"], selectedValue: maxExposureDurationLabel(for: reference), compact: true, vertical: false)
+            let fixedExposureAvailable: Bool = {
+                if enabled.count > 1 {
+                    guard let groups = MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(config),
+                                                                          depthEnabled: config.lidarDepthEnabled,
+                                                                          freeRunning: config.captureMode == .standardFree) else { return false }
+                    return groups.allSatisfy { $0.device.isExposureModeSupported(.custom) }
+                }
+                guard let key = enabled.first?.0, let device = settingsDevice(key, settings: config) else { return false }
+                return device.isExposureModeSupported(.custom)
+            }()
+            addExposureModeControl(to: captureCard, automatic: isAutoExposureEnabled(for: reference),
+                                   fixedAvailable: fixedExposureAvailable)
+            if !fixedExposureAvailable {
+                addSettingsFootnote(to: captureCard, text: "Fixed exposure is unavailable for this camera combination.")
+            }
+            addSettingsMenuRow(to: captureCard, key: "shared.maxExposure", title: "Max exposure (ms)",
+                               items: autoExposureLimitChoices(frameRate: reference.frameRate),
+                               selectedValue: maxExposureDurationLabel(for: reference), compact: true, vertical: false)
+            addSettingsMenuRow(to: captureCard, key: "shared.fixedExposure", title: "Exposure time (ms)", items: [],
+                               selectedValue: String(reference.fixedExposureDurationMS ?? 5), compact: true, vertical: false)
+            addSettingsMenuRow(to: captureCard, key: "shared.fixedISO", title: "Gain · ISO", items: [],
+                               selectedValue: String(reference.fixedISO ?? 100), compact: true, vertical: false)
             updateAutoExposureControlState(keyPrefix: "shared", cameraEnabled: !enabled.isEmpty)
             let focusCard = addSettingsCard(to: container, title: "Focus", icon: "viewfinder", identifier: "focus")
             if enabled.count > 1 {
-                let groups = MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(config)) ?? []
+                let groups = MultiCameraCaptureGraph.inputGroups(for: enabledPhysicalCameras(config), depthEnabled: config.lidarDepthEnabled,
+                                                                  freeRunning: config.captureMode == .standardFree) ?? []
                 if groups.contains(where: { $0.device.isFocusModeSupported(.continuousAutoFocus) && $0.device.isFocusModeSupported(.locked) }) {
-                    addFocusModeControl(to: focusCard, keyPrefix: "shared", automatic: reference.autoFocus, manualTitle: "Lock current focus")
-                    for group in groups where group.device.isLockingFocusWithCustomLensPositionSupported {
-                        guard let camera = PhysicalCamera.allCases.first(where: { group.cameras.contains($0) }) else { continue }
-                        let key = group.cameras.count > 1 ? "shared" : camera.settingsKey
+                    addFocusModeControl(to: focusCard, keyPrefix: "shared", automatic: reference.autoFocus, manualTitle: "Manual")
+                    for group in groups {
+                        guard group.device.isLockingFocusWithCustomLensPositionSupported,
+                              let camera = group.cameras.first else { continue }
                         let stored: CameraCaptureSettings
                         switch camera {
                         case .wide: stored = config.wide
@@ -7865,10 +8434,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         case .telephoto: stored = config.telephoto
                         case .front: stored = config.front
                         }
-                        addSettingsSliderRow(to: focusCard, key: "\(key).fixedFocus",
-                                             title: group.cameras.count > 1 ? "Rear Focus Position" : "\(camera.displayName) Focus Position",
-                                             value: clampedLensPosition(stored.fixedFocusLensPosition, fallback: camera == .ultraWide ? defaultUltraWideFixedFocusLensPosition : defaultWideFixedFocusLensPosition), compact: true)
-                        updateFixedFocusControlState(keyPrefix: key, cameraEnabled: true)
+                        let isSharedRear = group.cameras.count > 1
+                        let sliderKey = isSharedRear ? "shared.fixedFocus" : "\(camera.settingsKey).fixedFocus"
+                        addSettingsSliderRow(to: focusCard, key: sliderKey,
+                                             title: isSharedRear ? "Rear Focus Position" : "\(camera.displayName) Focus Position",
+                                             value: clampedLensPosition(stored.fixedFocusLensPosition,
+                                                 fallback: camera == .ultraWide ? defaultUltraWideFixedFocusLensPosition : defaultWideFixedFocusLensPosition), compact: true)
+                        updateFixedFocusControlState(keyPrefix: isSharedRear ? "shared" : camera.settingsKey, cameraEnabled: true)
+                    }
+                    if groups.contains(where: { group in group.cameras.count > 1 && !group.device.isLockingFocusWithCustomLensPositionSupported }) {
+                        addSettingsFootnote(to: focusCard, text: "Synchronized rear cameras can lock current focus; focus positions are unavailable for this combination.")
                     }
                 } else {
                     addSettingsFootnote(to: focusCard, text: "Fixed-focus lenses")
@@ -7880,9 +8455,60 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                                              available: available, unavailableReason: nil)
                 }
             }
-            addDepthSettingsCard(to: container, enabled: config.lidarDepthEnabled, available: capabilities.hasLiDAR)
-                updateCameraResolutionMenus()
+            updateCameraResolutionMenus(adjustResolution: adjustResolution)
         }
+    }
+
+    private func addSensorMatrix(to container: UIStackView, settings: RecorderSettings, lidarAvailable: Bool) {
+        let card = addSettingsCard(to: container, title: "Sensors", icon: "waveform.path", identifier: "sensors")
+        let rows: [(String, String, Bool, Bool)] = [
+            ("camera", "Camera", true, false),
+            ("lidarDepth", "LiDAR", settings.lidarDepthEnabled, lidarAvailable),
+            ("imu", "IMU", settings.imuEnabled, true),
+            ("motion", "Motion", settings.deviceMotionEnabled, true),
+            ("mag", "Magnetometer", settings.magnetometerEnabled, true),
+            ("baro", "Barometer", settings.barometerEnabled, true),
+            ("geo", "Location", settings.geoLocationEnabled, true),
+            ("audio", "Audio", settings.audioEnabled, true)
+        ]
+        let matrix = UIStackView()
+        matrix.axis = .vertical
+        matrix.spacing = 6
+        for start in stride(from: 0, to: rows.count, by: 4) {
+            let line = UIStackView()
+            line.axis = .horizontal
+            line.distribution = .fillEqually
+            line.spacing = 6
+            for index in start..<(start + 4) {
+                let cell = UIStackView()
+                cell.axis = .vertical
+                cell.alignment = .center
+                cell.spacing = 0
+                cell.isLayoutMarginsRelativeArrangement = true
+                cell.layoutMargins = UIEdgeInsets(top: 3, left: 2, bottom: 3, right: 2)
+                cell.backgroundColor = .secondarySystemGroupedBackground
+                cell.layer.cornerRadius = 9
+                cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 54).isActive = true
+                if index < rows.count {
+                    let (key, title, value, enabled) = rows[index]
+                    let label = UILabel()
+                    label.text = SRText(title)
+                    label.font = settingsFont(11, weight: .medium)
+                    label.adjustsFontSizeToFitWidth = true
+                    label.minimumScaleFactor = 0.8
+                    label.textAlignment = .center
+                    label.lineBreakMode = .byClipping
+                    let toggle = makeSettingsSwitch(key: key, isOn: value, enabled: enabled)
+                    toggle.transform = CGAffineTransform(scaleX: 0.68, y: 0.68)
+                    toggle.setContentHuggingPriority(.required, for: .horizontal)
+                    cell.addArrangedSubview(label)
+                    cell.addArrangedSubview(toggle)
+                }
+                line.addArrangedSubview(cell)
+            }
+            matrix.addArrangedSubview(line)
+        }
+        card.addArrangedSubview(matrix)
     }
 
     private func addPurchaseSection(to stack: UIStackView) {
@@ -8050,17 +8676,84 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return sensorSwitch
     }
 
-    private func addDepthSettingsCard(to stack: UIStackView, enabled: Bool, available: Bool) {
+    private func addDepthSettingsCard(to stack: UIStackView, enabled: Bool, available: Bool,
+                                      incompatibleCombination: Bool = false) {
         let card = addSettingsCard(to: stack, title: "LiDAR Depth", icon: "viewfinder.circle", identifier: "lidar")
         let toggle = makeSettingsSwitch(key: "lidarDepth", isOn: enabled && available, enabled: available)
         toggle.accessibilityLabel = "LiDAR Depth"
         (card.arrangedSubviews.first as? UIStackView)?.addArrangedSubview(toggle)
         if !available { addSettingsFootnote(to: card, text: "No LiDAR sensor on this device.") }
+        else if incompatibleCombination { addSettingsFootnote(to: card, text: "Enabling LiDAR adjusts the camera configuration.") }
     }
 
     @objc private func depthEnabledSwitchChanged(_ sender: UISwitch) {
-        guard settingsMenuButtons["captureMode"]?.accessibilityValue != "ARKit" else { return }
-        rebuildCameraSettings(settingsDraft())
+        if settingsMenuButtons["captureMode"]?.accessibilityValue == "ARKit" {
+            let previousRate = settingsMenuButtons["arkit.frameRate"]?.accessibilityValue
+            updateARKitFrameRateMenu()
+            settingsSaveButton?.isEnabled = true
+            if sender.isOn, previousRate != settingsMenuButtons["arkit.frameRate"]?.accessibilityValue {
+                let message = SRText("LiDAR selected. Frame rate changed to 30 fps or lower.")
+                let alert = UIAlertController(title: SRText("Capture Configuration Updated"), message: message, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: SRText("OK"), style: .default))
+                (settingsController ?? self).present(alert, animated: true)
+            }
+            return
+        }
+        let previous = settingsDraft()
+        guard sender.isOn else {
+            rebuildCameraSettings(previous)
+            return
+        }
+        settingsSaveButton?.isEnabled = false
+        settingsValidationLabel?.text = SRText("Checking configuration…")
+        settingsValidationLabel?.isHidden = false
+        let generation = UUID()
+        settingsCapabilityGeneration = generation
+        sessionQueue.async {
+            let compatible: RecorderSettings? = self.withRestoredCaptureDevices {
+                let requested = previous.wide.frameRate
+                var fallback = previous
+                fallback.ultraWide.enabled = false
+                fallback.telephoto.enabled = false
+                fallback.front.enabled = false
+                fallback.wide.enabled = true
+                for candidate in [previous, fallback] {
+                    guard self.isCameraSetSupportedByMultiCam(settings: candidate) else { continue }
+                    let resolutions = self.commonResolutionChoices(candidate)
+                    let orderedResolutions = resolutions.contains(previous.wide.resolution)
+                        ? [previous.wide.resolution] + resolutions.filter { $0 != previous.wide.resolution }
+                        : resolutions
+                    for resolution in orderedResolutions {
+                        let sized = self.replacingCaptureValue(candidate, key: "shared.resolution", value: resolution)
+                        for rate in CaptureRateOptions.compatibleOrder(current: requested, choices: self.commonRateChoices(sized)) {
+                            let option = self.replacingCaptureValue(sized, key: "shared.frameRate", value: rate)
+                            if self.jointConfigurationFits(option) { return option }
+                        }
+                    }
+                }
+                return nil
+            }
+            DispatchQueue.main.async {
+                guard self.settingsCapabilityGeneration == generation, self.settingsOverlayView != nil else { return }
+                guard let compatible else {
+                    sender.isOn = false
+                    self.rebuildCameraSettings(self.recorderSettings)
+                    return
+                }
+                let before = [previous.wide, previous.ultraWide, previous.telephoto, previous.front].first(where: \.enabled) ?? previous.wide
+                let after = [compatible.wide, compatible.ultraWide, compatible.telephoto, compatible.front].first(where: \.enabled) ?? compatible.wide
+                let changed = self.combinationTitle(previous) != self.combinationTitle(compatible) ||
+                    before.resolution != after.resolution || before.frameRate != after.frameRate
+                self.rebuildCameraSettings(compatible)
+                if changed {
+                    let message = String(format: SRText("LiDAR selected. Capture changed to %@, %@ at %@ fps."),
+                                         SRText(self.combinationTitle(compatible)), after.resolution, after.frameRate)
+                    let alert = UIAlertController(title: SRText("Capture Configuration Updated"), message: message, preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: SRText("OK"), style: .default))
+                    (self.settingsController ?? self).present(alert, animated: true)
+                }
+            }
+        }
     }
 
     @objc private func captureSensorChanged(_ sender: UISwitch) {
@@ -8127,9 +8820,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     @objc private func saveSettingsOverlay() {
+        settingsSaveButton?.isEnabled = false
         let captureMode: CaptureMode = {
             let modeValue = settingsMenuButtons["captureMode"]?.accessibilityValue ?? "Standard"
-            return modeValue == "ARKit" ? .arkit : .standard
+            return modeValue == "ARKit" ? .arkit : modeValue == "Standard · Free" ? .standardFree : .standard
         }()
 
         let arkitCameraSettings = CameraCaptureSettings(
@@ -8160,15 +8854,32 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         updatedSettings.barometerEnabled = settingsSwitches["baro"]?.isOn ?? draft.barometerEnabled
         updatedSettings.geoLocationEnabled = settingsSwitches["geo"]?.isOn ?? draft.geoLocationEnabled
         updatedSettings.deviceMotionEnabled = settingsSwitches["motion"]?.isOn ?? draft.deviceMotionEnabled
+        if updatedSettings == recorderSettings {
+            settingsCapabilityGeneration = UUID()
+            settingsOverlayView?.isUserInteractionEnabled = true
+            settingsSaveButton?.isEnabled = true
+            hideSettingsOverlay()
+            return
+        }
         if captureMode == .arkit && !CaptureRateOptions.isWithinProductLimit(Double(arkitCameraSettings.frameRate) ?? .nan) {
+            settingsSaveButton?.isEnabled = true
             showError(msg: "This version supports up to 60 fps. Select a supported frame rate in Settings.")
             return
         }
-        if updatedSettings.captureMode == .standard, let issue = standardConfigurationIssue(updatedSettings) {
+        if captureMode == .arkit && updatedSettings.lidarDepthEnabled &&
+            (Double(arkitCameraSettings.frameRate) ?? .infinity) > 30 {
+            settingsSaveButton?.isEnabled = true
+            showError(msg: "LiDAR capture supports camera frame rates up to 30 fps.")
+            return
+        }
+        if updatedSettings.captureMode.usesStandardCapture, let issue = standardConfigurationIssue(updatedSettings) {
+            settingsSaveButton?.isEnabled = true
             showError(msg: issue)
             return
         }
-        if updatedSettings.captureMode == .standard {
+        settingsCapabilityGeneration = UUID()
+        sessionQueue.async { self.saveCapabilityProbes() }
+        if updatedSettings.captureMode.usesStandardCapture {
             let previous = recorderSettings
             settingsOverlayView?.isUserInteractionEnabled = false
             recorderSettings = updatedSettings
@@ -8215,6 +8926,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 self.observesSessionRuntimeErrors = false
             }
             self.session.stopRunning()
+            self.lidarDepthOutput?.setDelegate(nil, callbackQueue: nil)
+            self.depthCaptureQueue.sync { self.activeDepthRecorder = nil }
             self.standardSynchronizer?.setDelegate(nil, queue: nil)
             self.standardSynchronizer = nil
             self.multiCameraGraph?.close()
@@ -8249,6 +8962,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.lidarDepthFrameCount = 0
             self.firstDepthSensorSec = nil
             self.latestDepthSensorSec = nil
+            self.latestDepthResolution = nil
+            self.depthPreviewPresentedCount = 0
+            self.firstDepthPreviewSec = nil
+            self.latestDepthPreviewSec = nil
+            self.lastDepthPreviewSubmissionSec = 0
 
             // ARKit releases the camera asynchronously after pause. Starting
             // a new ARSession immediately can retain the previous 30 fps
@@ -8302,6 +9020,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                           let configuration = self.arkitConfiguration else { return }
                     paused.delegate = self
                     paused.run(configuration)
+                }
+            } else if !self.isARKitMode {
+                self.sessionQueue.async {
+                    if self.isConfigured && !self.session.isRunning && self.needsRunningCaptureSession {
+                        self.session.startRunning()
+                    }
                 }
             }
             self.updateAuxiliaryRailButtons(isRecording: self.isRecording)
@@ -8480,7 +9204,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             badge.layer.borderColor = isRecording ? UIColor.systemTeal.withAlphaComponent(0.5).cgColor : UIColor.white.withAlphaComponent(0.15).cgColor
         } else {
             label.attributedText = nil
-            label.text = SRText("Standard")
+            label.text = SRText(recorderSettings.captureMode == .standardFree ? "Standard · Free" : "Standard · Hardware Sync")
             label.textColor = .secondaryLabel
             badge.layer.borderColor = UIColor.separator.cgColor
         }
@@ -8521,28 +9245,33 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard recorderSettings.lidarDepthEnabled else {
             return SRText("DEPTH OFF")
         }
+        let resolution = latestDepthResolution ?? "--"
         if isARKitMode {
-            let resolution = recorderSettings.arkitCamera.resolution
-            return "DEPTH \(resolution) | \(depthStatusValue())"
+            return "DEPTH \(resolution)\n\(SRText("Capture")) \(depthStatusValue())"
         }
-        guard let output = lidarDepthOutput else {
+        guard lidarDepthOutput != nil else {
             return "DEPTH --"
         }
-        let dimensions = output.connections.first?.inputPorts.first?.formatDescription
-            .map(CMVideoFormatDescriptionGetDimensions)
-        let resolution = dimensions.map { "\($0.width)x\($0.height)" } ?? "--"
-        return "DEPTH \(resolution) | \(depthStatusValue())"
+        return "DEPTH \(resolution)\n\(SRText("Capture")) \(depthStatusValue()) | \(SRText("Preview")) \(depthPreviewStatusValue())"
     }
 
     private func depthStatusValue() -> String {
-        guard lidarDepthFrameCount > 0 else { return "0Hz" }
+        guard lidarDepthFrameCount > 0 else { return "0.0 fps" }
         guard let firstDepthSensorSec,
               let latestDepthSensorSec,
               latestDepthSensorSec > firstDepthSensorSec else {
-            return "Depth"
+            return "0.0 fps"
         }
         let hz = Double(max(lidarDepthFrameCount - 1, 1)) / (latestDepthSensorSec - firstDepthSensorSec)
-        return String(format: "%.0fHz", hz)
+        return String(format: "%.1f fps", hz)
+    }
+
+    private func depthPreviewStatusValue() -> String {
+        guard depthPreviewPresentedCount > 1,
+              let firstDepthPreviewSec, let latestDepthPreviewSec,
+              latestDepthPreviewSec > firstDepthPreviewSec else { return "0.0 fps" }
+        let fps = Double(depthPreviewPresentedCount - 1) / (latestDepthPreviewSec - firstDepthPreviewSec)
+        return String(format: "%.1f fps", fps)
     }
 
     private func aspectLabel(for resolution: String) -> String {
@@ -8573,7 +9302,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
 
     private func updateSensorPill(key: String, title: String, value: String) {
         guard let label = sensorStatusRows[key] else { return }
-        let active = isRecording && !value.hasPrefix("0Hz") && value != "--"
+        let active = isRecording && !value.hasPrefix("0Hz") && value != "0.0 fps" && value != "--"
         label.text = "\(SRText(title)) \(value)"
         label.textColor = active ? UIColor.systemGreen : .secondaryLabel
     }
@@ -8909,6 +9638,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "target_frame_rate": targetRecordingFrameRate(for: settings),
             "auto_focus": settings.autoFocus,
             "auto_exposure": isAutoExposureEnabled(for: settings),
+            "fixed_exposure_duration_sec_requested": (settings.fixedExposureDurationMS ?? 5) / 1000,
+            "fixed_iso_requested": settings.fixedISO ?? 100,
             "fixed_focus_lens_position_requested": clampedLensPosition(
                 settings.fixedFocusLensPosition,
                 fallback: defaultLensPosition
@@ -8921,8 +9652,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let hardware = multiCameraGraph?.hardwareSyncCameras ?? []
         let mixed = recorderSettings.front.enabled && enabledCameraCount(in: recorderSettings) > 1
         var result: [String: Any] = [
-            "sampling_rule": recorderSettings.captureMode == .standard
-                ? (mixed ? "After initial stream warm-up establishes the common movie epoch, all original frames are retained. Rear hardware groups, when present, are synchronized separately; front records independently with a nearest-timestamp correspondence index." : enabledCameraCount(in: recorderSettings) > 1
+            "sampling_rule": recorderSettings.captureMode.usesStandardCapture
+                ? (recorderSettings.captureMode == .standardFree ? "Independent camera callbacks retain original capture timestamps after a common start epoch; no output synchronization or frame grid is applied." : mixed ? "After initial stream warm-up establishes the common movie epoch, all original frames are retained. Rear hardware groups, when present, are synchronized separately; front records independently with a nearest-timestamp correspondence index." : enabledCameraCount(in: recorderSettings) > 1
                     ? "Virtual-camera hardware-synchronized constituent ports in AVCaptureMultiCamSession; AVCaptureDataOutputSynchronizer delivers complete groups, original PTS and common movie epoch; record_slot is the shared hardware-sync group index."
                     : "Single camera records original capture timestamps; record_slot is the received-frame sequence.")
                 : "ARKit MP4/info rows are downsampled onto a host-time record_slot grid at target_fps.",
@@ -8935,6 +9666,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             "hardware_synchronized_cameras": hardware.map(\.rawValue).sorted(),
             "all_cameras_hardware_synchronized": multiCameraGraph?.isFullyHardwareSynchronized ?? false
         ]
+        if let graph = multiCameraGraph {
+            result["camera_controls_actual"] = graph.controllers.map { camera, device in
+                ["camera": camera.rawValue, "focus_mode": device.focusMode.rawValue,
+                 "lens_position": device.lensPosition, "exposure_mode": device.exposureMode.rawValue,
+                 "exposure_duration_sec": CMTimeGetSeconds(device.exposureDuration), "iso": device.iso,
+                 "controller_type": device.deviceType.rawValue] as [String: Any]
+            }
+            result["camera_source_controls_actual"] = graph.sourceDevices.map { camera, device in
+                ["camera": camera.rawValue, "focus_mode": device.focusMode.rawValue,
+                 "lens_position": device.lensPosition, "exposure_mode": device.exposureMode.rawValue,
+                 "exposure_duration_sec": CMTimeGetSeconds(device.exposureDuration), "iso": device.iso] as [String: Any]
+            }
+        }
         if let graph = multiCameraGraph, graph.hardwareSyncCameras.count > 1 {
             result["hardware_sync"] = [
                 "virtual_device_id": graph.device.uniqueID,
@@ -8954,7 +9698,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             result["shared_movie_origin_capture_pts_sec"] = CMTimeGetSeconds(origin)
             result["shared_movie_origin_sensor_sec"] = synchronizationOriginSensorSec
         }
-        if let alignment = timestampAlignmentSummary, recorderSettings.captureMode == .standard {
+        if let alignment = timestampAlignmentSummary, recorderSettings.captureMode.usesStandardCapture {
             result["timestamp_alignment"] = ["index_file": "timestamp_alignment.csv", "reference_camera": alignment.reference,
                 "rows": alignment.rows, "maximum_skew_sec": alignment.maximumSkew,
                 "method": "nearest existing frame by original sensor_sec; no media resampling or frame removal"] as [String: Any]
@@ -9127,7 +9871,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         : ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "ultrawide_camera": [
-                    "enabled": recorderSettings.ultraWide.enabled && recorderSettings.captureMode == .standard,
+                    "enabled": recorderSettings.ultraWide.enabled && recorderSettings.captureMode.usesStandardCapture,
                     "media_file": "ultrawide.mp4",
                     "index_file": "ultra_info.csv",
                     "codec": videoCodecName(for: recorderSettings.ultraWide),
@@ -9147,7 +9891,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "telephoto_camera": [
-                    "enabled": recorderSettings.telephoto.enabled && recorderSettings.captureMode == .standard,
+                    "enabled": recorderSettings.telephoto.enabled && recorderSettings.captureMode.usesStandardCapture,
                     "media_file": "telephoto.mp4",
                     "index_file": "tele_info.csv",
                     "codec": videoCodecName(for: recorderSettings.telephoto),
@@ -9167,7 +9911,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "schema": ["frame_index", "record_slot", "sensor_sec", "utc_sec", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px", "capture_pts_sec", "exposure_mid_sensor_sec", "exposure_mid_utc_sec", "exposure_source"]
                 ],
                 "front_camera": [
-                    "enabled": recorderSettings.front.enabled && recorderSettings.captureMode == .standard,
+                    "enabled": recorderSettings.front.enabled && recorderSettings.captureMode.usesStandardCapture,
                     "media_file": "front.mp4",
                     "index_file": "front_info.csv",
                     "codec": videoCodecName(for: recorderSettings.front),
@@ -9239,7 +9983,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     "enabled": recorderSettings.audioEnabled,
                     "media_file": "audio.m4a",
                     "index_file": "audio_info.csv",
-                    "embedded_in": embedAudioInCameraMP4 && recorderSettings.captureMode == .standard
+                    "embedded_in": embedAudioInCameraMP4 && recorderSettings.captureMode.usesStandardCapture
                         ? ["wide.mp4", "ultrawide.mp4", "telephoto.mp4", "front.mp4"]
                         : [],
                     "codec": "aac",

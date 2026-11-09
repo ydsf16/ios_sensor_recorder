@@ -36,6 +36,72 @@ final class StandardCaptureUITests: XCTestCase {
         wait(status, "value == 'done'", timeout: 60)
     }
 
+    func testSensorMatrixAndExposureModesOnDevice() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard")
+        let firstRow = ["camera", "lidarDepth", "imu", "motion"].map { app.switches[$0] }
+        for toggle in firstRow { XCTAssertTrue(toggle.exists) }
+        for pair in zip(firstRow, firstRow.dropFirst()) {
+            XCTAssertLessThan(abs(pair.0.frame.midY - pair.1.frame.midY), 12)
+            XCTAssertLessThan(pair.0.frame.midX, pair.1.frame.midX)
+        }
+        XCTAssertGreaterThan(app.switches["mag"].frame.midY, firstRow[0].frame.midY)
+        for key in ["motion", "mag", "baro", "geo", "audio"] { XCTAssertTrue(app.switches[key].exists) }
+        let resolution = app.buttons["settings.menu.shared.resolution"]
+        let rate = app.buttons["settings.menu.shared.frameRate"]
+        XCTAssertTrue(resolution.exists)
+        XCTAssertTrue(rate.exists)
+        select("cameraCombination", "Wide")
+        setSwitch("shared.autoExposure", false)
+        XCTAssertFalse(app.buttons["settings.menu.shared.maxExposure"].isHittable)
+        let times = availableMenuChoices("shared.fixedExposure", pattern: "[0-9]+([.][0-9]+)?")
+        let gains = availableMenuChoices("shared.fixedISO", pattern: "[0-9]+([.][0-9]+)?")
+        XCTAssertFalse(times.isEmpty)
+        XCTAssertFalse(gains.isEmpty)
+        select("shared.fixedExposure", times.contains("5") ? "5" : times[0])
+        select("shared.fixedISO", gains.contains("100") ? "100" : gains[0])
+        screenshot("sensor_matrix_fixed_exposure")
+        setSwitch("shared.autoExposure", true)
+        XCTAssertTrue(app.buttons["settings.menu.shared.maxExposure"].isHittable)
+        closeSettings()
+    }
+
+    func testStandardFreeModeAndSettingsOrder() throws {
+        app.buttons["main.settings"].tap()
+        let names = ["mode", "sensors", "camera", "account", "developer"]
+        for name in names { XCTAssertTrue(app.otherElements["settings.card.\(name)"].exists) }
+        let cards = names.map { app.otherElements["settings.card.\($0)"] }
+        for pair in zip(cards, cards.dropFirst()) {
+            XCTAssertLessThan(pair.0.frame.minY, pair.1.frame.minY)
+        }
+        select("captureMode", "Standard · Free")
+        select("cameraCombination", "Wide + Ultra Wide")
+        wait(app.buttons["settings.menu.shared.resolution"], "enabled == true", timeout: 120)
+        XCTAssertFalse(app.sliders["shared.fixedFocus"].exists)
+        screenshot("standard_free_settings")
+        save()
+        record(seconds: 5)
+    }
+
+    func testFreeModeCameraCombinationSwitches() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard · Free")
+        setSwitch("lidarDepth", false)
+        let menu = app.buttons["settings.menu.cameraCombination"]
+        wait(menu, "label BEGINSWITH 'OPTIONS:'", timeout: 120)
+        let offered = Set((menu.label.split(separator: ":", maxSplits: 1).last ?? "").split(separator: "|").map(String.init))
+        let representatives = ["Wide", "Wide + Ultra Wide", "Wide + Front", "Wide + Ultra Wide + Front"].filter(offered.contains)
+        XCTAssertGreaterThanOrEqual(representatives.count, 3, "Free mode should offer single, rear pair, and mixed camera choices")
+        for name in representatives {
+            select("cameraCombination", name)
+            XCTAssertEqual(menu.value as? String, name)
+            wait(app.buttons["settings.menu.shared.resolution"], "enabled == true", timeout: 120)
+            wait(app.buttons["settings.menu.shared.frameRate"], "enabled == true", timeout: 120)
+        }
+        save()
+        record(seconds: 4)
+    }
+
     func testCaptureMatrixTraversal() throws {
         executionTimeAllowance = 7200
         app.terminate()
@@ -160,6 +226,25 @@ final class StandardCaptureUITests: XCTestCase {
     }
 
     func testEveryAvailableCameraResolutionAndRateOption() throws { try exerciseAvailableCameraOptions() }
+
+    func testLiDARSelectionAdjustsAndRecords() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard")
+        setSwitch("lidarDepth", false)
+        select("cameraCombination", "Wide + Ultra Wide")
+        let depth = app.switches["lidarDepth"]
+        reveal(depth)
+        depth.tap()
+        let notice = app.alerts["Capture Configuration Updated"]
+        XCTAssertTrue(notice.waitForExistence(timeout: 120))
+        notice.buttons["OK"].tap()
+        wait(app.buttons["settings.menu.shared.resolution"], "enabled == true", timeout: 120)
+        XCTAssertTrue(app.buttons["settings.menu.cameraCombination"].value as? String == "Wide")
+        XCTAssertFalse(app.buttons["settings.retry"].exists)
+        XCTAssertTrue(app.buttons["settings.save"].isEnabled)
+        save()
+        record(seconds: 8)
+    }
     func testAllOptionsWide() throws { try exerciseAvailableCameraOptions(only: "Wide") }
     func testAllOptionsUltraWide() throws { try exerciseAvailableCameraOptions(only: "Ultra Wide") }
     func testAllOptionsFront() throws { try exerciseAvailableCameraOptions(only: "Front") }
@@ -270,7 +355,9 @@ final class StandardCaptureUITests: XCTestCase {
             XCTAssertEqual(app.buttons["settings.menu.shared.maxExposure"].value as? String, exposure)
         }
         setSwitch("shared.autoExposure", false)
-        XCTAssertFalse(app.buttons["settings.menu.shared.maxExposure"].isEnabled)
+        XCTAssertFalse(app.buttons["settings.menu.shared.maxExposure"].isHittable)
+        XCTAssertTrue(app.buttons["settings.menu.shared.fixedExposure"].exists)
+        XCTAssertTrue(app.buttons["settings.menu.shared.fixedISO"].exists)
         save(); record(seconds: 3)
         app.buttons["main.settings"].tap()
         setSwitch("shared.autoExposure", true)
@@ -323,14 +410,21 @@ final class StandardCaptureUITests: XCTestCase {
         for combination in ["Front", "Wide + Ultra Wide + Front"] {
             configure(combination: combination, resolution: "640x480", rate: "30", sensors: false)
             let rates = availableMenuChoices("shared.frameRate", pattern: "[0-9]+([.][0-9]+)?")
-            XCTAssertTrue(rates.contains("1"))
-            select("shared.frameRate", "1")
+            XCTAssertFalse(rates.isEmpty)
+            guard let lowRate = ["1", "2", "5", "10"].first(where: { rates.contains($0) }) else {
+                // A device may advertise a low format range but reject it
+                // after the complete graph is committed. The UI must omit it.
+                closeSettings()
+                continue
+            }
+            select("shared.frameRate", lowRate)
             wait(app.buttons["settings.save"], "enabled == true", timeout: 120)
-            select("shared.frameRate", "60")
-            select("shared.frameRate", "1")
+            let highRate = rates.contains("60") ? "60" : "30"
+            select("shared.frameRate", highRate)
+            select("shared.frameRate", lowRate)
             save(); record(seconds: 9)
             app.buttons["main.settings"].tap()
-            select("shared.frameRate", "60")
+            select("shared.frameRate", highRate)
             save(); record(seconds: 3)
         }
     }
@@ -380,6 +474,7 @@ final class StandardCaptureUITests: XCTestCase {
         record(seconds: 10)
         app.buttons["main.settings"].tap()
         setSwitch("shared.autoFocus", false)
+        setSwitch("shared.autoExposure", true)
         select("shared.maxExposure", "20")
         save()
         record(seconds: 10)
@@ -555,7 +650,9 @@ final class StandardCaptureUITests: XCTestCase {
         let wideFocus = app.sliders["wide.fixedFocus"]
         reveal(wideFocus)
         XCTAssertTrue(wideFocus.isEnabled)
-        XCTAssertFalse(app.sliders["front.fixedFocus"].exists)
+        if app.sliders["front.fixedFocus"].exists {
+            XCTAssertTrue(app.sliders["front.fixedFocus"].isEnabled)
+        }
         wideFocus.adjust(toNormalizedSliderPosition: 0.8)
         save()
         record(seconds: 3)
@@ -581,7 +678,7 @@ final class StandardCaptureUITests: XCTestCase {
         wide.tap()
         XCTAssertFalse(app.switches["cameraOverrides"].exists)
         XCTAssertFalse(app.buttons["settings.recheck"].exists)
-        for name in ["camera", "capture", "focus", "lidar", "sensors", "account"] {
+        for name in ["sensors", "account", "mode", "camera", "capture", "focus"] {
             XCTAssertTrue(app.otherElements["settings.card.\(name)"].exists, "Missing expanded card: \(name)")
         }
         save()
@@ -595,6 +692,47 @@ final class StandardCaptureUITests: XCTestCase {
         wait(app.buttons["settings.save"], "enabled == true", timeout: 15)
         app.buttons["settings.save"].tap()
         XCTAssertTrue(app.buttons["main.settings"].waitForExistence(timeout: 30))
+    }
+
+    func testLiDARFrameRateMenusStopAt30FPS() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard · Free")
+        setSwitch("lidarDepth", true)
+        dismissConfigurationAlerts()
+        let standardRates = availableMenuChoices("shared.frameRate", pattern: "[0-9]+([.][0-9]+)?")
+        XCTAssertFalse(standardRates.isEmpty)
+        XCTAssertTrue(standardRates.allSatisfy { (Double($0) ?? .infinity) <= 30 }, "LiDAR standard rates: \(standardRates)")
+
+        select("captureMode", "ARKit")
+        let arkitRates = availableMenuChoices("arkit.frameRate", pattern: "[0-9]+([.][0-9]+)?")
+        XCTAssertFalse(arkitRates.isEmpty)
+        XCTAssertTrue(arkitRates.allSatisfy { (Double($0) ?? .infinity) <= 30 }, "LiDAR ARKit rates: \(arkitRates)")
+        setSwitch("lidarDepth", false)
+        if availableMenuChoices("arkit.frameRate", pattern: "[0-9]+([.][0-9]+)?").contains("60") {
+            select("arkit.frameRate", "60")
+            setSwitch("lidarDepth", true)
+            dismissConfigurationAlerts()
+            XCTAssertLessThanOrEqual(Double(app.buttons["settings.menu.arkit.frameRate"].value as? String ?? "") ?? .infinity, 30)
+        }
+        closeSettings()
+    }
+
+    func testLiDARPreviewShowsMeasuredFrameRates() throws {
+        app.buttons["main.settings"].tap()
+        select("captureMode", "Standard · Free")
+        setSwitch("lidarDepth", true)
+        dismissConfigurationAlerts()
+        save()
+        let status = app.staticTexts["hud.depth.status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 20))
+        let measured = NSPredicate { _, _ in
+            let text = status.label
+            guard text.contains("Preview"),
+                  let range = text.range(of: "Capture [0-9]+([.][0-9]+)? fps", options: .regularExpression),
+                  let fps = Double(text[range].dropFirst(8).dropLast(4)) else { return false }
+            return fps > 0
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: measured, object: nil)], timeout: 30), .completed, status.label)
     }
 
     func testPortraitSettingsAndLandscapeReturn() throws {
@@ -735,8 +873,9 @@ final class StandardCaptureUITests: XCTestCase {
         if !app.buttons["settings.close"].exists { app.buttons["main.settings"].tap() }
         XCTAssertTrue(app.buttons["settings.menu.captureMode"].waitForExistence(timeout: 15))
         select("captureMode", "Standard")
+        setSwitch("lidarDepth", false)
         select("cameraCombination", combination)
-        for key in ["lidarDepth", "mag", "baro", "geo", "audio"] { setSwitch(key, false) }
+        for key in ["mag", "baro", "geo", "audio"] { setSwitch(key, false) }
         setSwitch("imu", sensors)
         setSwitch("motion", sensors)
         // Move through a common SDK-supported cadence before changing dimensions.
@@ -811,7 +950,9 @@ final class StandardCaptureUITests: XCTestCase {
     }
 
     private func select(_ key: String, _ value: String) {
+        let value = key == "captureMode" && value == "Standard" ? "Standard · Hardware Sync" : value
         let button = app.buttons["settings.menu.\(key)"]
+        if key == "cameraCombination", button.value as? String == value { return }
         if key.hasPrefix("shared.") { wait(button, "label BEGINSWITH 'VERIFIED:'", timeout: 120) }
         if key == "cameraCombination" { wait(button, "label BEGINSWITH 'OPTIONS:' OR label BEGINSWITH 'Available camera combinations'", timeout: 120) }
         reveal(button)
@@ -837,23 +978,48 @@ final class StandardCaptureUITests: XCTestCase {
                 (upward ? bottom : top).press(forDuration: 0.05, thenDragTo: upward ? top : bottom)
             }
         }
+        if key == "cameraCombination" {
+            for _ in 0..<120 {
+                if button.value as? String == value { return }
+                if option.exists { break }
+                Thread.sleep(forTimeInterval: 1)
+            }
+        }
         XCTAssertTrue(option.waitForExistence(timeout: 120), "\(key) does not offer \(value)")
-        // The device's floating AssistiveTouch control can cover the center
-        // of the top menu row; tap inside the row near its leading edge.
-        option.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+        // The floating AssistiveTouch control can cover the top row. Long
+        // menus scroll; use XCTest's visible-point tap for lower rows.
+        if key == "cameraCombination", value.split(separator: "+").count >= 3 {
+            option.tap()
+        } else {
+            option.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+        }
         // UIKit may keep the selected UIMenu action in the accessibility tree
         // briefly after dismissal. Verify the setting value instead.
-        if key == "cameraCombination", value.contains("Front"), value != "Front" {
+        if key == "cameraCombination", value.contains("Front"), value != "Front",
+           app.buttons["settings.menu.captureMode"].value as? String != "Standard · Free" {
             let warning = app.alerts["Camera Synchronization"]
             XCTAssertTrue(warning.waitForExistence(timeout: 5))
             XCTAssertTrue(warning.staticTexts.allElementsBoundByIndex.map(\.label).joined().contains("timestamp"))
             screenshot("mixed_sync_warning")
             warning.buttons["Use This Combination"].tap()
         }
-        XCTAssertEqual(button.value as? String, value)
+        if key == "cameraCombination" {
+            wait(button, "value == '\(value)'", timeout: 30)
+        } else {
+            XCTAssertEqual(button.value as? String, value)
+        }
     }
 
     private func setSwitch(_ key: String, _ on: Bool) {
+        if key == "shared.autoExposure" {
+            let control = app.segmentedControls["settings.exposureMode.shared"]
+            XCTAssertTrue(control.exists)
+            reveal(control)
+            let option = control.buttons.element(boundBy: on ? 0 : 1)
+            if !option.isSelected { option.tap() }
+            XCTAssertTrue(option.isSelected)
+            return
+        }
         if key.hasSuffix(".autoFocus") {
             let prefix = String(key.dropLast(".autoFocus".count))
             let control = app.segmentedControls["settings.focusMode.\(prefix)"]

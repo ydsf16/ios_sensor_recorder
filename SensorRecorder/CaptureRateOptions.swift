@@ -20,7 +20,7 @@ enum CaptureRateOptions {
     }
     static func choices(ranges: [ClosedRange<Double>], ceiling: Double = .greatestFiniteMagnitude) -> [String] {
         var candidates = Set<Double>()
-        let commonRates: [Double] = [1, 5, 10, 15, 20, 24, 25, 30, 48, 50, 60]
+        let commonRates: [Double] = [1, 2, 5, 10, 15, 20, 24, 25, 30, 48, 50, 60]
         for range in ranges {
             guard range.lowerBound.isFinite, range.upperBound.isFinite, range.lowerBound > 0 else { continue }
             candidates.insert(range.lowerBound)

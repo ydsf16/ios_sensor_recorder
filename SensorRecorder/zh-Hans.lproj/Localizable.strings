@@ -39,6 +39,12 @@
 "Timestamp alignment · no hardware sync" = "时间戳对齐 · 无硬件同步";
 "LiDAR Depth" = "LiDAR 深度";
 "No LiDAR sensor on this device." = "此设备没有 LiDAR 传感器。";
+"Choose a single camera to use LiDAR Depth in Standard mode." = "标准模式下，请选择单个相机以使用 LiDAR 深度。";
+"Enabling LiDAR adjusts the camera configuration." = "开启 LiDAR 时会自动调整相机配置。";
+"No supported LiDAR capture configuration is available." = "当前设备没有可用的 LiDAR 采集配置。";
+"LiDAR selected. Capture changed to Wide, %@ at %@ fps." = "已选择 LiDAR。采集配置调整为广角、%@、%@ fps。";
+"LiDAR selected. Capture changed to %@, %@ at %@ fps." = "已选择 LiDAR。采集配置调整为%@、%@、%@ fps。";
+"Capture Configuration Updated" = "采集配置已更新";
 "AR Camera" = "AR 相机";
 "IMU" = "IMU";
 "Motion" = "设备运动";
@@ -81,6 +87,11 @@
 "Only the rear camera views are hardware synchronized. Front records independently; matching timestamps do not guarantee the same exposure instant." = "仅后置相机画面使用硬件同步。前置相机独立录制，相同时间戳不保证曝光时刻完全一致。";
 "These camera views are not hardware synchronized. Each records original frames independently; alignment uses their capture timestamps." = "这些相机画面没有硬件同步，各路独立录制原始帧，并使用采集时间戳对齐。";
 "Auto Exposure" = "自动曝光";
+"Auto · exposure limit" = "自动 · 曝光上限";
+"Fixed · time + ISO" = "固定 · 时间＋增益";
+"Exposure time (ms)" = "曝光时间（毫秒）";
+"Gain · ISO" = "增益 · ISO";
+"Fixed exposure is unavailable for this camera combination." = "当前相机组合不支持固定曝光。";
 "Max Exposure" = "最长曝光";
 "Focus Position" = "对焦位置";
 "Fixed-focus lenses" = "固定对焦镜头";
@@ -109,3 +120,13 @@
 
 "ARKit source omitted %d frame slots. The recording and timestamps were preserved. Check meta.json." = "ARKit 源数据缺少 %d 个目标帧。录制文件及原始时间戳已保留，请查看 meta.json。";
 "Recording Quality" = "录制质量";
+"Standard · Free" = "标准 · 自由";
+"Standard · Hardware Sync" = "标准 · 硬同步";
+"Explain capture modes" = "说明采集模式";
+"Capture Modes" = "采集模式";
+"Standard · Hardware Sync: supported rear cameras share a hardware-timed capture group.\n\nStandard · Free: supported cameras run independently with original timestamps.\n\nARKit: world tracking and its camera stream use ARKit timing." = "标准 · 硬同步：支持的后置相机按硬件同步帧组采集。\n\n标准 · 自由：支持的相机独立采集，保留原始时间戳。\n\nARKit：使用 ARKit 世界追踪及相机时间基准。";
+"Independent camera streams · original timestamps" = "相机独立采集 · 保留原始时间戳";
+"LiDAR capture supports camera frame rates up to 30 fps." = "启用 LiDAR 时，相机帧率最高为 30 fps。";
+"LiDAR selected. Frame rate changed to 30 fps or lower." = "已启用 LiDAR，帧率已调整到 30 fps 或以下。";
+"Capture" = "采集";
+"Preview" = "预览";
