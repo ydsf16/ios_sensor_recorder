@@ -1,2 +1,6 @@
-"CFBundleDisplayName" = "SensorRecorder";
-"CFBundleName" = "SensorRecorder";
+"CFBundleDisplayName" = "Sensor Pro";
+"CFBundleName" = "Sensor Pro";
+"NSCameraUsageDescription" = "使用相机录制多镜头视频和传感器数据。";
+"NSMicrophoneUsageDescription" = "录制采集会话中的音频。";
+"NSLocationWhenInUseUsageDescription" = "录制采集会话中的位置数据。";
+"NSMotionUsageDescription" = "录制原始加速度、陀螺仪、磁力计和气压计数据。";

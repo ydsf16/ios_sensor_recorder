@@ -254,7 +254,7 @@ def convert_to_rerun(
             np=np,
             rows=logged_rows,
             base_path=f"{entity}/frame_info",
-            fields=["record_slot", "exposure_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"],
+            fields=["record_slot", "exposure_sec", "exposure_mid_sensor_sec", "iso", "width_px", "height_px", "fx_px", "fy_px", "cx_px", "cy_px"],
             drop_nonfinite=drop_nonfinite,
         )
 

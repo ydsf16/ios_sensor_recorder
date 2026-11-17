@@ -91,3 +91,10 @@ iOSInjectionProject/
 
 # MacOS
 .DS_Store
+
+# Local device validation artifacts and downloaded tools
+.codex-baseline/
+.tools/
+test_results/
+__pycache__/
+*.py[cod]

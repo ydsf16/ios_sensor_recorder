@@ -23,11 +23,15 @@
       </BuildActionEntries>
    </BuildAction>
    <TestAction
+      preferredScreenCaptureFormat = "screenshots"
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES">
       <Testables>
+         <TestableReference skipped="NO">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="CA7100000000000000000005" BuildableName="StandardCaptureUITests.xctest" BlueprintName="StandardCaptureUITests" ReferencedContainer="container:SensorRecorder.xcodeproj"/>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction
